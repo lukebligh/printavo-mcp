@@ -128,8 +128,8 @@ def get_order_details(order_number: str) -> str:
                                 color
                                 price
                                 sizes {
-                                  count
-                                  size
+                                    count
+                                    size
                                 }
                             }
                         }
@@ -327,6 +327,124 @@ def inspect_fields(type_name: str) -> str:
     for f in fields:
         type_info = f.get("type", {})
         lines.append(f"  {f.get('name')} ({type_info.get('name', type_info.get('kind', '?'))})")
+    return "\n".join(lines)
+
+
+# ---- TOOL 8: Production Schedule & Placement Count ----
+@mcp.tool()
+def get_production_schedule(date: str) -> str:
+    """
+    Get all orders scheduled for production on a given date, with total imprint/embroidery/DTF placements.
+    date: format YYYY-MM-DD (e.g. 2026-05-01)
+    Formula: total items on order x number of imprint locations = total placements
+    """
+    query = """
+    query($after: ISO8601DateTime, $before: ISO8601DateTime) {
+        invoices(first: 25, startAtAfter: $after, startAtBefore: $before) {
+            nodes {
+                visualId
+                nickname
+                totalQuantity
+                startAt
+                status { name }
+                contact { fullName }
+                lineItemGroups {
+                    nodes {
+                        imprints {
+                            nodes {
+                                details
+                                typeOfWork { name }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+    after = f"{date}T00:00:00Z"
+    before = f"{date}T23:59:59Z"
+    result = query_printavo(query, {"after": after, "before": before})
+    if "error" in result:
+        # Fallback: pull recent invoices and filter by startAt in Python
+        fallback_query = """
+        query {
+            invoices(first: 25, sortOn: VISUAL_ID, sortDescending: true) {
+                nodes {
+                    visualId
+                    nickname
+                    totalQuantity
+                    startAt
+                    status { name }
+                    contact { fullName }
+                    lineItemGroups {
+                        nodes {
+                            imprints {
+                                nodes {
+                                    details
+                                    typeOfWork { name }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        result = query_printavo(fallback_query)
+        if "error" in result:
+            return f"API Error: {result['error']}"
+        all_invoices = result.get("invoices", {}).get("nodes", [])
+        invoices = [o for o in all_invoices if o.get("startAt", "")[:10] == date]
+    else:
+        invoices = result.get("invoices", {}).get("nodes", [])
+
+    if not invoices:
+        return f"No orders scheduled for production on {date}."
+
+    lines = [f"PRODUCTION SCHEDULE — {date}", ""]
+    grand_total_qty = 0
+    grand_total_placements = 0
+    breakdown_by_type = {}
+
+    for o in invoices:
+        qty = int(o.get("totalQuantity") or 0)
+        customer = o.get("contact", {}).get("fullName", "Unknown")
+        nickname = o.get("nickname", "")
+        status = o.get("status", {}).get("name", "?")
+        groups = o.get("lineItemGroups", {}).get("nodes", [])
+
+        all_imprints = []
+        for group in groups:
+            imprints = group.get("imprints", {}).get("nodes", [])
+            all_imprints.extend(imprints)
+
+        num_locations = len(all_imprints)
+        order_placements = qty * num_locations
+        grand_total_qty += qty
+        grand_total_placements += order_placements
+
+        lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
+        lines.append(f"    Status: {status} | Items: {qty} | Locations: {num_locations} | Placements: {order_placements}")
+
+        for imp in all_imprints:
+            type_name = imp.get("typeOfWork", {}).get("name", "Unknown")
+            details = imp.get("details", "")
+            lines.append(f"    → {type_name}: {details}")
+            breakdown_by_type[type_name] = breakdown_by_type.get(type_name, 0) + qty
+
+        lines.append("")
+
+    lines.append("─" * 50)
+    lines.append(f"TOTALS FOR {date}:")
+    lines.append(f"  Orders: {len(invoices)}")
+    lines.append(f"  Total Items: {grand_total_qty}")
+    lines.append(f"  Total Placements: {grand_total_placements}")
+    lines.append("")
+    lines.append("  BY TYPE:")
+    for type_name, count in sorted(breakdown_by_type.items()):
+        lines.append(f"    {type_name}: {count} placements")
+
     return "\n".join(lines)
 
 

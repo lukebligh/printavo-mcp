@@ -41,6 +41,8 @@ def normalize_location(text):
         return "FB"
     elif any(x in t for x in ["right chest", "rc", "right-chest"]):
         return "RC"
+    elif any(x in t for x in ["back top", "top back", "upper back"]):
+        return "Back Top"
     elif any(x in t for x in ["sleeve", "slv"]):
         return "SLV"
     elif "hood" in t:
@@ -49,53 +51,58 @@ def normalize_location(text):
         return "Front"
     elif "back" in t:
         return "Back"
-    return text.strip()[:12] if text.strip() else "?"
+    elif "chest" in t:
+        return "Chest"
+    return text.strip()[:15] if text.strip() else "?"
+
+
+def extract_matrix_colors(matrix_col):
+    """Extract color count from pricing matrix column name like 'Contract SP 2025 (NEW) · 1 Color'"""
+    if not matrix_col:
+        return None
+    mc = re.search(r'(\d+)\s*[Cc]olor', matrix_col)
+    if mc:
+        return int(mc.group(1))
+    # Fallback: find any number
+    mc = re.search(r'(\d+)', matrix_col)
+    if mc:
+        return int(mc.group(1))
+    return None
 
 
 def parse_imprint_details(details):
     """
-    Parse imprint details text for location + color count.
+    Parse structured imprint details (from direct orders).
     Returns list of dicts: [{"location": "FF", "colors": 3}]
     """
     results = []
     if not details:
         return results
-
-    # Extract location
     loc_match = re.search(r'Location:\s*(.+?)(?:\n|Colors:|$)', details, re.IGNORECASE)
-    location = normalize_location(loc_match.group(1).strip()) if loc_match else "?"
-
-    # Extract color count — "Colors: 5 Colors (...)"
+    if not loc_match:
+        return results
+    location = normalize_location(loc_match.group(1).strip())
     color_match = re.search(r'Colors:\s*(\d+)\s*Colors?', details, re.IGNORECASE)
     if not color_match:
-        # Try "N-color" or "N color"
         color_match = re.search(r'(\d+)\s*[-]?\s*color', details, re.IGNORECASE)
-
     colors = int(color_match.group(1)) if color_match else None
-
-    if location or colors:
-        results.append({"location": location, "colors": colors})
-
+    results.append({"location": location, "colors": colors})
     return results
 
 
 def parse_description_imprints(description):
     """
-    Parse line item description for imprint info like '1C LC', '2C FF', '3C FB'.
-    Returns list of dicts: [{"location": "LC", "colors": 1}, {"location": "FB", "colors": 2}]
+    Parse line item description for imprint info like '1C LC', '2C FF', '1C Back Top'.
+    Returns list of dicts: [{"location": "LC", "colors": 1}]
     """
     results = []
     if not description:
         return results
-
-    # Match patterns like "1C LC", "2C FF", "4C FB" — with optional spaces/newlines
-    matches = re.findall(r'(\d+)\s*C\s+([A-Za-z]{2,4})', description)
+    # Match "1C LC", "2C FF", "1C Full Back", etc.
+    matches = re.findall(r'(\d+)C\s+([A-Za-z][A-Za-z ]{1,15}?)(?:\n|,|$)', description)
     for colors, location in matches:
-        results.append({
-            "location": normalize_location(location.upper()),
-            "colors": int(colors)
-        })
-
+        loc = normalize_location(location.strip())
+        results.append({"location": loc, "colors": int(colors)})
     return results
 
 
@@ -197,10 +204,7 @@ def get_order_details(order_number: str) -> str:
                                 itemNumber
                                 color
                                 price
-                                sizes {
-                                    count
-                                    size
-                                }
+                                sizes { count size }
                             }
                         }
                     }
@@ -253,11 +257,7 @@ def get_statuses() -> str:
     query = """
     query {
         statuses(first: 25) {
-            nodes {
-                id
-                name
-                color
-            }
+            nodes { id name color }
         }
     }
     """
@@ -452,7 +452,6 @@ def get_production_schedule(date: str) -> str:
     if not all_invoices:
         return f"No orders scheduled for production on {date}."
 
-    # Per-invoice detail query — pulls both imprints AND line item descriptions
     detail_query = """
     query($id: ID!) {
         invoice(id: $id) {
@@ -498,7 +497,6 @@ def get_production_schedule(date: str) -> str:
                 lines.append("")
                 continue
 
-            # Pull detail data for this invoice
             all_imprints = []
             all_descriptions = []
             if invoice_id:
@@ -515,27 +513,25 @@ def get_production_schedule(date: str) -> str:
                             if desc:
                                 all_descriptions.append(desc)
 
-            # Determine decoration type
             order_screens = 0
             imprint_lines = []
-
-            # Try parsing from imprint details first (direct orders)
             parsed_from_imprints = []
+
             for imp in all_imprints:
                 type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
                 details = imp.get("details") or ""
                 matrix_col = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
                 details_lower = details.lower()
 
+                # Handle embroidery
                 if type_of_work and type_of_work.lower() == "embroidery":
-                    dec_type = "Embroidery"
-                    parsed_from_imprints.append({"location": "?", "colors": None, "type": dec_type})
                     imprint_lines.append(f"    → Embroidery")
                     breakdown_by_type["Embroidery"] = breakdown_by_type.get("Embroidery", 0) + qty
                     grand_total_imprints += qty
+                    parsed_from_imprints.append(True)
                     continue
 
-                # Infer dec type
+                # Infer decoration type
                 if "dtf" in details_lower:
                     dec_type = "DTF"
                 elif "embroid" in details_lower:
@@ -545,17 +541,29 @@ def get_production_schedule(date: str) -> str:
                 else:
                     dec_type = "Screen Print"
 
-                parsed = parse_imprint_details(details)
-                # If no color count from details, try extracting from matrix column name
-                matrix_colors = None
-                if matrix_col:
-                    mc = re.search(r'(\d+)', matrix_col)
-                    if mc:
-                        matrix_colors = int(mc.group(1))
+                # Get color count from matrix column name
+                matrix_colors = extract_matrix_colors(matrix_col)
 
-                for p in parsed:
-                    loc = p.get("location", "?")
-                    colors = p.get("colors") or matrix_colors
+                # Try structured parsing first (direct orders with "Location: X / Colors: Y" format)
+                parsed = parse_imprint_details(details)
+
+                if parsed:
+                    # Structured details — direct order format
+                    for p in parsed:
+                        loc = p.get("location", "?")
+                        colors = p.get("colors") or matrix_colors
+                        color_str = f"{colors}C" if colors else "?C"
+                        screens = colors if colors else 0
+                        order_screens += screens
+                        parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
+                        imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
+                        breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                        grand_total_imprints += qty
+
+                elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
+                    # Short plain text — likely just a location name like "Left Chest" or "Full Back"
+                    loc = normalize_location(details.strip())
+                    colors = matrix_colors
                     color_str = f"{colors}C" if colors else "?C"
                     screens = colors if colors else 0
                     order_screens += screens
@@ -564,13 +572,22 @@ def get_production_schedule(date: str) -> str:
                     breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
                     grand_total_imprints += qty
 
-                if not parsed:
-                    # No parseable location/color from details
-                    imprint_lines.append(f"    → {dec_type} | Location/colors: not specified")
+                elif matrix_colors:
+                    # Color count from matrix but no location info
+                    color_str = f"{matrix_colors}C"
+                    order_screens += matrix_colors
+                    parsed_from_imprints.append({"location": None, "colors": matrix_colors, "type": dec_type})
+                    imprint_lines.append(f"    → {dec_type} | {color_str} (location not in Printavo)")
                     breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
                     grand_total_imprints += qty
 
-            # If no useful data from imprints, try parsing line item descriptions (contract orders)
+                else:
+                    # Nothing parseable — flag for data entry
+                    imprint_lines.append(f"    → {dec_type} | (no color/location entered in Printavo)")
+                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                    grand_total_imprints += qty
+
+            # Fallback: if imprints had no data, try parsing line item descriptions
             if not parsed_from_imprints and all_descriptions:
                 seen_combos = set()
                 for desc in all_descriptions:
@@ -587,7 +604,7 @@ def get_production_schedule(date: str) -> str:
                             breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
                             grand_total_imprints += qty
                 if not seen_combos:
-                    imprint_lines.append(f"    → Screen Print | Location/colors: not specified")
+                    imprint_lines.append(f"    → Screen Print | (no color/location entered in Printavo)")
                     breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
                     grand_total_imprints += qty
 
@@ -596,7 +613,7 @@ def get_production_schedule(date: str) -> str:
             order_imprints = qty * num_locations
 
             lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-            lines.append(f"    Status: {status_name} | Items: {qty} | Imprints: {order_imprints} | Est. Screens: {order_screens if order_screens else '?'}")
+            lines.append(f"    Status: {status_name} | Items: {qty} | Imprints: {order_imprints} | Est. Screens: {order_screens if order_screens else '(not entered)'}")
             lines.extend(imprint_lines)
             lines.append("")
 

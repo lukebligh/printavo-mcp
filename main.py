@@ -113,8 +113,42 @@ def parse_description_imprints(description):
     return results
 
 
+def imprint_type_sort_key(primary_type: str) -> int:
+    """Sort key: Screen Print=1, Embroidery=2, DTF/Store/other=3"""
+    t = (primary_type or "").lower()
+    if "screen print" in t:
+        return 1
+    elif "embroid" in t:
+        return 2
+    else:
+        return 3  # DTF, Store Order, or unknown
+
+
+def resolve_primary_type(current: str, new_type: str) -> str:
+    """Keep whichever type has the highest sort priority (lowest key)."""
+    if imprint_type_sort_key(new_type) < imprint_type_sort_key(current):
+        return new_type
+    return current
+
+
+# Statuses to exclude from the production schedule
+EXCLUDED_STATUS_PREFIXES = ["promo items"]          # starts-with match (case-insensitive)
+EXCLUDED_STATUS_EXACT    = ["quote", "quote sent"]  # exact match (case-insensitive)
+
+
+def should_exclude_status(status_name: str) -> bool:
+    s = status_name.lower().strip()
+    if any(s.startswith(p) for p in EXCLUDED_STATUS_PREFIXES):
+        return True
+    if s in EXCLUDED_STATUS_EXACT:
+        return True
+    return False
+
+
 def build_production_schedule(date: str) -> str:
-    """Core logic for production schedule — used by both the tool and the Slack scheduler"""
+    """Core logic for production schedule — used by both the tool and the Slack scheduler."""
+
+    # ── Phase 1: Collect invoices for this date ─────────────────────────────
     all_invoices = []
     page_query = """
     query($cursor: String) {
@@ -142,16 +176,22 @@ def build_production_schedule(date: str) -> str:
         result = query_printavo(page_query, variables)
         if "error" in result:
             return f"API Error: {result['error']}"
-        nodes = (result.get("invoices") or {}).get("nodes", [])
+        nodes     = (result.get("invoices") or {}).get("nodes", [])
         page_info = (result.get("invoices") or {}).get("pageInfo", {})
+
         for o in nodes:
             start = (o.get("startAt") or "")[:10]
             if start == date:
-                all_invoices.append(o)
+                status_name = (o.get("status") or {}).get("name") or ""
+                # Mark date range as found regardless of filter so pagination exits cleanly
                 found_any = True
                 consecutive_misses = 0
+                if should_exclude_status(status_name):
+                    continue  # Skip PROMO ITEMS, quote, quote sent
+                all_invoices.append(o)
             elif found_any and start < date:
                 consecutive_misses += 1
+
         if consecutive_misses >= 25:
             break
         if not page_info.get("hasNextPage"):
@@ -160,7 +200,7 @@ def build_production_schedule(date: str) -> str:
         pages_searched += 1
 
     if not all_invoices:
-        return f"No orders scheduled for production on {date}."
+        return f"No in-house orders scheduled for production on {date}."
 
     detail_query = """
     query($id: ID!) {
@@ -183,31 +223,36 @@ def build_production_schedule(date: str) -> str:
     }
     """
 
-    lines = [f"*PRODUCTION SCHEDULE — {date}*", ""]
-    grand_total_qty = 0
-    grand_total_imprints = 0
-    grand_total_screens = 0
-    breakdown_by_type = {}
+    # ── Phase 2: Fetch detail + parse each order ─────────────────────────────
+    order_data_list = []
 
-    for o in sorted(all_invoices, key=lambda x: x.get("visualId", 0)):
+    for o in all_invoices:
         try:
-            qty = int(o.get("totalQuantity") or 0)
-            customer = (o.get("contact") or {}).get("fullName") or "Unknown"
-            nickname = o.get("nickname") or ""
+            qty         = int(o.get("totalQuantity") or 0)
+            customer    = (o.get("contact") or {}).get("fullName") or "Unknown"
+            nickname    = o.get("nickname") or ""
             status_name = (o.get("status") or {}).get("name") or "?"
-            invoice_id = o.get("id")
-            is_store_order = "store" in status_name.lower()
-            grand_total_qty += qty
+            invoice_id  = o.get("id")
+            is_store    = "store" in status_name.lower()
 
-            if is_store_order:
-                lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-                lines.append(f"    Status: {status_name} | Items: {qty}")
-                lines.append(f"    → Store Order (InkSoft) — pieces only")
-                breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
-                lines.append("")
+            if is_store:
+                order_data_list.append({
+                    "visual_id":    o.get("visualId"),
+                    "customer":     customer,
+                    "nickname":     nickname,
+                    "status_name":  status_name,
+                    "qty":          qty,
+                    "is_store":     True,
+                    "imprint_lines": ["    → Store Order (InkSoft) — pieces only"],
+                    "order_screens": 0,
+                    "num_imprints":  0,
+                    "primary_type":  "Store Order",
+                    "breakdown":    {"Store Order (pieces only)": qty},
+                    "error":        None,
+                })
                 continue
 
-            all_imprints = []
+            all_imprints    = []
             all_descriptions = []
             if invoice_id:
                 detail_result = query_printavo(detail_query, {"id": invoice_id})
@@ -223,23 +268,27 @@ def build_production_schedule(date: str) -> str:
                             if desc:
                                 all_descriptions.append(desc)
 
-            order_screens = 0
-            imprint_lines = []
+            order_screens      = 0
+            imprint_lines      = []
             parsed_from_imprints = []
+            breakdown          = {}
+            primary_type       = "Screen Print"  # default until we see otherwise
 
             for imp in all_imprints:
                 type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
-                details = imp.get("details") or ""
-                matrix_col = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
+                details      = imp.get("details") or ""
+                matrix_col   = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
                 details_lower = details.lower()
 
+                # Layer 1 — TypeOfWork (most reliable)
                 if type_of_work and type_of_work.lower() == "embroidery":
-                    imprint_lines.append(f"    → Embroidery")
-                    breakdown_by_type["Embroidery"] = breakdown_by_type.get("Embroidery", 0) + qty
-                    grand_total_imprints += qty
+                    imprint_lines.append("    → Embroidery")
+                    breakdown["Embroidery"] = breakdown.get("Embroidery", 0) + qty
+                    primary_type = resolve_primary_type(primary_type, "Embroidery")
                     parsed_from_imprints.append(True)
                     continue
 
+                # Determine decoration type from details text
                 if "dtf" in details_lower:
                     dec_type = "DTF"
                 elif "embroid" in details_lower:
@@ -250,44 +299,48 @@ def build_production_schedule(date: str) -> str:
                     dec_type = "Screen Print"
 
                 matrix_colors = extract_matrix_colors(matrix_col)
-                parsed = parse_imprint_details(details)
 
+                # Layer 2 — Structured "Location: / Colors:" text
+                parsed = parse_imprint_details(details)
                 if parsed:
                     for p in parsed:
-                        loc = p.get("location", "?")
-                        colors = p.get("colors") or matrix_colors
+                        loc       = p.get("location", "?")
+                        colors    = p.get("colors") or matrix_colors
                         color_str = f"{colors}C" if colors else "?C"
-                        screens = colors if colors else 0
+                        screens   = colors if colors else 0
                         order_screens += screens
                         parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
                         imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
-                        breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                        grand_total_imprints += qty
+                        breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
+                        primary_type = resolve_primary_type(primary_type, dec_type)
 
+                # Layer 3 — Short plain text (contract imprint cards)
                 elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
-                    loc = normalize_location(details.strip())
-                    colors = matrix_colors
+                    loc       = normalize_location(details.strip())
+                    colors    = matrix_colors
                     color_str = f"{colors}C" if colors else "?C"
-                    screens = colors if colors else 0
+                    screens   = colors if colors else 0
                     order_screens += screens
                     parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
                     imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                    grand_total_imprints += qty
+                    breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
+                    primary_type = resolve_primary_type(primary_type, dec_type)
 
+                # Layer 4 — PricingMatrixColumn color count only
                 elif matrix_colors:
                     color_str = f"{matrix_colors}C"
                     order_screens += matrix_colors
                     parsed_from_imprints.append({"location": None, "colors": matrix_colors, "type": dec_type})
                     imprint_lines.append(f"    → {dec_type} | {color_str} (location not entered)")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                    grand_total_imprints += qty
+                    breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
+                    primary_type = resolve_primary_type(primary_type, dec_type)
 
                 else:
                     imprint_lines.append(f"    → {dec_type} | (no color/location entered)")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                    grand_total_imprints += qty
+                    breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
+                    primary_type = resolve_primary_type(primary_type, dec_type)
 
+            # Fallback — parse line item descriptions
             if not parsed_from_imprints and all_descriptions:
                 seen_combos = set()
                 for desc in all_descriptions:
@@ -296,41 +349,98 @@ def build_production_schedule(date: str) -> str:
                         key = (p["location"], p["colors"])
                         if key not in seen_combos:
                             seen_combos.add(key)
-                            loc = p["location"]
-                            colors = p["colors"]
+                            loc       = p["location"]
+                            colors    = p["colors"]
                             color_str = f"{colors}C"
                             order_screens += colors
                             imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
-                            breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
-                            grand_total_imprints += qty
+                            breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
+                            primary_type = resolve_primary_type(primary_type, "Screen Print")
                 if not seen_combos:
-                    imprint_lines.append(f"    → Screen Print | (no color/location entered)")
-                    breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
-                    grand_total_imprints += qty
+                    imprint_lines.append("    → Screen Print | (no color/location entered)")
+                    breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
+                    primary_type = resolve_primary_type(primary_type, "Screen Print")
 
-            grand_total_screens += order_screens
-            num_locations = len(all_imprints)
-            order_imprints = qty * num_locations
-
-            lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-            lines.append(f"    Status: {status_name} | Items: {qty} | Imprints: {order_imprints} | Est. Screens: {order_screens if order_screens else '(not entered)'}")
-            lines.extend(imprint_lines)
-            lines.append("")
+            order_data_list.append({
+                "visual_id":     o.get("visualId"),
+                "customer":      customer,
+                "nickname":      nickname,
+                "status_name":   status_name,
+                "qty":           qty,
+                "is_store":      False,
+                "imprint_lines": imprint_lines,
+                "order_screens": order_screens,
+                "num_imprints":  len(all_imprints),
+                "primary_type":  primary_type,
+                "breakdown":     breakdown,
+                "error":         None,
+            })
 
         except Exception as e:
-            lines.append(f"  [Skipped #{o.get('visualId')} due to error: {str(e)}]")
+            order_data_list.append({
+                "visual_id":    o.get("visualId"),
+                "error":        str(e),
+                "primary_type": "Screen Print",
+                "qty":          0,
+                "breakdown":    {},
+            })
+
+    # ── Phase 3: Sort by imprint type, then render ───────────────────────────
+    # Priority: Screen Print (1) → Embroidery (2) → DTF / Store (3)
+    order_data_list.sort(key=lambda x: imprint_type_sort_key(x.get("primary_type", "")))
+
+    lines               = [f"*PRODUCTION SCHEDULE — {date}*", ""]
+    grand_total_qty     = 0
+    grand_total_imprints = 0
+    grand_total_screens  = 0
+    breakdown_by_type    = {}
+
+    for od in order_data_list:
+        if od.get("error"):
+            lines.append(f"  [Skipped #{od.get('visual_id')} due to error: {od['error']}]")
             lines.append("")
+            continue
+
+        qty = od["qty"]
+        grand_total_qty += qty
+        for t, v in od.get("breakdown", {}).items():
+            breakdown_by_type[t] = breakdown_by_type.get(t, 0) + v
+
+        if od["is_store"]:
+            lines.append(f"  #{od['visual_id']} | {od['customer']} | {od['nickname']}")
+            lines.append(f"    Status: {od['status_name']} | Items: {qty}")
+            lines.extend(od["imprint_lines"])
+            lines.append("")
+            continue
+
+        order_screens   = od["order_screens"]
+        order_imprints  = qty * od["num_imprints"]
+        grand_total_imprints += order_imprints
+        grand_total_screens  += order_screens
+
+        lines.append(f"  #{od['visual_id']} | {od['customer']} | {od['nickname']}")
+        lines.append(
+            f"    Status: {od['status_name']} | Items: {qty} | "
+            f"Imprints: {order_imprints} | "
+            f"Est. Screens: {order_screens if order_screens else '(not entered)'}"
+        )
+        lines.extend(od["imprint_lines"])
+        lines.append("")
 
     lines.append("─" * 50)
     lines.append(f"TOTALS FOR {date}:")
-    lines.append(f"  Orders on schedule: {len(all_invoices)}")
+    lines.append(f"  Orders on schedule: {len([o for o in order_data_list if not o.get('error')])}")
     lines.append(f"  Total Items: {grand_total_qty}")
     lines.append(f"  Total Imprints (excl. store orders): {grand_total_imprints}")
-    lines.append(f"  Est. Total Screens Needed: {grand_total_screens if grand_total_screens else '(color data missing on some orders)'}")
+    lines.append(
+        f"  Est. Total Screens Needed: "
+        f"{grand_total_screens if grand_total_screens else '(color data missing on some orders)'}"
+    )
     if breakdown_by_type:
         lines.append("")
         lines.append("  BY TYPE:")
-        for type_name, count in sorted(breakdown_by_type.items()):
+        for type_name in sorted(breakdown_by_type.keys(), key=imprint_type_sort_key):
+            count = breakdown_by_type[type_name]
             label = "pieces" if "store" in type_name.lower() else "imprints"
             lines.append(f"    {type_name}: {count} {label}")
 
@@ -338,26 +448,32 @@ def build_production_schedule(date: str) -> str:
 
 
 def run_daily_scheduler():
-    """Background thread — posts production schedule to Slack every day at 6am CST"""
+    """Background thread — posts production schedule to Slack at 6am CST on weekdays only."""
     CST = timezone(timedelta(hours=-6))
     while True:
         now = datetime.now(CST)
-        # Target: 6:00am CST
         target = now.replace(hour=6, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         time.sleep(wait_seconds)
 
-        # Fire at 6am
-        today = datetime.now(CST).strftime("%Y-%m-%d")
-        day_name = datetime.now(CST).strftime("%A, %B %d")
+        # Skip Saturday (5) and Sunday (6)
+        fire_time = datetime.now(CST)
+        if fire_time.weekday() >= 5:
+            continue
+
+        today    = fire_time.strftime("%Y-%m-%d")
+        day_name = fire_time.strftime("%A, %B %d")
         schedule = build_production_schedule(today)
-        message = f":printer: *Good morning, Est. Merch team!* Here's your production schedule for *{day_name}*:\n\n{schedule}"
+        message  = (
+            f":printer: *Good morning, Est. Merch team!* "
+            f"Here's your production schedule for *{day_name}*:\n\n{schedule}"
+        )
         post_to_slack(message)
 
 
-# ---- TOOL 1: Get Recent Orders ----
+# ── TOOL 1: Get Recent Orders ────────────────────────────────────────────────
 @mcp.tool()
 def get_recent_orders(limit: int = 10) -> str:
     """Get the most recent orders/invoices from Printavo, newest first"""
@@ -394,7 +510,7 @@ def get_recent_orders(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 2: Search by Customer Name ----
+# ── TOOL 2: Search by Customer Name ─────────────────────────────────────────
 @mcp.tool()
 def search_orders(customer_name: str) -> str:
     """Search for orders by customer name"""
@@ -430,7 +546,7 @@ def search_orders(customer_name: str) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 3: Get Order Details ----
+# ── TOOL 3: Get Order Details ────────────────────────────────────────────────
 @mcp.tool()
 def get_order_details(order_number: str) -> str:
     """Get full details on a specific order including style, color, and size quantities."""
@@ -501,7 +617,7 @@ def get_order_details(order_number: str) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 4: Get All Statuses ----
+# ── TOOL 4: Get All Statuses ─────────────────────────────────────────────────
 @mcp.tool()
 def get_statuses() -> str:
     """Get all order statuses configured in your Printavo account"""
@@ -524,7 +640,7 @@ def get_statuses() -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 5: Outstanding Balances ----
+# ── TOOL 5: Outstanding Balances ─────────────────────────────────────────────
 @mcp.tool()
 def get_outstanding_balances() -> str:
     """Get open orders that are not yet marked paid or done"""
@@ -573,7 +689,7 @@ def get_outstanding_balances() -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 6: Create a Quote ----
+# ── TOOL 6: Create a Quote ───────────────────────────────────────────────────
 @mcp.tool()
 def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     """
@@ -619,7 +735,7 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     )
 
 
-# ---- TOOL 7: Inspect API Field Names ----
+# ── TOOL 7: Inspect API Field Names ─────────────────────────────────────────
 @mcp.tool()
 def inspect_fields(type_name: str) -> str:
     """Look up the exact field names on any Printavo API type."""
@@ -648,18 +764,19 @@ def inspect_fields(type_name: str) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 8: Production Schedule ----
+# ── TOOL 8: Production Schedule ──────────────────────────────────────────────
 @mcp.tool()
 def get_production_schedule(date: str) -> str:
     """
-    Get all orders scheduled for production on a given date.
-    Shows imprint locations, color counts, and estimated screens needed.
+    Get all in-house orders scheduled for production on a given date.
+    Excludes PROMO ITEMS and quote/quote-sent statuses.
+    Sorted by imprint type: Screen Print → Embroidery → DTF/Store.
     date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
     return build_production_schedule(date)
 
 
-# ---- TOOL 9: Send Production Schedule to Slack Now ----
+# ── TOOL 9: Send Production Schedule to Slack Now ────────────────────────────
 @mcp.tool()
 def send_schedule_to_slack(date: str) -> str:
     """
@@ -667,9 +784,11 @@ def send_schedule_to_slack(date: str) -> str:
     date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
     schedule = build_production_schedule(date)
-    CST = timezone(timedelta(hours=-6))
     day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A, %B %d")
-    message = f":printer: *Good morning, Est. Merch team!* Here's your production schedule for *{day_name}*:\n\n{schedule}"
+    message  = (
+        f":printer: *Good morning, Est. Merch team!* "
+        f"Here's your production schedule for *{day_name}*:\n\n{schedule}"
+    )
     success = post_to_slack(message)
     if success:
         return f"Production schedule for {date} posted to Slack successfully!"

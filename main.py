@@ -440,10 +440,11 @@ def get_production_schedule(date: str) -> str:
 
             lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
             lines.append(f"    Status: {status_name} | Items: {qty} | Locations: {num_locations} | Placements: {order_placements}")
-
-            if is_store_order:
-                lines.append(f"    → Store Order (InkSoft)")
-                breakdown_by_type["Store Order"] = breakdown_by_type.get("Store Order", 0) + order_placements
+if is_store_order:
+                lines.append(f"    → Store Order (InkSoft) | Pieces: {qty}")
+                breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
+                # Don't count imprints for store orders — artwork records ≠ imprint locations
+                grand_total_placements -= order_placements
             else:
                 for imp in all_imprints:
                     type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""

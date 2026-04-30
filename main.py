@@ -128,10 +128,8 @@ def get_order_details(order_number: str) -> str:
                                 color
                                 price
                                 sizes {
-                                    nodes {
-                                        name
-                                        quantity
-                                    }
+                                  count
+                                  size
                                 }
                             }
                         }

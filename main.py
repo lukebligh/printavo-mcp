@@ -337,7 +337,6 @@ def get_production_schedule(date: str) -> str:
     Get all orders scheduled for production on a given date, with total imprint/embroidery/DTF placements.
     date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
-    # Pass 1: Get invoices scheduled for this date (lightweight query)
     step1 = """
     query($after: ISO8601DateTime, $before: ISO8601DateTime) {
         invoices(first: 10, startAtAfter: $after, startAtBefore: $before) {
@@ -357,7 +356,6 @@ def get_production_schedule(date: str) -> str:
     before = f"{date}T23:59:59Z"
     result = query_printavo(step1, {"after": after, "before": before})
 
-    # Fallback: filter recent invoices by startAt in Python
     if "error" in result:
         fallback = """
         query {
@@ -377,15 +375,17 @@ def get_production_schedule(date: str) -> str:
         result = query_printavo(fallback)
         if "error" in result:
             return f"API Error: {result['error']}"
-        all_invoices = result.get("invoices", {}).get("nodes", [])
-        invoices = [o for o in all_invoices if o.get("startAt", "")[:10] == date]
+        all_invoices = (result.get("invoices") or {}).get("nodes", [])
+        invoices = [
+            o for o in all_invoices
+            if (o.get("startAt") or "")[:10] == date
+        ]
     else:
-        invoices = result.get("invoices", {}).get("nodes", [])
+        invoices = (result.get("invoices") or {}).get("nodes", [])
 
     if not invoices:
         return f"No orders scheduled for production on {date}."
 
-    # Pass 2: For each invoice, get imprint details separately
     imprint_query = """
     query($id: ID!) {
         invoice(id: $id) {
@@ -409,37 +409,42 @@ def get_production_schedule(date: str) -> str:
     breakdown_by_type = {}
 
     for o in invoices:
-        qty = int(o.get("totalQuantity") or 0)
-        customer = (o.get("contact") or {}).get("fullName", "Unknown")
-        nickname = o.get("nickname", "")
-        status = o.get("status", {}).get("name", "?")
-        invoice_id = o.get("id")
+        try:
+            qty = int(o.get("totalQuantity") or 0)
+            customer = (o.get("contact") or {}).get("fullName") or "Unknown"
+            nickname = o.get("nickname") or ""
+            status = (o.get("status") or {}).get("name") or "?"
+            invoice_id = o.get("id")
 
-# Get imprints for this specific invoice
-        imprint_result = query_printavo(imprint_query, {"id": invoice_id})
-        all_imprints = []
-        if "error" not in imprint_result:
-            invoice_data = imprint_result.get("invoice") or {}
-            groups = (invoice_data.get("lineItemGroups") or {}).get("nodes", [])
-            for group in groups:
-                imprints = (group.get("imprints") or {}).get("nodes", [])
-                all_imprints.extend(imprints)
+            all_imprints = []
+            if invoice_id:
+                imprint_result = query_printavo(imprint_query, {"id": invoice_id})
+                if "error" not in imprint_result:
+                    invoice_data = imprint_result.get("invoice") or {}
+                    groups = (invoice_data.get("lineItemGroups") or {}).get("nodes") or []
+                    for group in groups:
+                        imprints = (group.get("imprints") or {}).get("nodes") or []
+                        all_imprints.extend(imprints)
 
-        num_locations = len(all_imprints)
-        order_placements = qty * num_locations
-        grand_total_qty += qty
-        grand_total_placements += order_placements
+            num_locations = len(all_imprints)
+            order_placements = qty * num_locations
+            grand_total_qty += qty
+            grand_total_placements += order_placements
 
-        lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-        lines.append(f"    Status: {status} | Items: {qty} | Locations: {num_locations} | Placements: {order_placements}")
+            lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
+            lines.append(f"    Status: {status} | Items: {qty} | Locations: {num_locations} | Placements: {order_placements}")
 
-        for imp in all_imprints:
-            type_name = imp.get("typeOfWork", {}).get("name", "Unknown")
-            details = imp.get("details", "")
-            lines.append(f"    → {type_name}: {details}")
-            breakdown_by_type[type_name] = breakdown_by_type.get(type_name, 0) + qty
+            for imp in all_imprints:
+                type_name = (imp.get("typeOfWork") or {}).get("name") or "Unknown"
+                details = imp.get("details") or ""
+                lines.append(f"    → {type_name}: {details}")
+                breakdown_by_type[type_name] = breakdown_by_type.get(type_name, 0) + qty
 
-        lines.append("")
+            lines.append("")
+
+        except Exception as e:
+            lines.append(f"  [Skipped order due to error: {str(e)}]")
+            lines.append("")
 
     lines.append("─" * 50)
     lines.append(f"TOTALS FOR {date}:")

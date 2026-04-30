@@ -162,9 +162,9 @@ def get_order_details(order_number: str) -> str:
                 f"  Item: {item.get('itemNumber', 'N/A')} | {item.get('description', '')} | "
                 f"Color: {item.get('color', 'N/A')} | ${item.get('price', '?')} ea"
             )
-            for size in item.get("sizes", {}).get("nodes", []):
+            for size in item.get("sizes", []):
                 lines.append(
-                    f"    {size.get('name', '?')}: {size.get('quantity', '?')}"
+                    f"    {size.get('size', '?')}: {size.get('count', '?')}"
                 )
     return "\n".join(lines)
 

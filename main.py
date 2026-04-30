@@ -32,10 +32,10 @@ def query_printavo(query: str, variables: dict = None):
 # ---- TOOL 1: Get Recent Orders ----
 @mcp.tool()
 def get_recent_orders(limit: int = 10) -> str:
-    """Get the most recent orders/invoices from Printavo"""
+    """Get the most recent orders/invoices from Printavo, newest first"""
     query = """
     query {
-        invoices(first: %d, sortDescending: true) {
+        invoices(first: %d, sortOn: VISUAL_ID, sortDescending: true) {
             nodes {
                 id
                 visualId
@@ -53,13 +53,15 @@ def get_recent_orders(limit: int = 10) -> str:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
     if not invoices:
-        return "No invoices found. Check API credentials."
+        return "No invoices found."
     lines = [f"RECENT {len(invoices)} ORDERS:"]
     for o in invoices:
+        due = o.get('dueAt', 'N/A')
+        due_clean = due[:10] if due else 'N/A'
         lines.append(
             f"  #{o.get('visualId')} | {o.get('contact', {}).get('fullName', 'Unknown')} | "
             f"Total: ${o.get('total', 0)} | "
-            f"Status: {o.get('status', {}).get('name', '?')} | Due: {o.get('dueAt', 'N/A')}"
+            f"Status: {o.get('status', {}).get('name', '?')} | Due: {due_clean}"
         )
     return "\n".join(lines)
 
@@ -70,7 +72,7 @@ def search_orders(customer_name: str) -> str:
     """Search for orders by customer name"""
     query = """
     query($q: String) {
-        invoices(first: 20, query: $q) {
+        invoices(first: 25, query: $q, sortOn: VISUAL_ID, sortDescending: true) {
             nodes {
                 id
                 visualId
@@ -91,9 +93,11 @@ def search_orders(customer_name: str) -> str:
         return f"No orders found for '{customer_name}'."
     lines = [f"Found {len(invoices)} order(s) for '{customer_name}':"]
     for o in invoices:
+        due = o.get('dueAt', 'N/A')
+        due_clean = due[:10] if due else 'N/A'
         lines.append(
             f"  #{o.get('visualId')} | ${o.get('total', 0)} | "
-            f"Status: {o.get('status', {}).get('name', '?')} | Due: {o.get('dueAt', 'N/A')}"
+            f"Status: {o.get('status', {}).get('name', '?')} | Due: {due_clean}"
         )
     return "\n".join(lines)
 
@@ -137,10 +141,12 @@ def get_order_details(order_number: str) -> str:
     if not invoices:
         return f"Order #{order_number} not found."
     o = invoices[0]
+    due = o.get('dueAt', 'N/A')
+    due_clean = due[:10] if due else 'N/A'
     lines = [
         f"ORDER #{o.get('visualId')} — {o.get('nickname', '')}",
         f"Customer: {o.get('contact', {}).get('fullName')} | {o.get('contact', {}).get('email')} | {o.get('contact', {}).get('phone')}",
-        f"Status: {o.get('status', {}).get('name')} | Due: {o.get('dueAt')}",
+        f"Status: {o.get('status', {}).get('name')} | Due: {due_clean}",
         f"Total: ${o.get('total')}",
         "",
         "LINE ITEMS:"
@@ -155,19 +161,46 @@ def get_order_details(order_number: str) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 4: Outstanding Balances ----
+# ---- TOOL 4: Get All Statuses ----
 @mcp.tool()
-def get_outstanding_balances() -> str:
-    """Get open orders that are not yet marked paid"""
+def get_statuses() -> str:
+    """Get all order statuses configured in your Printavo account"""
     query = """
     query {
-        invoices(first: 25, sortDescending: true) {
+        statuses(first: 25) {
+            nodes {
+                id
+                name
+                color
+            }
+        }
+    }
+    """
+    result = query_printavo(query)
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    statuses = result.get("statuses", {}).get("nodes", [])
+    if not statuses:
+        return "No statuses found."
+    lines = ["YOUR PRINTAVO STATUSES:"]
+    for s in statuses:
+        lines.append(f"  ID: {s.get('id')} | Name: {s.get('name')} | Color: {s.get('color')}")
+    return "\n".join(lines)
+
+
+# ---- TOOL 5: Outstanding Balances ----
+@mcp.tool()
+def get_outstanding_balances() -> str:
+    """Get open orders that are not yet marked paid or done"""
+    query = """
+    query {
+        invoices(first: 25, sortOn: VISUAL_ID, sortDescending: true) {
             nodes {
                 visualId
                 total
                 dueAt
                 contact { fullName email phone }
-                status { name }
+                status { name id }
             }
         }
     }
@@ -176,26 +209,35 @@ def get_outstanding_balances() -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
-    paid_keywords = ["paid", "done", "complete", "cancelled", "canceled"]
+    paid_keywords = ["paid", "done", "complete", "cancelled", "canceled", "void"]
     unpaid = [
         o for o in invoices
         if not any(kw in (o.get("status", {}).get("name", "").lower()) for kw in paid_keywords)
     ]
     if not unpaid:
-        return "No open/unpaid orders found."
+        lines = ["No open orders found in most recent 25. All statuses returned:"]
+        seen = set()
+        for o in invoices:
+            name = o.get("status", {}).get("name", "Unknown")
+            if name not in seen:
+                seen.add(name)
+                lines.append(f"  - {name}")
+        return "\n".join(lines)
     total_outstanding = sum(float(o.get("total") or 0) for o in unpaid)
     lines = [f"OPEN ORDERS — {len(unpaid)} orders | Gross value: ${total_outstanding:.2f}", ""]
     for o in unpaid:
+        due = o.get('dueAt', 'N/A')
+        due_clean = due[:10] if due else 'N/A'
         lines.append(
             f"  #{o.get('visualId')} | {o.get('contact', {}).get('fullName')} | "
-            f"Total: ${float(o.get('total') or 0):.2f} | Due: {o.get('dueAt', 'N/A')[:10] if o.get('dueAt') else 'N/A'} | "
+            f"Total: ${float(o.get('total') or 0):.2f} | Due: {due_clean} | "
             f"Status: {o.get('status', {}).get('name')} | "
             f"Phone: {o.get('contact', {}).get('phone', 'N/A')}"
         )
     return "\n".join(lines)
 
 
-# ---- TOOL 5: Create a Quote ----
+# ---- TOOL 6: Create a Quote ----
 @mcp.tool()
 def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     """
@@ -237,7 +279,7 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     return (
         f"Quote created!\n"
         f"Order #{quote.get('visualId')} | {quote.get('nickname')} | "
-        f"For: {contact['fullName']} | Due: {quote.get('dueAt')}"
+        f"For: {contact['fullName']} | Due: {quote.get('dueAt', '')[:10]}"
     )
 
 

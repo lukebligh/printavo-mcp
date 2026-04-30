@@ -161,7 +161,7 @@ def get_outstanding_balances() -> str:
     """Get open orders that are not yet marked paid"""
     query = """
     query {
-        invoices(first: 100, sortDescending: true) {
+        invoices(first: 25, sortDescending: true) {
             nodes {
                 visualId
                 total

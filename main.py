@@ -330,11 +330,11 @@ def inspect_fields(type_name: str) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 8: Production Schedule & Placement Count ----
+# ---- TOOL 8: Production Schedule ----
 @mcp.tool()
 def get_production_schedule(date: str) -> str:
     """
-    Get all orders scheduled for production on a given date, with total imprint/embroidery/DTF placements.
+    Get all orders scheduled for production on a given date with imprint counts by type.
     date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
     all_invoices = []
@@ -410,7 +410,7 @@ def get_production_schedule(date: str) -> str:
 
     lines = [f"PRODUCTION SCHEDULE — {date}", ""]
     grand_total_qty = 0
-    grand_total_placements = 0
+    grand_total_imprints = 0
     breakdown_by_type = {}
 
     for o in sorted(all_invoices, key=lambda x: x.get("visualId", 0)):
@@ -420,8 +420,16 @@ def get_production_schedule(date: str) -> str:
             nickname = o.get("nickname") or ""
             status_name = (o.get("status") or {}).get("name") or "?"
             invoice_id = o.get("id")
-
             is_store_order = "store" in status_name.lower()
+            grand_total_qty += qty
+
+            if is_store_order:
+                lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
+                lines.append(f"    Status: {status_name} | Items: {qty}")
+                lines.append(f"    → Store Order (InkSoft) — pieces only, imprints not counted")
+                breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
+                lines.append("")
+                continue
 
             all_imprints = []
             if invoice_id:
@@ -434,43 +442,34 @@ def get_production_schedule(date: str) -> str:
                         all_imprints.extend(imprints)
 
             num_locations = len(all_imprints)
-            order_placements = qty * num_locations
-            grand_total_qty += qty
-            grand_total_placements += order_placements
+            order_imprints = qty * num_locations
+            grand_total_imprints += order_imprints
 
             lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-            if is_store_order:
-                lines.append(f"    Status: {status_name} | Items: {qty}")
-            else:
-                lines.append(f"    Status: {status_name} | Items: {qty} | Locations: {num_locations} | Imprints: {order_placements}")
-             if is_store_order:
-                lines.append(f"    → Store Order (InkSoft) | Pieces: {qty}")
-                breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
-                # Don't count imprints for store orders — artwork records ≠ imprint locations
-                grand_total_placements -= order_placements
-            else:
-                for imp in all_imprints:
-                    type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
-                    details = imp.get("details") or ""
-                    details_lower = details.lower()
+            lines.append(f"    Status: {status_name} | Items: {qty} | Locations: {num_locations} | Imprints: {order_imprints}")
 
-                    if type_of_work and type_of_work.lower() not in ["unknown", ""]:
-                        dec_type = type_of_work
-                    elif "dtf" in details_lower:
-                        dec_type = "DTF"
-                    elif "embroid" in details_lower:
-                        dec_type = "Embroidery"
-                    elif "screenprint" in details_lower or "screen print" in details_lower:
-                        dec_type = "Screen Print"
-                    elif "emb" in details_lower:
-                        dec_type = "Embroidery"
-                    elif "scrn" in details_lower:
-                        dec_type = "Screen Print"
-                    else:
-                        dec_type = "Screen Print"
+            for imp in all_imprints:
+                type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
+                details = imp.get("details") or ""
+                details_lower = details.lower()
 
-                    lines.append(f"    → {dec_type}: {details[:80] if details else '(no detail)'}")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                if type_of_work and type_of_work.lower() not in ["unknown", ""]:
+                    dec_type = type_of_work
+                elif "dtf" in details_lower:
+                    dec_type = "DTF"
+                elif "embroid" in details_lower:
+                    dec_type = "Embroidery"
+                elif "screenprint" in details_lower or "screen print" in details_lower:
+                    dec_type = "Screen Print"
+                elif "emb" in details_lower:
+                    dec_type = "Embroidery"
+                elif "scrn" in details_lower:
+                    dec_type = "Screen Print"
+                else:
+                    dec_type = "Screen Print"
+
+                lines.append(f"    → {dec_type}: {details[:80] if details else '(no detail)'}")
+                breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
 
             lines.append("")
 
@@ -482,12 +481,13 @@ def get_production_schedule(date: str) -> str:
     lines.append(f"TOTALS FOR {date}:")
     lines.append(f"  Orders on schedule: {len(all_invoices)}")
     lines.append(f"  Total Items: {grand_total_qty}")
-    lines.append(f"  Total Imprints (excl. store orders): {grand_total_placements}")
+    lines.append(f"  Total Imprints (excl. store orders): {grand_total_imprints}")
     if breakdown_by_type:
         lines.append("")
         lines.append("  BY TYPE:")
         for type_name, count in sorted(breakdown_by_type.items()):
-            lines.append(f"    {type_name}: {count} placements")
+            label = "pieces" if "store" in type_name.lower() else "imprints"
+            lines.append(f"    {type_name}: {count} {label}")
 
     return "\n".join(lines)
 

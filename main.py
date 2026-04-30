@@ -162,10 +162,17 @@ def get_order_details(order_number: str) -> str:
                 f"  Item: {item.get('itemNumber', 'N/A')} | {item.get('description', '')} | "
                 f"Color: {item.get('color', 'N/A')} | ${item.get('price', '?')} ea"
             )
+            size_parts = []
             for size in item.get("sizes", []):
-                lines.append(
-                    f"    {size.get('size', '?')}: {size.get('count', '?')}"
-                )
+                count = size.get("count")
+                raw_size = size.get("size", "")
+                if count:
+                    clean_size = raw_size.replace("size_", "").upper()
+                    size_parts.append(f"{clean_size}: {count}")
+            if size_parts:
+                lines.append(f"    Sizes: {' | '.join(size_parts)}")
+            else:
+                lines.append(f"    Sizes: None entered")
     return "\n".join(lines)
 
 

@@ -10,7 +10,6 @@ API_URL = "https://www.printavo.com/api/v2"
 
 
 def query_printavo(query: str, variables: dict = None):
-    """Send a request to Printavo and return the result"""
     payload = {"query": query}
     if variables:
         payload["variables"] = variables
@@ -30,21 +29,19 @@ def query_printavo(query: str, variables: dict = None):
     return data.get("data", {})
 
 
-# ---- TOOL 1: Get Recent Invoices (your active jobs) ----
+# ---- TOOL 1: Get Recent Orders ----
 @mcp.tool()
 def get_recent_orders(limit: int = 10) -> str:
     """Get the most recent orders/invoices from Printavo"""
     query = """
     query {
-        invoices(first: %d, sortOn: CREATED_AT, descending: true) {
+        invoices(first: %d, sortDescending: true) {
             nodes {
                 id
                 visualId
                 nickname
                 total
-                balance
-                dueDate
-                productionDate
+                dueAt
                 status { name }
                 contact { fullName email phone }
             }
@@ -56,13 +53,13 @@ def get_recent_orders(limit: int = 10) -> str:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
     if not invoices:
-        return "No invoices found. Check that your API credentials are correct."
+        return "No invoices found. Check API credentials."
     lines = [f"RECENT {len(invoices)} ORDERS:"]
     for o in invoices:
         lines.append(
             f"  #{o.get('visualId')} | {o.get('contact', {}).get('fullName', 'Unknown')} | "
-            f"${o.get('total', 0)} | Balance: ${o.get('balance', 0)} | "
-            f"Status: {o.get('status', {}).get('name', '?')} | Due: {o.get('dueDate', 'N/A')}"
+            f"Total: ${o.get('total', 0)} | "
+            f"Status: {o.get('status', {}).get('name', '?')} | Due: {o.get('dueAt', 'N/A')}"
         )
     return "\n".join(lines)
 
@@ -79,8 +76,7 @@ def search_orders(customer_name: str) -> str:
                 visualId
                 nickname
                 total
-                balance
-                dueDate
+                dueAt
                 status { name }
                 contact { fullName email phone }
             }
@@ -93,12 +89,11 @@ def search_orders(customer_name: str) -> str:
     invoices = result.get("invoices", {}).get("nodes", [])
     if not invoices:
         return f"No orders found for '{customer_name}'."
-    lines = [f"Found {len(invoices)} order(s) matching '{customer_name}':"]
+    lines = [f"Found {len(invoices)} order(s) for '{customer_name}':"]
     for o in invoices:
         lines.append(
             f"  #{o.get('visualId')} | ${o.get('total', 0)} | "
-            f"Balance: ${o.get('balance', 0)} | "
-            f"Status: {o.get('status', {}).get('name', '?')} | Due: {o.get('dueDate', 'N/A')}"
+            f"Status: {o.get('status', {}).get('name', '?')} | Due: {o.get('dueAt', 'N/A')}"
         )
     return "\n".join(lines)
 
@@ -115,9 +110,7 @@ def get_order_details(order_number: str) -> str:
                 visualId
                 nickname
                 total
-                balance
-                productionDate
-                dueDate
+                dueAt
                 status { name }
                 contact { fullName email phone }
                 lineItemGroups {
@@ -147,8 +140,8 @@ def get_order_details(order_number: str) -> str:
     lines = [
         f"ORDER #{o.get('visualId')} — {o.get('nickname', '')}",
         f"Customer: {o.get('contact', {}).get('fullName')} | {o.get('contact', {}).get('email')} | {o.get('contact', {}).get('phone')}",
-        f"Status: {o.get('status', {}).get('name')} | Production: {o.get('productionDate')} | Due: {o.get('dueDate')}",
-        f"Total: ${o.get('total')} | Balance Owed: ${o.get('balance')}",
+        f"Status: {o.get('status', {}).get('name')} | Due: {o.get('dueAt')}",
+        f"Total: ${o.get('total')}",
         "",
         "LINE ITEMS:"
     ]
@@ -165,17 +158,21 @@ def get_order_details(order_number: str) -> str:
 # ---- TOOL 4: Outstanding Balances ----
 @mcp.tool()
 def get_outstanding_balances() -> str:
-    """Get all orders that still have money owed"""
+    """Get recent open orders — check for unpaid jobs"""
     query = """
     query {
-        invoices(first: 100, sortOn: DUE_AT, descending: false) {
+        invoices(first: 50, sortDescending: true) {
             nodes {
                 visualId
                 total
-                balance
-                dueDate
+                dueAt
                 contact { fullName email phone }
                 status { name }
+                transactions {
+                    nodes {
+                        amount
+                    }
+                }
             }
         }
     }
@@ -184,15 +181,21 @@ def get_outstanding_balances() -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
-    unpaid = [o for o in invoices if float(o.get("balance") or 0) > 0]
+    unpaid = []
+    for o in invoices:
+        total = float(o.get("total") or 0)
+        paid = sum(float(t.get("amount") or 0) for t in o.get("transactions", {}).get("nodes", []))
+        balance = total - paid
+        if balance > 0.01:
+            unpaid.append({**o, "calculated_balance": balance})
     if not unpaid:
         return "No outstanding balances found."
-    total_owed = sum(float(o.get("balance") or 0) for o in unpaid)
+    total_owed = sum(o["calculated_balance"] for o in unpaid)
     lines = [f"OUTSTANDING BALANCES — {len(unpaid)} orders | Total owed: ${total_owed:.2f}", ""]
     for o in unpaid:
         lines.append(
             f"  #{o.get('visualId')} | {o.get('contact', {}).get('fullName')} | "
-            f"Balance: ${float(o.get('balance') or 0):.2f} | Due: {o.get('dueDate', 'N/A')} | "
+            f"Balance: ${o['calculated_balance']:.2f} | Due: {o.get('dueAt', 'N/A')} | "
             f"Phone: {o.get('contact', {}).get('phone', 'N/A')}"
         )
     return "\n".join(lines)
@@ -218,12 +221,11 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     contacts = contact_result.get("contacts", {}).get("nodes", [])
     if not contacts:
         return f"No customer found with email '{customer_email}'. Add them to Printavo first."
-
     contact = contacts[0]
     mutation = """
-    mutation($contactId: ID!, $nickname: String, $dueDate: ISO8601DateTime) {
-        invoiceCreate(input: { contactId: $contactId, nickname: $nickname, dueAt: $dueDate }) {
-            invoice { id visualId nickname dueDate }
+    mutation($contactId: ID!, $nickname: String, $dueAt: ISO8601DateTime) {
+        quoteCreate(input: { contactId: $contactId, nickname: $nickname, dueAt: $dueAt }) {
+            quote { id visualId nickname dueAt }
             errors { message }
         }
     }
@@ -231,17 +233,17 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     result = query_printavo(mutation, {
         "contactId": contact["id"],
         "nickname": order_name,
-        "dueDate": f"{due_date}T00:00:00Z"
+        "dueAt": f"{due_date}T00:00:00Z"
     })
-    invoice_data = result.get("invoiceCreate", {})
-    errors = invoice_data.get("errors", [])
+    quote_data = result.get("quoteCreate", {})
+    errors = quote_data.get("errors", [])
     if errors:
         return f"Printavo error: {errors}"
-    invoice = invoice_data.get("invoice", {})
+    quote = quote_data.get("quote", {})
     return (
         f"Quote created!\n"
-        f"Order #{invoice.get('visualId')} | {invoice.get('nickname')} | "
-        f"For: {contact['fullName']} | Due: {invoice.get('dueDate')}"
+        f"Order #{quote.get('visualId')} | {quote.get('nickname')} | "
+        f"For: {contact['fullName']} | Due: {quote.get('dueAt')}"
     )
 
 

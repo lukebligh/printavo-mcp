@@ -2,11 +2,15 @@ from fastmcp import FastMCP
 import httpx
 import os
 import re
+import threading
+import time
+from datetime import datetime, timezone, timedelta
 
 mcp = FastMCP("Printavo Assistant")
 
 EMAIL = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN = os.environ.get("PRINTAVO_TOKEN", "")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 API_URL = "https://www.printavo.com/api/v2"
 
 
@@ -30,8 +34,22 @@ def query_printavo(query: str, variables: dict = None):
     return data.get("data", {})
 
 
+def post_to_slack(message: str):
+    """Post a message to Slack via webhook"""
+    if not SLACK_WEBHOOK_URL:
+        return False
+    try:
+        response = httpx.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": message},
+            timeout=10
+        )
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
 def normalize_location(text):
-    """Convert location text to standard abbreviation"""
     t = text.lower().strip()
     if any(x in t for x in ["full front", "ff", "front - full", "front full"]):
         return "FF"
@@ -57,13 +75,11 @@ def normalize_location(text):
 
 
 def extract_matrix_colors(matrix_col):
-    """Extract color count from pricing matrix column name like 'Contract SP 2025 (NEW) · 1 Color'"""
     if not matrix_col:
         return None
     mc = re.search(r'(\d+)\s*[Cc]olor', matrix_col)
     if mc:
         return int(mc.group(1))
-    # Fallback: find any number
     mc = re.search(r'(\d+)', matrix_col)
     if mc:
         return int(mc.group(1))
@@ -71,10 +87,6 @@ def extract_matrix_colors(matrix_col):
 
 
 def parse_imprint_details(details):
-    """
-    Parse structured imprint details (from direct orders).
-    Returns list of dicts: [{"location": "FF", "colors": 3}]
-    """
     results = []
     if not details:
         return results
@@ -91,19 +103,258 @@ def parse_imprint_details(details):
 
 
 def parse_description_imprints(description):
-    """
-    Parse line item description for imprint info like '1C LC', '2C FF', '1C Back Top'.
-    Returns list of dicts: [{"location": "LC", "colors": 1}]
-    """
     results = []
     if not description:
         return results
-    # Match "1C LC", "2C FF", "1C Full Back", etc.
     matches = re.findall(r'(\d+)C\s+([A-Za-z][A-Za-z ]{1,15}?)(?:\n|,|$)', description)
     for colors, location in matches:
         loc = normalize_location(location.strip())
         results.append({"location": loc, "colors": int(colors)})
     return results
+
+
+def build_production_schedule(date: str) -> str:
+    """Core logic for production schedule — used by both the tool and the Slack scheduler"""
+    all_invoices = []
+    page_query = """
+    query($cursor: String) {
+        invoices(first: 25, after: $cursor, sortOn: VISUAL_ID, sortDescending: true) {
+            nodes {
+                id
+                visualId
+                nickname
+                totalQuantity
+                startAt
+                status { name }
+                contact { fullName }
+            }
+            pageInfo { hasNextPage endCursor }
+        }
+    }
+    """
+    cursor = None
+    pages_searched = 0
+    found_any = False
+    consecutive_misses = 0
+
+    while pages_searched < 20:
+        variables = {"cursor": cursor} if cursor else {}
+        result = query_printavo(page_query, variables)
+        if "error" in result:
+            return f"API Error: {result['error']}"
+        nodes = (result.get("invoices") or {}).get("nodes", [])
+        page_info = (result.get("invoices") or {}).get("pageInfo", {})
+        for o in nodes:
+            start = (o.get("startAt") or "")[:10]
+            if start == date:
+                all_invoices.append(o)
+                found_any = True
+                consecutive_misses = 0
+            elif found_any and start < date:
+                consecutive_misses += 1
+        if consecutive_misses >= 25:
+            break
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        pages_searched += 1
+
+    if not all_invoices:
+        return f"No orders scheduled for production on {date}."
+
+    detail_query = """
+    query($id: ID!) {
+        invoice(id: $id) {
+            lineItemGroups {
+                nodes {
+                    lineItems {
+                        nodes { description }
+                    }
+                    imprints {
+                        nodes {
+                            details
+                            typeOfWork { name }
+                            pricingMatrixColumn { columnName }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+
+    lines = [f"*PRODUCTION SCHEDULE — {date}*", ""]
+    grand_total_qty = 0
+    grand_total_imprints = 0
+    grand_total_screens = 0
+    breakdown_by_type = {}
+
+    for o in sorted(all_invoices, key=lambda x: x.get("visualId", 0)):
+        try:
+            qty = int(o.get("totalQuantity") or 0)
+            customer = (o.get("contact") or {}).get("fullName") or "Unknown"
+            nickname = o.get("nickname") or ""
+            status_name = (o.get("status") or {}).get("name") or "?"
+            invoice_id = o.get("id")
+            is_store_order = "store" in status_name.lower()
+            grand_total_qty += qty
+
+            if is_store_order:
+                lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
+                lines.append(f"    Status: {status_name} | Items: {qty}")
+                lines.append(f"    → Store Order (InkSoft) — pieces only")
+                breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
+                lines.append("")
+                continue
+
+            all_imprints = []
+            all_descriptions = []
+            if invoice_id:
+                detail_result = query_printavo(detail_query, {"id": invoice_id})
+                if "error" not in detail_result:
+                    invoice_data = detail_result.get("invoice") or {}
+                    groups = (invoice_data.get("lineItemGroups") or {}).get("nodes") or []
+                    for group in groups:
+                        imprints = (group.get("imprints") or {}).get("nodes") or []
+                        all_imprints.extend(imprints)
+                        items = (group.get("lineItems") or {}).get("nodes") or []
+                        for item in items:
+                            desc = item.get("description") or ""
+                            if desc:
+                                all_descriptions.append(desc)
+
+            order_screens = 0
+            imprint_lines = []
+            parsed_from_imprints = []
+
+            for imp in all_imprints:
+                type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
+                details = imp.get("details") or ""
+                matrix_col = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
+                details_lower = details.lower()
+
+                if type_of_work and type_of_work.lower() == "embroidery":
+                    imprint_lines.append(f"    → Embroidery")
+                    breakdown_by_type["Embroidery"] = breakdown_by_type.get("Embroidery", 0) + qty
+                    grand_total_imprints += qty
+                    parsed_from_imprints.append(True)
+                    continue
+
+                if "dtf" in details_lower:
+                    dec_type = "DTF"
+                elif "embroid" in details_lower:
+                    dec_type = "Embroidery"
+                elif "screenprint" in details_lower or "screen print" in details_lower:
+                    dec_type = "Screen Print"
+                else:
+                    dec_type = "Screen Print"
+
+                matrix_colors = extract_matrix_colors(matrix_col)
+                parsed = parse_imprint_details(details)
+
+                if parsed:
+                    for p in parsed:
+                        loc = p.get("location", "?")
+                        colors = p.get("colors") or matrix_colors
+                        color_str = f"{colors}C" if colors else "?C"
+                        screens = colors if colors else 0
+                        order_screens += screens
+                        parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
+                        imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
+                        breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                        grand_total_imprints += qty
+
+                elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
+                    loc = normalize_location(details.strip())
+                    colors = matrix_colors
+                    color_str = f"{colors}C" if colors else "?C"
+                    screens = colors if colors else 0
+                    order_screens += screens
+                    parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
+                    imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
+                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                    grand_total_imprints += qty
+
+                elif matrix_colors:
+                    color_str = f"{matrix_colors}C"
+                    order_screens += matrix_colors
+                    parsed_from_imprints.append({"location": None, "colors": matrix_colors, "type": dec_type})
+                    imprint_lines.append(f"    → {dec_type} | {color_str} (location not entered)")
+                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                    grand_total_imprints += qty
+
+                else:
+                    imprint_lines.append(f"    → {dec_type} | (no color/location entered)")
+                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
+                    grand_total_imprints += qty
+
+            if not parsed_from_imprints and all_descriptions:
+                seen_combos = set()
+                for desc in all_descriptions:
+                    parsed = parse_description_imprints(desc)
+                    for p in parsed:
+                        key = (p["location"], p["colors"])
+                        if key not in seen_combos:
+                            seen_combos.add(key)
+                            loc = p["location"]
+                            colors = p["colors"]
+                            color_str = f"{colors}C"
+                            order_screens += colors
+                            imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
+                            breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
+                            grand_total_imprints += qty
+                if not seen_combos:
+                    imprint_lines.append(f"    → Screen Print | (no color/location entered)")
+                    breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
+                    grand_total_imprints += qty
+
+            grand_total_screens += order_screens
+            num_locations = len(all_imprints)
+            order_imprints = qty * num_locations
+
+            lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
+            lines.append(f"    Status: {status_name} | Items: {qty} | Imprints: {order_imprints} | Est. Screens: {order_screens if order_screens else '(not entered)'}")
+            lines.extend(imprint_lines)
+            lines.append("")
+
+        except Exception as e:
+            lines.append(f"  [Skipped #{o.get('visualId')} due to error: {str(e)}]")
+            lines.append("")
+
+    lines.append("─" * 50)
+    lines.append(f"TOTALS FOR {date}:")
+    lines.append(f"  Orders on schedule: {len(all_invoices)}")
+    lines.append(f"  Total Items: {grand_total_qty}")
+    lines.append(f"  Total Imprints (excl. store orders): {grand_total_imprints}")
+    lines.append(f"  Est. Total Screens Needed: {grand_total_screens if grand_total_screens else '(color data missing on some orders)'}")
+    if breakdown_by_type:
+        lines.append("")
+        lines.append("  BY TYPE:")
+        for type_name, count in sorted(breakdown_by_type.items()):
+            label = "pieces" if "store" in type_name.lower() else "imprints"
+            lines.append(f"    {type_name}: {count} {label}")
+
+    return "\n".join(lines)
+
+
+def run_daily_scheduler():
+    """Background thread — posts production schedule to Slack every day at 6am CST"""
+    CST = timezone(timedelta(hours=-6))
+    while True:
+        now = datetime.now(CST)
+        # Target: 6:00am CST
+        target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        time.sleep(wait_seconds)
+
+        # Fire at 6am
+        today = datetime.now(CST).strftime("%Y-%m-%d")
+        day_name = datetime.now(CST).strftime("%A, %B %d")
+        schedule = build_production_schedule(today)
+        message = f":printer: *Good morning, Est. Merch team!* Here's your production schedule for *{day_name}*:\n\n{schedule}"
+        post_to_slack(message)
 
 
 # ---- TOOL 1: Get Recent Orders ----
@@ -328,8 +579,8 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     """
     Create a new quote in Printavo.
     customer_email: must already exist as a contact in Printavo
-    order_name: nickname for this job (e.g. 'Spring 2026 Tees')
-    due_date: format YYYY-MM-DD (e.g. 2026-05-15)
+    order_name: nickname for this job
+    due_date: format YYYY-MM-DD
     """
     contact_query = """
     query($q: String) {
@@ -368,7 +619,7 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     )
 
 
-# ---- TOOL 7: Inspect API Field Names (Diagnostic) ----
+# ---- TOOL 7: Inspect API Field Names ----
 @mcp.tool()
 def inspect_fields(type_name: str) -> str:
     """Look up the exact field names on any Printavo API type."""
@@ -405,238 +656,31 @@ def get_production_schedule(date: str) -> str:
     Shows imprint locations, color counts, and estimated screens needed.
     date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
-    all_invoices = []
-    page_query = """
-    query($cursor: String) {
-        invoices(first: 25, after: $cursor, sortOn: VISUAL_ID, sortDescending: true) {
-            nodes {
-                id
-                visualId
-                nickname
-                totalQuantity
-                startAt
-                status { name }
-                contact { fullName }
-            }
-            pageInfo { hasNextPage endCursor }
-        }
-    }
+    return build_production_schedule(date)
+
+
+# ---- TOOL 9: Send Production Schedule to Slack Now ----
+@mcp.tool()
+def send_schedule_to_slack(date: str) -> str:
     """
-    cursor = None
-    pages_searched = 0
-    found_any = False
-    consecutive_misses = 0
-
-    while pages_searched < 20:
-        variables = {"cursor": cursor} if cursor else {}
-        result = query_printavo(page_query, variables)
-        if "error" in result:
-            return f"API Error: {result['error']}"
-        nodes = (result.get("invoices") or {}).get("nodes", [])
-        page_info = (result.get("invoices") or {}).get("pageInfo", {})
-        for o in nodes:
-            start = (o.get("startAt") or "")[:10]
-            if start == date:
-                all_invoices.append(o)
-                found_any = True
-                consecutive_misses = 0
-            elif found_any and start < date:
-                consecutive_misses += 1
-        if consecutive_misses >= 25:
-            break
-        if not page_info.get("hasNextPage"):
-            break
-        cursor = page_info.get("endCursor")
-        pages_searched += 1
-
-    if not all_invoices:
-        return f"No orders scheduled for production on {date}."
-
-    detail_query = """
-    query($id: ID!) {
-        invoice(id: $id) {
-            lineItemGroups {
-                nodes {
-                    lineItems {
-                        nodes { description }
-                    }
-                    imprints {
-                        nodes {
-                            details
-                            typeOfWork { name }
-                            pricingMatrixColumn { columnName }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    Manually send the production schedule for any date to Slack right now.
+    date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
-
-    lines = [f"PRODUCTION SCHEDULE — {date}", ""]
-    grand_total_qty = 0
-    grand_total_imprints = 0
-    grand_total_screens = 0
-    breakdown_by_type = {}
-
-    for o in sorted(all_invoices, key=lambda x: x.get("visualId", 0)):
-        try:
-            qty = int(o.get("totalQuantity") or 0)
-            customer = (o.get("contact") or {}).get("fullName") or "Unknown"
-            nickname = o.get("nickname") or ""
-            status_name = (o.get("status") or {}).get("name") or "?"
-            invoice_id = o.get("id")
-            is_store_order = "store" in status_name.lower()
-            grand_total_qty += qty
-
-            if is_store_order:
-                lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-                lines.append(f"    Status: {status_name} | Items: {qty}")
-                lines.append(f"    → Store Order (InkSoft) — pieces only, imprints not counted")
-                breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
-                lines.append("")
-                continue
-
-            all_imprints = []
-            all_descriptions = []
-            if invoice_id:
-                detail_result = query_printavo(detail_query, {"id": invoice_id})
-                if "error" not in detail_result:
-                    invoice_data = detail_result.get("invoice") or {}
-                    groups = (invoice_data.get("lineItemGroups") or {}).get("nodes") or []
-                    for group in groups:
-                        imprints = (group.get("imprints") or {}).get("nodes") or []
-                        all_imprints.extend(imprints)
-                        items = (group.get("lineItems") or {}).get("nodes") or []
-                        for item in items:
-                            desc = item.get("description") or ""
-                            if desc:
-                                all_descriptions.append(desc)
-
-            order_screens = 0
-            imprint_lines = []
-            parsed_from_imprints = []
-
-            for imp in all_imprints:
-                type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
-                details = imp.get("details") or ""
-                matrix_col = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
-                details_lower = details.lower()
-
-                # Handle embroidery
-                if type_of_work and type_of_work.lower() == "embroidery":
-                    imprint_lines.append(f"    → Embroidery")
-                    breakdown_by_type["Embroidery"] = breakdown_by_type.get("Embroidery", 0) + qty
-                    grand_total_imprints += qty
-                    parsed_from_imprints.append(True)
-                    continue
-
-                # Infer decoration type
-                if "dtf" in details_lower:
-                    dec_type = "DTF"
-                elif "embroid" in details_lower:
-                    dec_type = "Embroidery"
-                elif "screenprint" in details_lower or "screen print" in details_lower:
-                    dec_type = "Screen Print"
-                else:
-                    dec_type = "Screen Print"
-
-                # Get color count from matrix column name
-                matrix_colors = extract_matrix_colors(matrix_col)
-
-                # Try structured parsing first (direct orders with "Location: X / Colors: Y" format)
-                parsed = parse_imprint_details(details)
-
-                if parsed:
-                    # Structured details — direct order format
-                    for p in parsed:
-                        loc = p.get("location", "?")
-                        colors = p.get("colors") or matrix_colors
-                        color_str = f"{colors}C" if colors else "?C"
-                        screens = colors if colors else 0
-                        order_screens += screens
-                        parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
-                        imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
-                        breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                        grand_total_imprints += qty
-
-                elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
-                    # Short plain text — likely just a location name like "Left Chest" or "Full Back"
-                    loc = normalize_location(details.strip())
-                    colors = matrix_colors
-                    color_str = f"{colors}C" if colors else "?C"
-                    screens = colors if colors else 0
-                    order_screens += screens
-                    parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
-                    imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                    grand_total_imprints += qty
-
-                elif matrix_colors:
-                    # Color count from matrix but no location info
-                    color_str = f"{matrix_colors}C"
-                    order_screens += matrix_colors
-                    parsed_from_imprints.append({"location": None, "colors": matrix_colors, "type": dec_type})
-                    imprint_lines.append(f"    → {dec_type} | {color_str} (location not in Printavo)")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                    grand_total_imprints += qty
-
-                else:
-                    # Nothing parseable — flag for data entry
-                    imprint_lines.append(f"    → {dec_type} | (no color/location entered in Printavo)")
-                    breakdown_by_type[dec_type] = breakdown_by_type.get(dec_type, 0) + qty
-                    grand_total_imprints += qty
-
-            # Fallback: if imprints had no data, try parsing line item descriptions
-            if not parsed_from_imprints and all_descriptions:
-                seen_combos = set()
-                for desc in all_descriptions:
-                    parsed = parse_description_imprints(desc)
-                    for p in parsed:
-                        key = (p["location"], p["colors"])
-                        if key not in seen_combos:
-                            seen_combos.add(key)
-                            loc = p["location"]
-                            colors = p["colors"]
-                            color_str = f"{colors}C"
-                            order_screens += colors
-                            imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
-                            breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
-                            grand_total_imprints += qty
-                if not seen_combos:
-                    imprint_lines.append(f"    → Screen Print | (no color/location entered in Printavo)")
-                    breakdown_by_type["Screen Print"] = breakdown_by_type.get("Screen Print", 0) + qty
-                    grand_total_imprints += qty
-
-            grand_total_screens += order_screens
-            num_locations = len(all_imprints)
-            order_imprints = qty * num_locations
-
-            lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-            lines.append(f"    Status: {status_name} | Items: {qty} | Imprints: {order_imprints} | Est. Screens: {order_screens if order_screens else '(not entered)'}")
-            lines.extend(imprint_lines)
-            lines.append("")
-
-        except Exception as e:
-            lines.append(f"  [Skipped #{o.get('visualId')} due to error: {str(e)}]")
-            lines.append("")
-
-    lines.append("─" * 50)
-    lines.append(f"TOTALS FOR {date}:")
-    lines.append(f"  Orders on schedule: {len(all_invoices)}")
-    lines.append(f"  Total Items: {grand_total_qty}")
-    lines.append(f"  Total Imprints (excl. store orders): {grand_total_imprints}")
-    lines.append(f"  Est. Total Screens Needed: {grand_total_screens if grand_total_screens else '(color data missing on some orders)'}")
-    if breakdown_by_type:
-        lines.append("")
-        lines.append("  BY TYPE:")
-        for type_name, count in sorted(breakdown_by_type.items()):
-            label = "pieces" if "store" in type_name.lower() else "imprints"
-            lines.append(f"    {type_name}: {count} {label}")
-
-    return "\n".join(lines)
+    schedule = build_production_schedule(date)
+    CST = timezone(timedelta(hours=-6))
+    day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A, %B %d")
+    message = f":printer: *Good morning, Est. Merch team!* Here's your production schedule for *{day_name}*:\n\n{schedule}"
+    success = post_to_slack(message)
+    if success:
+        return f"Production schedule for {date} posted to Slack successfully!"
+    else:
+        return "Failed to post to Slack. Check that SLACK_WEBHOOK_URL is set in Railway variables."
 
 
 if __name__ == "__main__":
+    # Start the daily 6am Slack scheduler in a background thread
+    scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
+    scheduler_thread.start()
+
     port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="sse", host="0.0.0.0", port=port)

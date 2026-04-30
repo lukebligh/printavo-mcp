@@ -336,62 +336,45 @@ def get_production_schedule(date: str) -> str:
     """
     Get all orders scheduled for production on a given date, with total imprint/embroidery/DTF placements.
     date: format YYYY-MM-DD (e.g. 2026-05-01)
-    Formula: total items on order x number of imprint locations = total placements
     """
-    query = """
+    # Pass 1: Get invoices scheduled for this date (lightweight query)
+    step1 = """
     query($after: ISO8601DateTime, $before: ISO8601DateTime) {
-        invoices(first: 25, startAtAfter: $after, startAtBefore: $before) {
+        invoices(first: 10, startAtAfter: $after, startAtBefore: $before) {
             nodes {
+                id
                 visualId
                 nickname
                 totalQuantity
                 startAt
                 status { name }
                 contact { fullName }
-                lineItemGroups {
-                    nodes {
-                        imprints {
-                            nodes {
-                                details
-                                typeOfWork { name }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
     """
     after = f"{date}T00:00:00Z"
     before = f"{date}T23:59:59Z"
-    result = query_printavo(query, {"after": after, "before": before})
+    result = query_printavo(step1, {"after": after, "before": before})
+
+    # Fallback: filter recent invoices by startAt in Python
     if "error" in result:
-        # Fallback: pull recent invoices and filter by startAt in Python
-        fallback_query = """
+        fallback = """
         query {
             invoices(first: 25, sortOn: VISUAL_ID, sortDescending: true) {
                 nodes {
+                    id
                     visualId
                     nickname
                     totalQuantity
                     startAt
                     status { name }
                     contact { fullName }
-                    lineItemGroups {
-                        nodes {
-                            imprints {
-                                nodes {
-                                    details
-                                    typeOfWork { name }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
         """
-        result = query_printavo(fallback_query)
+        result = query_printavo(fallback)
         if "error" in result:
             return f"API Error: {result['error']}"
         all_invoices = result.get("invoices", {}).get("nodes", [])
@@ -401,6 +384,24 @@ def get_production_schedule(date: str) -> str:
 
     if not invoices:
         return f"No orders scheduled for production on {date}."
+
+    # Pass 2: For each invoice, get imprint details separately
+    imprint_query = """
+    query($id: ID!) {
+        invoice(id: $id) {
+            lineItemGroups {
+                nodes {
+                    imprints {
+                        nodes {
+                            details
+                            typeOfWork { name }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
 
     lines = [f"PRODUCTION SCHEDULE — {date}", ""]
     grand_total_qty = 0
@@ -412,12 +413,16 @@ def get_production_schedule(date: str) -> str:
         customer = o.get("contact", {}).get("fullName", "Unknown")
         nickname = o.get("nickname", "")
         status = o.get("status", {}).get("name", "?")
-        groups = o.get("lineItemGroups", {}).get("nodes", [])
+        invoice_id = o.get("id")
 
+        # Get imprints for this specific invoice
+        imprint_result = query_printavo(imprint_query, {"id": invoice_id})
         all_imprints = []
-        for group in groups:
-            imprints = group.get("imprints", {}).get("nodes", [])
-            all_imprints.extend(imprints)
+        if "error" not in imprint_result:
+            groups = imprint_result.get("invoice", {}).get("lineItemGroups", {}).get("nodes", [])
+            for group in groups:
+                imprints = group.get("imprints", {}).get("nodes", [])
+                all_imprints.extend(imprints)
 
         num_locations = len(all_imprints)
         order_placements = qty * num_locations
@@ -437,13 +442,14 @@ def get_production_schedule(date: str) -> str:
 
     lines.append("─" * 50)
     lines.append(f"TOTALS FOR {date}:")
-    lines.append(f"  Orders: {len(invoices)}")
+    lines.append(f"  Orders on schedule: {len(invoices)}")
     lines.append(f"  Total Items: {grand_total_qty}")
     lines.append(f"  Total Placements: {grand_total_placements}")
-    lines.append("")
-    lines.append("  BY TYPE:")
-    for type_name, count in sorted(breakdown_by_type.items()):
-        lines.append(f"    {type_name}: {count} placements")
+    if breakdown_by_type:
+        lines.append("")
+        lines.append("  BY TYPE:")
+        for type_name, count in sorted(breakdown_by_type.items()):
+            lines.append(f"    {type_name}: {count} placements")
 
     return "\n".join(lines)
 

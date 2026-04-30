@@ -102,7 +102,7 @@ def search_orders(customer_name: str) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 3: Get Full Order Details ----
+# ---- TOOL 3: Get Order Details ----
 @mcp.tool()
 def get_order_details(order_number: str) -> str:
     """Get full details on a specific order. Use the visual order number like 1042."""
@@ -119,13 +119,16 @@ def get_order_details(order_number: str) -> str:
                 contact { fullName email phone }
                 lineItemGroups {
                     nodes {
-                        name
+                        id
+                        description
+                        style
+                        garmentColor
                         lineItems {
                             nodes {
-                                name
-                                quantity
-                                unitPrice
-                                total
+                                id
+                                size
+                                qty
+                                price
                             }
                         }
                     }
@@ -152,11 +155,12 @@ def get_order_details(order_number: str) -> str:
         "LINE ITEMS:"
     ]
     for group in o.get("lineItemGroups", {}).get("nodes", []):
-        lines.append(f"  Group: {group.get('name', '')}")
+        lines.append(
+            f"  Style: {group.get('style', 'N/A')} | {group.get('description', '')} | Color: {group.get('garmentColor', 'N/A')}"
+        )
         for item in group.get("lineItems", {}).get("nodes", []):
             lines.append(
-                f"    - {item.get('name')} | Qty: {item.get('quantity')} | "
-                f"${item.get('unitPrice')} ea | Total: ${item.get('total')}"
+                f"    Size: {item.get('size', '?')} | Qty: {item.get('qty', '?')} | ${item.get('price', '?')} ea"
             )
     return "\n".join(lines)
 
@@ -281,6 +285,38 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
         f"Order #{quote.get('visualId')} | {quote.get('nickname')} | "
         f"For: {contact['fullName']} | Due: {quote.get('dueAt', '')[:10]}"
     )
+
+
+# ---- TOOL 7: Inspect API Field Names (Diagnostic) ----
+@mcp.tool()
+def inspect_fields(type_name: str) -> str:
+    """Look up the exact field names on any Printavo API type. Try: Invoice, LineItemGroup, LineItem"""
+    query = """
+    query($typeName: String!) {
+        __type(name: $typeName) {
+            name
+            fields {
+                name
+                type {
+                    name
+                    kind
+                }
+            }
+        }
+    }
+    """
+    result = query_printavo(query, {"typeName": type_name})
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    type_data = result.get("__type")
+    if not type_data:
+        return f"Type '{type_name}' not found."
+    fields = type_data.get("fields", [])
+    lines = [f"FIELDS ON {type_name}:"]
+    for f in fields:
+        type_info = f.get("type", {})
+        lines.append(f"  {f.get('name')} ({type_info.get('name', type_info.get('kind', '?'))})")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

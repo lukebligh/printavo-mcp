@@ -465,6 +465,7 @@ def get_production_schedule(date: str) -> str:
                         nodes {
                             details
                             typeOfWork { name }
+                            pricingMatrixColumn { columnName }
                         }
                     }
                 }
@@ -523,6 +524,7 @@ def get_production_schedule(date: str) -> str:
             for imp in all_imprints:
                 type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
                 details = imp.get("details") or ""
+                matrix_col = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
                 details_lower = details.lower()
 
                 if type_of_work and type_of_work.lower() == "embroidery":
@@ -544,9 +546,16 @@ def get_production_schedule(date: str) -> str:
                     dec_type = "Screen Print"
 
                 parsed = parse_imprint_details(details)
+                # If no color count from details, try extracting from matrix column name
+                matrix_colors = None
+                if matrix_col:
+                    mc = re.search(r'(\d+)', matrix_col)
+                    if mc:
+                        matrix_colors = int(mc.group(1))
+
                 for p in parsed:
                     loc = p.get("location", "?")
-                    colors = p.get("colors")
+                    colors = p.get("colors") or matrix_colors
                     color_str = f"{colors}C" if colors else "?C"
                     screens = colors if colors else 0
                     order_screens += screens

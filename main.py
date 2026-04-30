@@ -105,7 +105,7 @@ def search_orders(customer_name: str) -> str:
 # ---- TOOL 3: Get Order Details ----
 @mcp.tool()
 def get_order_details(order_number: str) -> str:
-    """Get full details on a specific order. Use the visual order number like 1042."""
+    """Get full details on a specific order including style, color, and size quantities."""
     query = """
     query($q: String) {
         invoices(first: 1, query: $q) {
@@ -120,15 +120,19 @@ def get_order_details(order_number: str) -> str:
                 lineItemGroups {
                     nodes {
                         id
-                        description
-                        style
-                        garmentColor
                         lineItems {
                             nodes {
                                 id
-                                size
-                                qty
+                                description
+                                itemNumber
+                                color
                                 price
+                                sizes {
+                                    nodes {
+                                        name
+                                        quantity
+                                    }
+                                }
                             }
                         }
                     }
@@ -155,13 +159,15 @@ def get_order_details(order_number: str) -> str:
         "LINE ITEMS:"
     ]
     for group in o.get("lineItemGroups", {}).get("nodes", []):
-        lines.append(
-            f"  Style: {group.get('style', 'N/A')} | {group.get('description', '')} | Color: {group.get('garmentColor', 'N/A')}"
-        )
         for item in group.get("lineItems", {}).get("nodes", []):
             lines.append(
-                f"    Size: {item.get('size', '?')} | Qty: {item.get('qty', '?')} | ${item.get('price', '?')} ea"
+                f"  Item: {item.get('itemNumber', 'N/A')} | {item.get('description', '')} | "
+                f"Color: {item.get('color', 'N/A')} | ${item.get('price', '?')} ea"
             )
+            for size in item.get("sizes", {}).get("nodes", []):
+                lines.append(
+                    f"    {size.get('name', '?')}: {size.get('quantity', '?')}"
+                )
     return "\n".join(lines)
 
 

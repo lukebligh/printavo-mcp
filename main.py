@@ -2,10 +2,8 @@ from fastmcp import FastMCP
 import httpx
 import os
 
-# Create the MCP server — this is the "translator box"
 mcp = FastMCP("Printavo Assistant")
 
-# These get filled in from Railway (we set them in Phase 3)
 EMAIL = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN = os.environ.get("PRINTAVO_TOKEN", "")
 API_URL = "https://www.printavo.com/api/v2"
@@ -19,8 +17,11 @@ def query_printavo(query: str, variables: dict = None):
     response = httpx.post(
         API_URL,
         json=payload,
-        params={"email": EMAIL, "token": TOKEN},
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "email": EMAIL,
+            "token": TOKEN
+        },
         timeout=30
     )
     data = response.json()
@@ -29,13 +30,13 @@ def query_printavo(query: str, variables: dict = None):
     return data.get("data", {})
 
 
-# ---- TOOL 1: Get Recent Orders ----
+# ---- TOOL 1: Get Recent Invoices (your active jobs) ----
 @mcp.tool()
 def get_recent_orders(limit: int = 10) -> str:
-    """Get the most recent orders from Printavo"""
+    """Get the most recent orders/invoices from Printavo"""
     query = """
     query {
-        orders(first: %d, sortOn: CREATED_AT, descending: true) {
+        invoices(first: %d, sortOn: CREATED_AT, descending: true) {
             nodes {
                 id
                 visualId
@@ -51,11 +52,13 @@ def get_recent_orders(limit: int = 10) -> str:
     }
     """ % limit
     result = query_printavo(query)
-    orders = result.get("orders", {}).get("nodes", [])
-    if not orders:
-        return "No orders found."
-    lines = [f"RECENT {len(orders)} ORDERS:"]
-    for o in orders:
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    invoices = result.get("invoices", {}).get("nodes", [])
+    if not invoices:
+        return "No invoices found. Check that your API credentials are correct."
+    lines = [f"RECENT {len(invoices)} ORDERS:"]
+    for o in invoices:
         lines.append(
             f"  #{o.get('visualId')} | {o.get('contact', {}).get('fullName', 'Unknown')} | "
             f"${o.get('total', 0)} | Balance: ${o.get('balance', 0)} | "
@@ -64,13 +67,13 @@ def get_recent_orders(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-# ---- TOOL 2: Search Orders by Customer Name ----
+# ---- TOOL 2: Search by Customer Name ----
 @mcp.tool()
 def search_orders(customer_name: str) -> str:
     """Search for orders by customer name"""
     query = """
     query($q: String) {
-        orders(first: 20, query: $q) {
+        invoices(first: 20, query: $q) {
             nodes {
                 id
                 visualId
@@ -85,11 +88,13 @@ def search_orders(customer_name: str) -> str:
     }
     """
     result = query_printavo(query, {"q": customer_name})
-    orders = result.get("orders", {}).get("nodes", [])
-    if not orders:
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    invoices = result.get("invoices", {}).get("nodes", [])
+    if not invoices:
         return f"No orders found for '{customer_name}'."
-    lines = [f"Found {len(orders)} order(s) matching '{customer_name}':"]
-    for o in orders:
+    lines = [f"Found {len(invoices)} order(s) matching '{customer_name}':"]
+    for o in invoices:
         lines.append(
             f"  #{o.get('visualId')} | ${o.get('total', 0)} | "
             f"Balance: ${o.get('balance', 0)} | "
@@ -101,10 +106,10 @@ def search_orders(customer_name: str) -> str:
 # ---- TOOL 3: Get Full Order Details ----
 @mcp.tool()
 def get_order_details(order_number: str) -> str:
-    """Get full details on a specific order including line items. Use the order number (like 1042)."""
+    """Get full details on a specific order. Use the visual order number like 1042."""
     query = """
     query($q: String) {
-        orders(first: 1, query: $q) {
+        invoices(first: 1, query: $q) {
             nodes {
                 id
                 visualId
@@ -115,12 +120,17 @@ def get_order_details(order_number: str) -> str:
                 dueDate
                 status { name }
                 contact { fullName email phone }
-                lineItems {
+                lineItemGroups {
                     nodes {
                         name
-                        quantity
-                        unitPrice
-                        total
+                        lineItems {
+                            nodes {
+                                name
+                                quantity
+                                unitPrice
+                                total
+                            }
+                        }
                     }
                 }
             }
@@ -128,10 +138,12 @@ def get_order_details(order_number: str) -> str:
     }
     """
     result = query_printavo(query, {"q": order_number})
-    orders = result.get("orders", {}).get("nodes", [])
-    if not orders:
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    invoices = result.get("invoices", {}).get("nodes", [])
+    if not invoices:
         return f"Order #{order_number} not found."
-    o = orders[0]
+    o = invoices[0]
     lines = [
         f"ORDER #{o.get('visualId')} — {o.get('nickname', '')}",
         f"Customer: {o.get('contact', {}).get('fullName')} | {o.get('contact', {}).get('email')} | {o.get('contact', {}).get('phone')}",
@@ -140,21 +152,23 @@ def get_order_details(order_number: str) -> str:
         "",
         "LINE ITEMS:"
     ]
-    for item in o.get("lineItems", {}).get("nodes", []):
-        lines.append(
-            f"  - {item.get('name')} | Qty: {item.get('quantity')} | "
-            f"${item.get('unitPrice')} ea | Line Total: ${item.get('total')}"
-        )
+    for group in o.get("lineItemGroups", {}).get("nodes", []):
+        lines.append(f"  Group: {group.get('name', '')}")
+        for item in group.get("lineItems", {}).get("nodes", []):
+            lines.append(
+                f"    - {item.get('name')} | Qty: {item.get('quantity')} | "
+                f"${item.get('unitPrice')} ea | Total: ${item.get('total')}"
+            )
     return "\n".join(lines)
 
 
-# ---- TOOL 4: Get Outstanding Balances ----
+# ---- TOOL 4: Outstanding Balances ----
 @mcp.tool()
 def get_outstanding_balances() -> str:
-    """Get all orders that still have money owed — your AR list"""
+    """Get all orders that still have money owed"""
     query = """
     query {
-        orders(first: 100, sortOn: DUE_AT, descending: false) {
+        invoices(first: 100, sortOn: DUE_AT, descending: false) {
             nodes {
                 visualId
                 total
@@ -167,10 +181,12 @@ def get_outstanding_balances() -> str:
     }
     """
     result = query_printavo(query)
-    orders = result.get("orders", {}).get("nodes", [])
-    unpaid = [o for o in orders if float(o.get("balance") or 0) > 0]
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    invoices = result.get("invoices", {}).get("nodes", [])
+    unpaid = [o for o in invoices if float(o.get("balance") or 0) > 0]
     if not unpaid:
-        return "You're all caught up — no outstanding balances!"
+        return "No outstanding balances found."
     total_owed = sum(float(o.get("balance") or 0) for o in unpaid)
     lines = [f"OUTSTANDING BALANCES — {len(unpaid)} orders | Total owed: ${total_owed:.2f}", ""]
     for o in unpaid:
@@ -187,9 +203,9 @@ def get_outstanding_balances() -> str:
 def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     """
     Create a new quote in Printavo.
-    customer_email: the customer's email address (must already exist in Printavo)
-    order_name: a nickname for this job (e.g., 'Spring 2026 Tees')
-    due_date: in YYYY-MM-DD format (e.g., 2026-05-15)
+    customer_email: must already exist as a contact in Printavo
+    order_name: nickname for this job (e.g. 'Spring 2026 Tees')
+    due_date: format YYYY-MM-DD (e.g. 2026-05-15)
     """
     contact_query = """
     query($q: String) {
@@ -201,35 +217,34 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     contact_result = query_printavo(contact_query, {"q": customer_email})
     contacts = contact_result.get("contacts", {}).get("nodes", [])
     if not contacts:
-        return f"No customer found with email '{customer_email}'. Add them to Printavo first, then try again."
+        return f"No customer found with email '{customer_email}'. Add them to Printavo first."
 
     contact = contacts[0]
     mutation = """
-    mutation($contactId: ID!, $nickname: String, $dueDate: String) {
-        createOrder(input: { contactId: $contactId, nickname: $nickname, dueAt: $dueDate }) {
-            order { id visualId nickname dueDate }
-            errors
+    mutation($contactId: ID!, $nickname: String, $dueDate: ISO8601DateTime) {
+        invoiceCreate(input: { contactId: $contactId, nickname: $nickname, dueAt: $dueDate }) {
+            invoice { id visualId nickname dueDate }
+            errors { message }
         }
     }
     """
     result = query_printavo(mutation, {
         "contactId": contact["id"],
         "nickname": order_name,
-        "dueDate": due_date
+        "dueDate": f"{due_date}T00:00:00Z"
     })
-    order_data = result.get("createOrder", {})
-    errors = order_data.get("errors", [])
+    invoice_data = result.get("invoiceCreate", {})
+    errors = invoice_data.get("errors", [])
     if errors:
-        return f"Printavo returned an error: {errors}"
-    order = order_data.get("order", {})
+        return f"Printavo error: {errors}"
+    invoice = invoice_data.get("invoice", {})
     return (
-        f"Quote created in Printavo!\n"
-        f"Order #{order.get('visualId')} | Name: {order.get('nickname')} | "
-        f"For: {contact['fullName']} | Due: {order.get('dueDate')}"
+        f"Quote created!\n"
+        f"Order #{invoice.get('visualId')} | {invoice.get('nickname')} | "
+        f"For: {contact['fullName']} | Due: {invoice.get('dueDate')}"
     )
 
 
-# Start the server
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="sse", host="0.0.0.0", port=port)

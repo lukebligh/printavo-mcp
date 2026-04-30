@@ -158,21 +158,16 @@ def get_order_details(order_number: str) -> str:
 # ---- TOOL 4: Outstanding Balances ----
 @mcp.tool()
 def get_outstanding_balances() -> str:
-    """Get recent open orders — check for unpaid jobs"""
+    """Get open orders that are not yet marked paid"""
     query = """
     query {
-        invoices(first: 50, sortDescending: true) {
+        invoices(first: 100, sortDescending: true) {
             nodes {
                 visualId
                 total
                 dueAt
                 contact { fullName email phone }
                 status { name }
-                transactions {
-                    nodes {
-                        amount
-                    }
-                }
             }
         }
     }
@@ -181,21 +176,20 @@ def get_outstanding_balances() -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
-    unpaid = []
-    for o in invoices:
-        total = float(o.get("total") or 0)
-        paid = sum(float(t.get("amount") or 0) for t in o.get("transactions", {}).get("nodes", []))
-        balance = total - paid
-        if balance > 0.01:
-            unpaid.append({**o, "calculated_balance": balance})
+    paid_keywords = ["paid", "done", "complete", "cancelled", "canceled"]
+    unpaid = [
+        o for o in invoices
+        if not any(kw in (o.get("status", {}).get("name", "").lower()) for kw in paid_keywords)
+    ]
     if not unpaid:
-        return "No outstanding balances found."
-    total_owed = sum(o["calculated_balance"] for o in unpaid)
-    lines = [f"OUTSTANDING BALANCES — {len(unpaid)} orders | Total owed: ${total_owed:.2f}", ""]
+        return "No open/unpaid orders found."
+    total_outstanding = sum(float(o.get("total") or 0) for o in unpaid)
+    lines = [f"OPEN ORDERS — {len(unpaid)} orders | Gross value: ${total_outstanding:.2f}", ""]
     for o in unpaid:
         lines.append(
             f"  #{o.get('visualId')} | {o.get('contact', {}).get('fullName')} | "
-            f"Balance: ${o['calculated_balance']:.2f} | Due: {o.get('dueAt', 'N/A')} | "
+            f"Total: ${float(o.get('total') or 0):.2f} | Due: {o.get('dueAt', 'N/A')[:10] if o.get('dueAt') else 'N/A'} | "
+            f"Status: {o.get('status', {}).get('name')} | "
             f"Phone: {o.get('contact', {}).get('phone', 'N/A')}"
         )
     return "\n".join(lines)

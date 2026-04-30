@@ -410,18 +410,19 @@ def get_production_schedule(date: str) -> str:
 
     for o in invoices:
         qty = int(o.get("totalQuantity") or 0)
-        customer = o.get("contact", {}).get("fullName", "Unknown")
+        customer = (o.get("contact") or {}).get("fullName", "Unknown")
         nickname = o.get("nickname", "")
         status = o.get("status", {}).get("name", "?")
         invoice_id = o.get("id")
 
-        # Get imprints for this specific invoice
+# Get imprints for this specific invoice
         imprint_result = query_printavo(imprint_query, {"id": invoice_id})
         all_imprints = []
         if "error" not in imprint_result:
-            groups = imprint_result.get("invoice", {}).get("lineItemGroups", {}).get("nodes", [])
+            invoice_data = imprint_result.get("invoice") or {}
+            groups = (invoice_data.get("lineItemGroups") or {}).get("nodes", [])
             for group in groups:
-                imprints = group.get("imprints", {}).get("nodes", [])
+                imprints = (group.get("imprints") or {}).get("nodes", [])
                 all_imprints.extend(imprints)
 
         num_locations = len(all_imprints)

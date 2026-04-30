@@ -439,8 +439,11 @@ def get_production_schedule(date: str) -> str:
             grand_total_placements += order_placements
 
             lines.append(f"  #{o.get('visualId')} | {customer} | {nickname}")
-            lines.append(f"    Status: {status_name} | Items: {qty} | Locations: {num_locations} | Placements: {order_placements}")
-if is_store_order:
+            if is_store_order:
+                lines.append(f"    Status: {status_name} | Items: {qty}")
+            else:
+                lines.append(f"    Status: {status_name} | Items: {qty} | Locations: {num_locations} | Imprints: {order_placements}")
+             if is_store_order:
                 lines.append(f"    → Store Order (InkSoft) | Pieces: {qty}")
                 breakdown_by_type["Store Order (pieces only)"] = breakdown_by_type.get("Store Order (pieces only)", 0) + qty
                 # Don't count imprints for store orders — artwork records ≠ imprint locations
@@ -479,7 +482,7 @@ if is_store_order:
     lines.append(f"TOTALS FOR {date}:")
     lines.append(f"  Orders on schedule: {len(all_invoices)}")
     lines.append(f"  Total Items: {grand_total_qty}")
-    lines.append(f"  Total Placements: {grand_total_placements}")
+    lines.append(f"  Total Imprints (excl. store orders): {grand_total_placements}")
     if breakdown_by_type:
         lines.append("")
         lines.append("  BY TYPE:")

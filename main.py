@@ -121,7 +121,7 @@ def imprint_type_sort_key(primary_type: str) -> int:
     elif "embroid" in t:
         return 2
     else:
-        return 3  # DTF, Store Order, or unknown
+        return 3
 
 
 def resolve_primary_type(current: str, new_type: str) -> str:
@@ -132,8 +132,8 @@ def resolve_primary_type(current: str, new_type: str) -> str:
 
 
 # Statuses to exclude from the production schedule
-EXCLUDED_STATUS_PREFIXES = ["promo items"]          # starts-with match (case-insensitive)
-EXCLUDED_STATUS_EXACT    = ["quote", "quote sent"]  # exact match (case-insensitive)
+EXCLUDED_STATUS_PREFIXES = ["promo items"]
+EXCLUDED_STATUS_EXACT    = ["quote", "quote sent"]
 
 
 def should_exclude_status(status_name: str) -> bool:
@@ -177,7 +177,7 @@ def build_production_schedule(date: str) -> str:
         if "error" in result:
             return f"API Error: {result['error']}"
         nodes     = (result.get("invoices") or {}).get("nodes", [])
-        page_info = (result.get("invoices") or {}).get("pageInfo", {})  # FIX 3: was result.get("")
+        page_info = (result.get("invoices") or {}).get("pageInfo", {})
 
         for o in nodes:
             start = (o.get("startAt") or "")[:10]
@@ -201,13 +201,17 @@ def build_production_schedule(date: str) -> str:
     if not all_invoices:
         return f"No in-house orders scheduled for production on {date}."
 
+    # ── FIX: sizes added so we can calculate per-group quantity ─────────────
     detail_query = """
     query($id: ID!) {
         invoice(id: $id) {
             lineItemGroups {
                 nodes {
                     lineItems {
-                        nodes { description }
+                        nodes {
+                            description
+                            sizes { count }
+                        }
                     }
                     imprints {
                         nodes {
@@ -236,138 +240,184 @@ def build_production_schedule(date: str) -> str:
 
             if is_store:
                 order_data_list.append({
-                    "visual_id":    o.get("visualId"),
-                    "customer":     customer,
-                    "nickname":     nickname,
-                    "status_name":  status_name,
-                    "qty":          qty,
-                    "is_store":     True,
+                    "visual_id":     o.get("visualId"),
+                    "customer":      customer,
+                    "nickname":      nickname,
+                    "status_name":   status_name,
+                    "qty":           qty,
+                    "is_store":      True,
                     "imprint_lines": ["    → Store Order (InkSoft) — pieces only"],
                     "order_screens": 0,
-                    "num_imprints":  0,
+                    "total_imprints": 0,
                     "primary_type":  "Store Order",
-                    "breakdown":    {"Store Order (pieces only)": qty},
-                    "error":        None,
+                    "breakdown":     {"Store Order (pieces only)": qty},
+                    "error":         None,
                 })
                 continue
 
-            all_imprints     = []
-            all_descriptions = []
+            groups           = []
+            all_descriptions = []  # order-level, for order-level fallback only
+
             if invoice_id:
                 detail_result = query_printavo(detail_query, {"id": invoice_id})
                 if "error" not in detail_result:
                     invoice_data = detail_result.get("invoice") or {}
                     groups = (invoice_data.get("lineItemGroups") or {}).get("nodes") or []
-                    for group in groups:
-                        imprints = (group.get("imprints") or {}).get("nodes") or []
-                        all_imprints.extend(imprints)
-                        items = (group.get("lineItems") or {}).get("nodes") or []
-                        for item in items:
-                            desc = item.get("description") or ""
-                            if desc:
-                                all_descriptions.append(desc)
 
-            order_screens        = 0
-            imprint_lines        = []
-            parsed_from_imprints = []
-            breakdown            = {}
-            primary_type         = "Screen Print"  # default until we see otherwise
-            num_locations        = 0               # FIX 2: tracks actual parsed location count
+            order_screens    = 0
+            imprint_lines    = []
+            breakdown        = {}
+            primary_type     = "Screen Print"
+            total_imprints   = 0   # ── FIX: accumulated at group level, not qty × locations
+            any_group_parsed = False
 
-            for imp in all_imprints:
-                type_of_work  = (imp.get("typeOfWork") or {}).get("name") or ""
-                details       = imp.get("details") or ""
-                matrix_col    = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
-                details_lower = details.lower()
+            for group in groups:
+                # ── FIX: calculate this group's quantity from its own line item sizes ──
+                group_qty = 0
+                group_descriptions = []
+                items = (group.get("lineItems") or {}).get("nodes") or []
+                for item in items:
+                    desc = item.get("description") or ""
+                    if desc:
+                        group_descriptions.append(desc)
+                        all_descriptions.append(desc)
+                    for size in (item.get("sizes") or []):
+                        group_qty += int(size.get("count") or 0)
 
-                # Layer 1 — TypeOfWork (most reliable)
-                if type_of_work and type_of_work.lower() == "embroidery":
-                    imprint_lines.append("    → Embroidery")
-                    breakdown["Embroidery"] = breakdown.get("Embroidery", 0) + qty
-                    primary_type = resolve_primary_type(primary_type, "Embroidery")
-                    parsed_from_imprints.append(True)
-                    num_locations += 1
-                    continue
+                # Safety net: if sizes aren't entered, fall back to order total for this group
+                if group_qty == 0:
+                    group_qty = qty
 
-                # Determine decoration type from details text
-                if "dtf" in details_lower:
-                    dec_type = "DTF"
-                elif "embroid" in details_lower:
-                    dec_type = "Embroidery"
-                elif "screenprint" in details_lower or "screen print" in details_lower:
-                    dec_type = "Screen Print"
-                else:
-                    dec_type = "Screen Print"
+                imprints      = (group.get("imprints") or {}).get("nodes") or []
+                group_locs    = 0
+                group_parsed  = False
 
-                matrix_colors = extract_matrix_colors(matrix_col)
+                for imp in imprints:
+                    type_of_work  = (imp.get("typeOfWork") or {}).get("name") or ""
+                    details       = imp.get("details") or ""
+                    matrix_col    = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
+                    details_lower = details.lower()
 
-                # Layer 2 — Structured "Location: / Colors:" text
-                parsed = parse_imprint_details(details)
-                if parsed:
-                    for p in parsed:
-                        loc       = p.get("location", "?")
-                        colors    = p.get("colors") or matrix_colors
+                    # Layer 1 — TypeOfWork (most reliable)
+                    if type_of_work and type_of_work.lower() == "embroidery":
+                        imprint_lines.append("    → Embroidery")
+                        breakdown["Embroidery"] = breakdown.get("Embroidery", 0) + group_qty
+                        primary_type = resolve_primary_type(primary_type, "Embroidery")
+                        group_locs  += 1
+                        group_parsed = True
+                        any_group_parsed = True
+                        continue
+
+                    # Determine decoration type
+                    if "dtf" in details_lower:
+                        dec_type = "DTF"
+                    elif "embroid" in details_lower:
+                        dec_type = "Embroidery"
+                    elif "screenprint" in details_lower or "screen print" in details_lower:
+                        dec_type = "Screen Print"
+                    else:
+                        dec_type = "Screen Print"
+
+                    matrix_colors = extract_matrix_colors(matrix_col)
+
+                    # Layer 2 — Structured "Location: / Colors:" text
+                    parsed = parse_imprint_details(details)
+                    if parsed:
+                        for p in parsed:
+                            loc       = p.get("location", "?")
+                            colors    = p.get("colors") or matrix_colors
+                            color_str = f"{colors}C" if colors else "?C"
+                            screens   = colors if colors else 0
+                            order_screens += screens
+                            imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
+                            breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
+                            primary_type = resolve_primary_type(primary_type, dec_type)
+                            group_locs  += 1
+                            group_parsed = True
+                            any_group_parsed = True
+
+                    # Layer 3 — Short plain text (contract imprint cards)
+                    elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
+                        loc       = normalize_location(details.strip())
+                        colors    = matrix_colors
                         color_str = f"{colors}C" if colors else "?C"
                         screens   = colors if colors else 0
                         order_screens += screens
-                        parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
                         imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
-                        breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
+                        breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
                         primary_type = resolve_primary_type(primary_type, dec_type)
-                        num_locations += 1
+                        group_locs  += 1
+                        group_parsed = True
+                        any_group_parsed = True
 
-                # Layer 3 — Short plain text (contract imprint cards)
-                elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
-                    loc       = normalize_location(details.strip())
-                    colors    = matrix_colors
-                    color_str = f"{colors}C" if colors else "?C"
-                    screens   = colors if colors else 0
-                    order_screens += screens
-                    parsed_from_imprints.append({"location": loc, "colors": colors, "type": dec_type})
-                    imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
-                    breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
-                    primary_type = resolve_primary_type(primary_type, dec_type)
-                    num_locations += 1
+                    # Layer 4 — PricingMatrixColumn color count only
+                    elif matrix_colors:
+                        color_str = f"{matrix_colors}C"
+                        order_screens += matrix_colors
+                        imprint_lines.append(f"    → {dec_type} | {color_str} (location not entered)")
+                        breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
+                        primary_type = resolve_primary_type(primary_type, dec_type)
+                        group_locs  += 1
+                        group_parsed = True
+                        any_group_parsed = True
 
-                # Layer 4 — PricingMatrixColumn color count only
-                elif matrix_colors:
-                    color_str = f"{matrix_colors}C"
-                    order_screens += matrix_colors
-                    parsed_from_imprints.append({"location": None, "colors": matrix_colors, "type": dec_type})
-                    imprint_lines.append(f"    → {dec_type} | {color_str} (location not entered)")
-                    breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
-                    primary_type = resolve_primary_type(primary_type, dec_type)
-                    num_locations += 1
+                    else:
+                        imprint_lines.append(f"    → {dec_type} | (no color/location entered)")
+                        breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
+                        primary_type = resolve_primary_type(primary_type, dec_type)
+                        group_locs  += 1
+                        any_group_parsed = True
 
-                else:
-                    imprint_lines.append(f"    → {dec_type} | (no color/location entered)")
-                    breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
-                    primary_type = resolve_primary_type(primary_type, dec_type)
-                    num_locations += 1
+                # ── FIX: accumulate this group's imprint contribution ────────
+                total_imprints += group_qty * group_locs
 
-            # Fallback — parse line item descriptions
-            if not parsed_from_imprints and all_descriptions:
+                # Per-group description fallback — runs if this group had no imprint nodes
+                if not group_parsed and group_descriptions:
+                    seen_combos = set()
+                    for desc in group_descriptions:
+                        parsed_desc = parse_description_imprints(desc)
+                        for p in parsed_desc:
+                            key = (p["location"], p["colors"])
+                            if key not in seen_combos:
+                                seen_combos.add(key)
+                                loc       = p["location"]
+                                colors    = p["colors"]
+                                color_str = f"{colors}C"
+                                order_screens  += colors
+                                total_imprints += group_qty
+                                imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
+                                breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + group_qty
+                                primary_type = resolve_primary_type(primary_type, "Screen Print")
+                                any_group_parsed = True
+                    if not seen_combos:
+                        imprint_lines.append("    → Screen Print | (no color/location entered)")
+                        breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + group_qty
+                        primary_type = resolve_primary_type(primary_type, "Screen Print")
+                        total_imprints += group_qty
+                        any_group_parsed = True
+
+            # Order-level fallback — no groups at all or all groups were empty
+            if not any_group_parsed and all_descriptions:
                 seen_combos = set()
                 for desc in all_descriptions:
-                    parsed = parse_description_imprints(desc)
-                    for p in parsed:
+                    parsed_desc = parse_description_imprints(desc)
+                    for p in parsed_desc:
                         key = (p["location"], p["colors"])
                         if key not in seen_combos:
                             seen_combos.add(key)
                             loc       = p["location"]
                             colors    = p["colors"]
                             color_str = f"{colors}C"
-                            order_screens += colors
+                            order_screens  += colors
+                            total_imprints += qty
                             imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
                             breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
                             primary_type = resolve_primary_type(primary_type, "Screen Print")
-                if seen_combos:
-                    num_locations = len(seen_combos)  # FIX 2: set from fallback parse
-                else:
+                if not seen_combos:
                     imprint_lines.append("    → Screen Print | (no color/location entered)")
                     breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
                     primary_type = resolve_primary_type(primary_type, "Screen Print")
-                    num_locations = 1  # FIX 2: at least 1 location exists, just no data
+                    total_imprints += qty
 
             order_data_list.append({
                 "visual_id":     o.get("visualId"),
@@ -378,7 +428,7 @@ def build_production_schedule(date: str) -> str:
                 "is_store":      False,
                 "imprint_lines": imprint_lines,
                 "order_screens": order_screens,
-                "num_imprints":  num_locations,  # FIX 2: was len(all_imprints)
+                "total_imprints": total_imprints,  # ── FIX: pre-calculated, not qty × locations
                 "primary_type":  primary_type,
                 "breakdown":     breakdown,
                 "error":         None,
@@ -421,7 +471,7 @@ def build_production_schedule(date: str) -> str:
             continue
 
         order_screens   = od["order_screens"]
-        order_imprints  = qty * od["num_imprints"]
+        order_imprints  = od["total_imprints"]  # ── FIX: use pre-calculated value directly
         grand_total_imprints += order_imprints
         grand_total_screens  += order_screens
 
@@ -590,7 +640,7 @@ def get_order_details(order_number: str) -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
-    matching = [i for i in invoices if str(i.get("visualId", "")) == str(order_number)]  # FIX 1
+    matching = [i for i in invoices if str(i.get("visualId", "")) == str(order_number)]
     if not matching:
         return f"Order #{order_number} not found."
     o = matching[0]

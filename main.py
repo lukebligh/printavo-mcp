@@ -2,6 +2,7 @@ from fastmcp import FastMCP
 import httpx
 import os
 import re
+import math
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -131,6 +132,94 @@ def resolve_primary_type(current: str, new_type: str) -> str:
     return current
 
 
+# ── PRODUCTION TIME MATRIX ───────────────────────────────────────────────────
+# Screen Print
+# Setup time assumes CTS registration, inks prepped, screens burned
+SP_SETUP_MINUTES = {1: 5, 2: 9, 3: 13, 4: 17, 5: 21, 6: 25}
+SP_BASE_RATE     = 375   # pieces/hour at 1-2 colors (midpoint of 350-400)
+SP_COLOR_PENALTY = 0.10  # 10% run rate reduction per color at 3C and above
+SP_MAX_COLORS    = 6     # max effective colors (flash positions consume stations)
+
+# Embroidery
+# Standard 10k stitch run = 16.5 min avg per run (includes hooping, loading, trim, issues)
+# Thresholds: <24 pcs → 2-head, 24-47 → 6-head only, 48+ → both machines simultaneously
+EMB_MINUTES_PER_RUN = 16.5
+EMB_2HEAD_HEADS     = 2
+EMB_6HEAD_HEADS     = 6
+EMB_6HEAD_THRESHOLD = 24   # qty at or above this → use 6-head
+EMB_DUAL_THRESHOLD  = 48   # qty at or above this → run both machines
+
+# Capacity thresholds
+CAPACITY_CURRENT_HOURS = 6.25   # 8am–3pm minus 45 min lunch (today's reality)
+CAPACITY_TARGET_HOURS  = 8.0    # 8am–4:30pm minus 30 min lunch (near-term standard)
+
+
+def sp_run_rate(colors: int) -> float:
+    """Return pieces/hour for a given screen print color count."""
+    c = min(max(colors, 1), SP_MAX_COLORS)
+    if c <= 2:
+        return SP_BASE_RATE
+    penalty = SP_COLOR_PENALTY * (c - 2)
+    return SP_BASE_RATE * (1 - penalty)
+
+
+def sp_setup_minutes(colors: int) -> float:
+    """Return setup time in minutes for a given color count."""
+    c = min(max(colors, 1), SP_MAX_COLORS)
+    return SP_SETUP_MINUTES.get(c, SP_SETUP_MINUTES[SP_MAX_COLORS])
+
+
+def estimate_sp_minutes(qty: int, colors: int) -> float:
+    """Total screen print time in minutes: setup + run time."""
+    if qty <= 0 or colors <= 0:
+        return 0.0
+    setup = sp_setup_minutes(colors)
+    run   = (qty / sp_run_rate(colors)) * 60
+    return setup + run
+
+
+def estimate_emb_minutes(qty: int) -> float:
+    """Total embroidery time in minutes using standard 10k stitch run rate."""
+    if qty <= 0:
+        return 0.0
+    if qty >= EMB_DUAL_THRESHOLD:
+        # Split across both machines — time = max of each machine's portion
+        six_qty  = math.ceil(qty * (EMB_6HEAD_HEADS / (EMB_6HEAD_HEADS + EMB_2HEAD_HEADS)))
+        two_qty  = qty - six_qty
+        six_time = math.ceil(six_qty / EMB_6HEAD_HEADS) * EMB_MINUTES_PER_RUN
+        two_time = math.ceil(two_qty / EMB_2HEAD_HEADS) * EMB_MINUTES_PER_RUN
+        return max(six_time, two_time)
+    elif qty >= EMB_6HEAD_THRESHOLD:
+        return math.ceil(qty / EMB_6HEAD_HEADS) * EMB_MINUTES_PER_RUN
+    else:
+        return math.ceil(qty / EMB_2HEAD_HEADS) * EMB_MINUTES_PER_RUN
+
+
+def format_duration(minutes: float) -> str:
+    """Format minutes as Xh Ym."""
+    h = int(minutes // 60)
+    m = int(minutes % 60)
+    if h > 0 and m > 0:
+        return f"{h}h {m}m"
+    elif h > 0:
+        return f"{h}h"
+    else:
+        return f"{m}m"
+
+
+def capacity_flag(total_minutes: float) -> str:
+    """Return a capacity status emoji + label."""
+    hours = total_minutes / 60
+    if hours <= CAPACITY_CURRENT_HOURS * 0.8:
+        return "🟢 On Track"
+    elif hours <= CAPACITY_CURRENT_HOURS:
+        return "🟡 Full Day"
+    elif hours <= CAPACITY_TARGET_HOURS:
+        return "🟠 Needs Extended Hours (to 4:30)"
+    else:
+        return "🔴 OVERLOADED — Reschedule Required"
+
+
 # Statuses to exclude from the production schedule
 EXCLUDED_STATUS_PREFIXES = ["promo items"]
 EXCLUDED_STATUS_EXACT    = ["quote", "quote sent"]
@@ -201,16 +290,17 @@ def build_production_schedule(date: str) -> str:
     if not all_invoices:
         return f"No in-house orders scheduled for production on {date}."
 
-    # ── FIX: sizes added so we can calculate per-group quantity ─────────────
     detail_query = """
     query($id: ID!) {
         invoice(id: $id) {
-            lineItems {
-    nodes {
-        description
-        sizes { count }
-    }
-}
+            lineItemGroups {
+                nodes {
+                    lineItems {
+                        nodes {
+                            description
+                            sizes { count }
+                        }
+                    }
                     imprints {
                         nodes {
                             details
@@ -249,12 +339,13 @@ def build_production_schedule(date: str) -> str:
                     "total_imprints": 0,
                     "primary_type":  "Store Order",
                     "breakdown":     {"Store Order (pieces only)": qty},
+                    "est_minutes":   0,
                     "error":         None,
                 })
                 continue
 
             groups           = []
-            all_descriptions = []  # order-level, for order-level fallback only
+            all_descriptions = []
 
             if invoice_id:
                 detail_result = query_printavo(detail_query, {"id": invoice_id})
@@ -266,11 +357,13 @@ def build_production_schedule(date: str) -> str:
             imprint_lines    = []
             breakdown        = {}
             primary_type     = "Screen Print"
-            total_imprints   = 0   # ── FIX: accumulated at group level, not qty × locations
+            total_imprints   = 0
             any_group_parsed = False
+            # Time estimation tracking
+            sp_locations     = []   # list of (qty, colors) per SP location
+            emb_qty          = 0    # total EMB pieces
 
             for group in groups:
-                # ── FIX: calculate this group's quantity from its own line item sizes ──
                 group_qty = 0
                 group_descriptions = []
                 items = (group.get("lineItems") or {}).get("nodes") or []
@@ -280,15 +373,14 @@ def build_production_schedule(date: str) -> str:
                         group_descriptions.append(desc)
                         all_descriptions.append(desc)
                     for size in (item.get("sizes") or []):
-    group_qty += int(size.get("count") or 0)
+                        group_qty += int(size.get("count") or 0)
 
-                # Safety net: if sizes aren't entered, fall back to order total for this group
                 if group_qty == 0:
                     group_qty = qty
 
-                imprints      = (group.get("imprints") or {}).get("nodes") or []
-                group_locs    = 0
-                group_parsed  = False
+                imprints     = (group.get("imprints") or {}).get("nodes") or []
+                group_locs   = 0
+                group_parsed = False
 
                 for imp in imprints:
                     type_of_work  = (imp.get("typeOfWork") or {}).get("name") or ""
@@ -296,17 +388,17 @@ def build_production_schedule(date: str) -> str:
                     matrix_col    = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
                     details_lower = details.lower()
 
-                    # Layer 1 — TypeOfWork (most reliable)
+                    # Layer 1 — Embroidery
                     if type_of_work and type_of_work.lower() == "embroidery":
                         imprint_lines.append("    → Embroidery")
                         breakdown["Embroidery"] = breakdown.get("Embroidery", 0) + group_qty
                         primary_type = resolve_primary_type(primary_type, "Embroidery")
+                        emb_qty     += group_qty
                         group_locs  += 1
                         group_parsed = True
                         any_group_parsed = True
                         continue
 
-                    # Determine decoration type
                     if "dtf" in details_lower:
                         dec_type = "DTF"
                     elif "embroid" in details_lower:
@@ -318,7 +410,7 @@ def build_production_schedule(date: str) -> str:
 
                     matrix_colors = extract_matrix_colors(matrix_col)
 
-                    # Layer 2 — Structured "Location: / Colors:" text
+                    # Layer 2
                     parsed = parse_imprint_details(details)
                     if parsed:
                         for p in parsed:
@@ -330,11 +422,15 @@ def build_production_schedule(date: str) -> str:
                             imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
                             breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
                             primary_type = resolve_primary_type(primary_type, dec_type)
+                            if dec_type == "Screen Print" and colors:
+                                sp_locations.append((group_qty, colors))
+                            elif dec_type == "Embroidery":
+                                emb_qty += group_qty
                             group_locs  += 1
                             group_parsed = True
                             any_group_parsed = True
 
-                    # Layer 3 — Short plain text (contract imprint cards)
+                    # Layer 3
                     elif details and len(details.strip()) < 60 and "name:" not in details_lower and "color:" not in details_lower:
                         loc       = normalize_location(details.strip())
                         colors    = matrix_colors
@@ -344,17 +440,25 @@ def build_production_schedule(date: str) -> str:
                         imprint_lines.append(f"    → {dec_type} | {loc}: {color_str}")
                         breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
                         primary_type = resolve_primary_type(primary_type, dec_type)
+                        if dec_type == "Screen Print" and colors:
+                            sp_locations.append((group_qty, colors))
+                        elif dec_type == "Embroidery":
+                            emb_qty += group_qty
                         group_locs  += 1
                         group_parsed = True
                         any_group_parsed = True
 
-                    # Layer 4 — PricingMatrixColumn color count only
+                    # Layer 4
                     elif matrix_colors:
                         color_str = f"{matrix_colors}C"
                         order_screens += matrix_colors
                         imprint_lines.append(f"    → {dec_type} | {color_str} (location not entered)")
                         breakdown[dec_type] = breakdown.get(dec_type, 0) + group_qty
                         primary_type = resolve_primary_type(primary_type, dec_type)
+                        if dec_type == "Screen Print":
+                            sp_locations.append((group_qty, matrix_colors))
+                        elif dec_type == "Embroidery":
+                            emb_qty += group_qty
                         group_locs  += 1
                         group_parsed = True
                         any_group_parsed = True
@@ -366,10 +470,9 @@ def build_production_schedule(date: str) -> str:
                         group_locs  += 1
                         any_group_parsed = True
 
-                # ── FIX: accumulate this group's imprint contribution ────────
                 total_imprints += group_qty * group_locs
 
-                # Per-group description fallback — runs if this group had no imprint nodes
+                # Per-group description fallback
                 if not group_parsed and group_descriptions:
                     seen_combos = set()
                     for desc in group_descriptions:
@@ -386,6 +489,7 @@ def build_production_schedule(date: str) -> str:
                                 imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
                                 breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + group_qty
                                 primary_type = resolve_primary_type(primary_type, "Screen Print")
+                                sp_locations.append((group_qty, colors))
                                 any_group_parsed = True
                     if not seen_combos:
                         imprint_lines.append("    → Screen Print | (no color/location entered)")
@@ -394,7 +498,7 @@ def build_production_schedule(date: str) -> str:
                         total_imprints += group_qty
                         any_group_parsed = True
 
-            # Order-level fallback — no groups at all or all groups were empty
+            # Order-level fallback
             if not any_group_parsed and all_descriptions:
                 seen_combos = set()
                 for desc in all_descriptions:
@@ -411,11 +515,22 @@ def build_production_schedule(date: str) -> str:
                             imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
                             breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
                             primary_type = resolve_primary_type(primary_type, "Screen Print")
+                            sp_locations.append((qty, colors))
                 if not seen_combos:
                     imprint_lines.append("    → Screen Print | (no color/location entered)")
                     breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
                     primary_type = resolve_primary_type(primary_type, "Screen Print")
                     total_imprints += qty
+
+            # ── Estimate production time ─────────────────────────────────────
+            est_minutes = 0.0
+            if sp_locations:
+                # Each unique location/color combo = one setup + its run time
+                # Group by color count to consolidate setups for same-color locations
+                for loc_qty, colors in sp_locations:
+                    est_minutes += estimate_sp_minutes(loc_qty, colors)
+            if emb_qty > 0:
+                est_minutes += estimate_emb_minutes(emb_qty)
 
             order_data_list.append({
                 "visual_id":     o.get("visualId"),
@@ -426,9 +541,10 @@ def build_production_schedule(date: str) -> str:
                 "is_store":      False,
                 "imprint_lines": imprint_lines,
                 "order_screens": order_screens,
-                "total_imprints": total_imprints,  # ── FIX: pre-calculated, not qty × locations
+                "total_imprints": total_imprints,
                 "primary_type":  primary_type,
                 "breakdown":     breakdown,
+                "est_minutes":   est_minutes,
                 "error":         None,
             })
 
@@ -439,6 +555,7 @@ def build_production_schedule(date: str) -> str:
                 "primary_type": "Screen Print",
                 "qty":          0,
                 "breakdown":    {},
+                "est_minutes":  0,
             })
 
     # ── Phase 3: Sort by imprint type, then render ───────────────────────────
@@ -448,6 +565,7 @@ def build_production_schedule(date: str) -> str:
     grand_total_qty      = 0
     grand_total_imprints = 0
     grand_total_screens  = 0
+    grand_total_minutes  = 0.0
     breakdown_by_type    = {}
 
     for od in order_data_list:
@@ -457,7 +575,8 @@ def build_production_schedule(date: str) -> str:
             continue
 
         qty = od["qty"]
-        grand_total_qty += qty
+        grand_total_qty     += qty
+        grand_total_minutes += od.get("est_minutes", 0)
         for t, v in od.get("breakdown", {}).items():
             breakdown_by_type[t] = breakdown_by_type.get(t, 0) + v
 
@@ -469,7 +588,8 @@ def build_production_schedule(date: str) -> str:
             continue
 
         order_screens   = od["order_screens"]
-        order_imprints  = od["total_imprints"]  # ── FIX: use pre-calculated value directly
+        order_imprints  = od["total_imprints"]
+        est_min         = od.get("est_minutes", 0)
         grand_total_imprints += order_imprints
         grand_total_screens  += order_screens
 
@@ -477,11 +597,13 @@ def build_production_schedule(date: str) -> str:
         lines.append(
             f"    Status: {od['status_name']} | Items: {qty} | "
             f"Imprints: {order_imprints} | "
-            f"Est. Screens: {order_screens if order_screens else '(not entered)'}"
+            f"Est. Screens: {order_screens if order_screens else '(not entered)'} | "
+            f"Est. Time: {format_duration(est_min) if est_min else '(unknown)'}"
         )
         lines.extend(od["imprint_lines"])
         lines.append("")
 
+    # ── Daily totals + capacity alert ────────────────────────────────────────
     lines.append("─" * 50)
     lines.append(f"TOTALS FOR {date}:")
     lines.append(f"  Orders on schedule: {len([o for o in order_data_list if not o.get('error')])}")
@@ -491,6 +613,9 @@ def build_production_schedule(date: str) -> str:
         f"  Est. Total Screens Needed: "
         f"{grand_total_screens if grand_total_screens else '(color data missing on some orders)'}"
     )
+    lines.append(f"  Est. Production Time: {format_duration(grand_total_minutes)}")
+    lines.append(f"  Capacity Status: {capacity_flag(grand_total_minutes)}")
+
     if breakdown_by_type:
         lines.append("")
         lines.append("  BY TYPE:")
@@ -826,6 +951,7 @@ def get_production_schedule(date: str) -> str:
     Get all in-house orders scheduled for production on a given date.
     Excludes PROMO ITEMS and quote/quote-sent statuses.
     Sorted by imprint type: Screen Print → Embroidery → DTF/Store.
+    Includes per-order and daily production time estimates with capacity alert.
     date: format YYYY-MM-DD (e.g. 2026-05-01)
     """
     return build_production_schedule(date)
@@ -851,8 +977,71 @@ def send_schedule_to_slack(date: str) -> str:
         return "Failed to post to Slack. Check that SLACK_WEBHOOK_URL is set in Railway variables."
 
 
+# ── TOOL 10: Production Time Estimate ────────────────────────────────────────
+@mcp.tool()
+def get_production_time_estimate(date: str) -> str:
+    """
+    Returns a focused production time estimate for a given date.
+    Shows per-order time breakdown, daily total, and capacity status.
+    Capacity thresholds:
+      🟢 On Track       = under 80% of current capacity (5h)
+      🟡 Full Day       = 80-100% of current capacity (5-6.25h)
+      🟠 Needs Extended = requires extended hours to 4:30pm (6.25-8h)
+      🔴 Overloaded     = exceeds even extended hours (8h+)
+    date: format YYYY-MM-DD (e.g. 2026-05-01)
+    """
+    # Re-use build_production_schedule but extract and reformat time data only
+    raw = build_production_schedule(date)
+    if "No in-house orders" in raw or "API Error" in raw:
+        return raw
+
+    lines = [f"*PRODUCTION TIME ESTIMATE — {date}*", ""]
+
+    grand_minutes = 0.0
+    order_times   = []
+
+    # Re-run the schedule to get per-order data cleanly
+    # (Pull from raw output — parse Est. Time lines)
+    for line in raw.split("\n"):
+        if "Est. Time:" in line and "Est. Screens:" in line:
+            # Extract order header line above this
+            pass
+        if "Est. Production Time:" in line:
+            time_str = line.split("Est. Production Time:")[-1].strip()
+            lines.append(f"  Total: {time_str}")
+        if "Capacity Status:" in line:
+            status = line.split("Capacity Status:")[-1].strip()
+            lines.append(f"  Status: {status}")
+            lines.append("")
+            lines.append(f"  Thresholds:")
+            lines.append(f"    🟢 On Track       = under 5h production")
+            lines.append(f"    🟡 Full Day        = 5h – 6h 15m (current standard)")
+            lines.append(f"    🟠 Extended Hours  = 6h 15m – 8h (requires 8am–4:30pm)")
+            lines.append(f"    🔴 Overloaded      = over 8h — reschedule required")
+
+    # Extract per-order time lines from raw output
+    order_lines = []
+    current_order = None
+    for line in raw.split("\n"):
+        if line.strip().startswith("#") and "|" in line:
+            current_order = line.strip()
+        if "Est. Time:" in line and current_order:
+            time_part = line.split("Est. Time:")[-1].strip()
+            order_lines.append(f"  {current_order.split('|')[0].strip()} — {time_part}")
+            current_order = None
+
+    if order_lines:
+        result = [f"*PRODUCTION TIME ESTIMATE — {date}*", ""]
+        result.append("  PER ORDER:")
+        result.extend(order_lines)
+        result.append("")
+        result.extend(lines[2:])
+        return "\n".join(result)
+
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
-    # Start the daily 6am Slack scheduler in a background thread
     scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
     scheduler_thread.start()
 

@@ -208,11 +208,11 @@ def build_production_schedule(date: str) -> str:
             lineItemGroups {
                 nodes {
                     lineItems {
-                        nodes {
-                            description
-                            sizes { count }
-                        }
-                    }
+    nodes {
+        description
+        items
+    }
+}
                     imprints {
                         nodes {
                             details
@@ -281,8 +281,7 @@ def build_production_schedule(date: str) -> str:
                     if desc:
                         group_descriptions.append(desc)
                         all_descriptions.append(desc)
-                    for size in (item.get("sizes") or []):
-                        group_qty += int(size.get("count") or 0)
+                    group_qty += int(item.get("items") or 0)
 
                 # Safety net: if sizes aren't entered, fall back to order total for this group
                 if group_qty == 0:

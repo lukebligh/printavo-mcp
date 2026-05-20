@@ -177,18 +177,17 @@ def build_production_schedule(date: str) -> str:
         if "error" in result:
             return f"API Error: {result['error']}"
         nodes     = (result.get("invoices") or {}).get("nodes", [])
-        page_info = (result.get("") or {}).get("pageInfo", {})
+        page_info = (result.get("invoices") or {}).get("pageInfo", {})  # FIX 3: was result.get("")
 
         for o in nodes:
             start = (o.get("startAt") or "")[:10]
             if start == date:
                 status_name = (o.get("status") or {}).get("name") or ""
-                # Mark date range as found regardless of filter so pagination exits cleanly
                 found_any = True
                 consecutive_misses = 0
                 if should_exclude_status(status_name):
-                    continue  # Skip PROMO ITEMS, quote, quote sent
-                all_.append(o)
+                    continue
+                all_invoices.append(o)
             elif found_any and start < date:
                 consecutive_misses += 1
 
@@ -199,7 +198,7 @@ def build_production_schedule(date: str) -> str:
         cursor = page_info.get("endCursor")
         pages_searched += 1
 
-    if not all_:
+    if not all_invoices:
         return f"No in-house orders scheduled for production on {date}."
 
     detail_query = """
@@ -226,7 +225,7 @@ def build_production_schedule(date: str) -> str:
     # ── Phase 2: Fetch detail + parse each order ─────────────────────────────
     order_data_list = []
 
-    for o in all_:
+    for o in all_invoices:
         try:
             qty         = int(o.get("totalQuantity") or 0)
             customer    = (o.get("contact") or {}).get("fullName") or "Unknown"
@@ -252,7 +251,7 @@ def build_production_schedule(date: str) -> str:
                 })
                 continue
 
-            all_imprints    = []
+            all_imprints     = []
             all_descriptions = []
             if invoice_id:
                 detail_result = query_printavo(detail_query, {"id": invoice_id})
@@ -268,26 +267,27 @@ def build_production_schedule(date: str) -> str:
                             if desc:
                                 all_descriptions.append(desc)
 
-            order_screens      = 0
-            imprint_lines      = []
+            order_screens        = 0
+            imprint_lines        = []
             parsed_from_imprints = []
-            breakdown          = {}
-            primary_type       = "Screen Print"  # default until we see otherwise
-            num_locations = 0
+            breakdown            = {}
+            primary_type         = "Screen Print"  # default until we see otherwise
+            num_locations        = 0               # FIX 2: tracks actual parsed location count
+
             for imp in all_imprints:
-                type_of_work = (imp.get("typeOfWork") or {}).get("name") or ""
-                details      = imp.get("details") or ""
-                matrix_col   = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
+                type_of_work  = (imp.get("typeOfWork") or {}).get("name") or ""
+                details       = imp.get("details") or ""
+                matrix_col    = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
                 details_lower = details.lower()
 
                 # Layer 1 — TypeOfWork (most reliable)
                 if type_of_work and type_of_work.lower() == "embroidery":
-                   imprint_lines.append("    → Embroidery")
-                   breakdown["Embroidery"] = breakdown.get("Embroidery", 0) + qty
-                   primary_type = resolve_primary_type(primary_type, "Embroidery")
-                   parsed_from_imprints.append(True)
-                   num_locations += 1   # ← ADD
-                   continue
+                    imprint_lines.append("    → Embroidery")
+                    breakdown["Embroidery"] = breakdown.get("Embroidery", 0) + qty
+                    primary_type = resolve_primary_type(primary_type, "Embroidery")
+                    parsed_from_imprints.append(True)
+                    num_locations += 1
+                    continue
 
                 # Determine decoration type from details text
                 if "dtf" in details_lower:
@@ -341,9 +341,9 @@ def build_production_schedule(date: str) -> str:
 
                 else:
                     imprint_lines.append(f"    → {dec_type} | (no color/location entered)")
-                    num_locations += 1
                     breakdown[dec_type] = breakdown.get(dec_type, 0) + qty
                     primary_type = resolve_primary_type(primary_type, dec_type)
+                    num_locations += 1
 
             # Fallback — parse line item descriptions
             if not parsed_from_imprints and all_descriptions:
@@ -361,10 +361,13 @@ def build_production_schedule(date: str) -> str:
                             imprint_lines.append(f"    → Screen Print | {loc}: {color_str}")
                             breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
                             primary_type = resolve_primary_type(primary_type, "Screen Print")
-                if not seen_combos:
+                if seen_combos:
+                    num_locations = len(seen_combos)  # FIX 2: set from fallback parse
+                else:
                     imprint_lines.append("    → Screen Print | (no color/location entered)")
                     breakdown["Screen Print"] = breakdown.get("Screen Print", 0) + qty
                     primary_type = resolve_primary_type(primary_type, "Screen Print")
+                    num_locations = 1  # FIX 2: at least 1 location exists, just no data
 
             order_data_list.append({
                 "visual_id":     o.get("visualId"),
@@ -375,7 +378,7 @@ def build_production_schedule(date: str) -> str:
                 "is_store":      False,
                 "imprint_lines": imprint_lines,
                 "order_screens": order_screens,
-                "num_imprints":  num_locations,,
+                "num_imprints":  num_locations,  # FIX 2: was len(all_imprints)
                 "primary_type":  primary_type,
                 "breakdown":     breakdown,
                 "error":         None,
@@ -391,11 +394,10 @@ def build_production_schedule(date: str) -> str:
             })
 
     # ── Phase 3: Sort by imprint type, then render ───────────────────────────
-    # Priority: Screen Print (1) → Embroidery (2) → DTF / Store (3)
     order_data_list.sort(key=lambda x: imprint_type_sort_key(x.get("primary_type", "")))
 
-    lines               = [f"*PRODUCTION SCHEDULE — {date}*", ""]
-    grand_total_qty     = 0
+    lines                = [f"*PRODUCTION SCHEDULE — {date}*", ""]
+    grand_total_qty      = 0
     grand_total_imprints = 0
     grand_total_screens  = 0
     breakdown_by_type    = {}
@@ -463,7 +465,6 @@ def run_daily_scheduler():
         wait_seconds = (target - now).total_seconds()
         time.sleep(wait_seconds)
 
-        # Skip Saturday (5) and Sunday (6)
         fire_time = datetime.now(CST)
         if fire_time.weekday() >= 5:
             continue
@@ -481,10 +482,10 @@ def run_daily_scheduler():
 # ── TOOL 1: Get Recent Orders ────────────────────────────────────────────────
 @mcp.tool()
 def get_recent_orders(limit: int = 10) -> str:
-    """Get the most recent orders/ from Printavo, newest first"""
+    """Get the most recent orders/invoices from Printavo, newest first"""
     query = """
     query {
-        (first: %d, sortOn: VISUAL_ID, sortDescending: true) {
+        invoices(first: %d, sortOn: VISUAL_ID, sortDescending: true) {
             nodes {
                 id
                 visualId
@@ -589,10 +590,10 @@ def get_order_details(order_number: str) -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
     invoices = result.get("invoices", {}).get("nodes", [])
-     matching = [i for i in invoices if str(i.get("visualId", "")) == str(order_number)]
-     if not matching:
-     return f"Order #{order_number} not found."
-     o = matching[0]
+    matching = [i for i in invoices if str(i.get("visualId", "")) == str(order_number)]  # FIX 1
+    if not matching:
+        return f"Order #{order_number} not found."
+    o = matching[0]
     due = o.get('dueAt', 'N/A')
     due_clean = due[:10] if due else 'N/A'
     lines = [
@@ -619,7 +620,7 @@ def get_order_details(order_number: str) -> str:
             if size_parts:
                 lines.append(f"    Sizes: {' | '.join(size_parts)}")
             else:
-                lines.append(f"    Sizes: None entered")
+                lines.append("    Sizes: None entered")
     return "\n".join(lines)
 
 

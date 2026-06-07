@@ -238,7 +238,7 @@ def build_production_schedule(date: str) -> str:
                 visualId
                 nickname
                 totalQuantity
-                startAt
+                dueAt
                 status { name }
                 contact { fullName }
             }
@@ -246,10 +246,8 @@ def build_production_schedule(date: str) -> str:
         }
     }
     """
-    cursor             = None
-    pages_searched     = 0
-    found_any          = False
-    consecutive_misses = 0
+    cursor         = None
+    pages_searched = 0
 
     while pages_searched < 20:
         variables = {"cursor": cursor} if cursor else {}
@@ -261,19 +259,15 @@ def build_production_schedule(date: str) -> str:
         page_info = (result.get("invoices") or {}).get("pageInfo", {})
 
         for o in nodes:
-            start       = (o.get("startAt") or "")[:10]
-            status_name = (o.get("status") or {}).get("name") or ""
+            # Use dueAt (Production Due Date) — what Printavo calendar plots against.
+            # startAt is the Power Scheduler time slot and does not match calendar dates.
+            due_date_str = (o.get("dueAt") or "")[:10]
+            status_name  = (o.get("status") or {}).get("name") or ""
 
-            if start == date:
-                found_any          = True
-                consecutive_misses = 0
+            if due_date_str == date:
                 if not should_exclude_status(status_name):
                     all_invoices.append(o)
-            elif found_any and start < date:
-                consecutive_misses += 1
 
-        if consecutive_misses >= 25:
-            break
         if not page_info.get("hasNextPage"):
             break
         cursor = page_info.get("endCursor")
@@ -371,9 +365,10 @@ def build_production_schedule(date: str) -> str:
                     for size in (item.get("sizes") or []):
                         group_pieces += int(size.get("count") or 0)
 
-                # Fallback: use invoice totalQuantity if sizes returned nothing
-                # (happens on some store/fulfillment order types)
-                if group_pieces == 0:
+                # Fallback: use invoice totalQuantity only when there is a single
+                # group. If multiple groups exist, totalQuantity is the whole invoice
+                # quantity and would double/triple-count pieces across groups.
+                if group_pieces == 0 and len(groups) == 1:
                     group_pieces = int(o.get("totalQuantity") or 0)
 
                 # 2. Imprint blocks

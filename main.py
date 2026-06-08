@@ -294,7 +294,7 @@ def build_production_schedule(date: str) -> str:
                 nodes {
                     lineItems {
                         nodes {
-                            items
+                            sizes { count }
                         }
                     }
                     imprints {
@@ -356,19 +356,41 @@ def build_production_schedule(date: str) -> str:
             group_summaries        = []
             data_missing           = False
 
+            # Pre-check: does ANY group in this invoice have sizes populated?
+            # If none do, Printavo has no size matrix data — quantity was entered
+            # as a flat number. In that case we use invoice totalQuantity and
+            # distribute it across groups proportionally (or just use it directly
+            # for single-group invoices).
+            any_sizes = False
+            for g in groups:
+                for item in (g.get("lineItems") or {}).get("nodes") or []:
+                    if item.get("sizes"):
+                        any_sizes = True
+                        break
+                if any_sizes:
+                    break
+
+            invoice_qty_fallback = int(o.get("totalQuantity") or 0)
+
             for group in groups:
 
                 # 1. Total pieces for this group
-                # Use items field — flat total quantity per line item regardless
-                # of whether sizes were entered through the size matrix or not.
                 group_pieces = 0
                 line_items   = (group.get("lineItems") or {}).get("nodes") or []
-                for item in line_items:
-                    group_pieces += int(item.get("items") or 0)
 
-                # Final fallback: single-group invoices only — use invoice totalQuantity
-                if group_pieces == 0 and len(groups) == 1:
-                    group_pieces = int(o.get("totalQuantity") or 0)
+                if any_sizes:
+                    # Normal path: sum sizes.count across line items
+                    for item in line_items:
+                        for size in (item.get("sizes") or []):
+                            group_pieces += int(size.get("count") or 0)
+                else:
+                    # Flat-quantity path: no sizes entered anywhere on this invoice.
+                    # Use totalQuantity for single-group invoices.
+                    # For multi-group: distribute evenly (best available approximation).
+                    if len(groups) == 1:
+                        group_pieces = invoice_qty_fallback
+                    else:
+                        group_pieces = invoice_qty_fallback // len(groups)
 
                 # 2. Imprint blocks
                 imprint_nodes = (group.get("imprints") or {}).get("nodes") or []

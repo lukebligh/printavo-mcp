@@ -294,7 +294,7 @@ def build_production_schedule(date: str) -> str:
                 nodes {
                     lineItems {
                         nodes {
-                            sizes { count }
+                            items
                         }
                     }
                     imprints {
@@ -359,15 +359,14 @@ def build_production_schedule(date: str) -> str:
             for group in groups:
 
                 # 1. Total pieces for this group
+                # Use items field — flat total quantity per line item regardless
+                # of whether sizes were entered through the size matrix or not.
                 group_pieces = 0
                 line_items   = (group.get("lineItems") or {}).get("nodes") or []
                 for item in line_items:
-                    for size in (item.get("sizes") or []):
-                        group_pieces += int(size.get("count") or 0)
+                    group_pieces += int(item.get("items") or 0)
 
-                # Fallback: use invoice totalQuantity only when there is a single
-                # group. If multiple groups exist, totalQuantity is the whole invoice
-                # quantity and would double/triple-count pieces across groups.
+                # Final fallback: single-group invoices only — use invoice totalQuantity
                 if group_pieces == 0 and len(groups) == 1:
                     group_pieces = int(o.get("totalQuantity") or 0)
 

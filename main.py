@@ -340,6 +340,8 @@ def build_production_schedule(date: str) -> str:
                 continue
 
             # Fetch group detail
+            # Small delay to avoid Printavo API rate limiting on rapid sequential calls
+            time.sleep(0.4)
             groups = []
             if invoice_id:
                 detail_result = query_printavo(detail_query, {"id": invoice_id})

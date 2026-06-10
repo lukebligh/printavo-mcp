@@ -6,17 +6,12 @@ import math
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-
 mcp = FastMCP("Printavo Assistant")
-
 EMAIL = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN = os.environ.get("PRINTAVO_TOKEN", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 API_URL = "https://www.printavo.com/api/v2"
-
-
 # ── API ───────────────────────────────────────────────────────────────────────
-
 def query_printavo(query: str, variables: dict = None):
     payload = {"query": query}
     if variables:
@@ -35,8 +30,6 @@ def query_printavo(query: str, variables: dict = None):
     if "errors" in data:
         return {"error": data["errors"]}
     return data.get("data", {})
-
-
 def post_to_slack(message: str):
     if not SLACK_WEBHOOK_URL:
         return False
@@ -49,29 +42,31 @@ def post_to_slack(message: str):
         return response.status_code == 200
     except Exception:
         return False
-
-
 # ── DECORATION TYPE ───────────────────────────────────────────────────────────
-
-def resolve_decoration_type(matrix_name: str) -> str:
+def resolve_decoration_type(name: str) -> str:
     """
-    Derive decoration type from pricing matrix name.
-    CONTRACT EMB 2024, Embroidery 2025 → Embroidery
-    TRANSFERS (CONTRACT), TRANSFERS (DIRECT) → DTF
+    Derive decoration type from a pricing matrix column name OR a typeOfWork name.
+
+    Matrix name examples:
+      CONTRACT EMB 2024, Embroidery 2025 → Embroidery
+      TRANSFERS (CONTRACT), TRANSFERS (DIRECT) → DTF
+
+    TypeOfWork name examples:
+      Embroidery, Screen Print, DTF, Direct to Film → matched directly
+
     Everything else (including DO NOT USE matrices) → Screen Print
     """
-    if not matrix_name:
+    if not name:
         return "Screen Print"
-    m = matrix_name.lower().strip()
-    if "contract emb" in m or "embroidery 2025" in m:
+    m = name.lower().strip()
+    # Embroidery — matrix patterns AND plain typeOfWork name
+    if "embroid" in m:
         return "Embroidery"
-    if "transfers" in m:
+    # DTF — matrix "transfers" patterns AND plain typeOfWork names
+    if "transfers" in m or "dtf" in m or "direct to film" in m:
         return "DTF"
     return "Screen Print"
-
-
 # ── COLOR COUNT ───────────────────────────────────────────────────────────────
-
 def extract_matrix_colors(matrix_col: str):
     """
     Extract color count from pricing matrix column name.
@@ -88,41 +83,30 @@ def extract_matrix_colors(matrix_col: str):
     if mc:
         return int(mc.group(1))
     return None
-
-
 # ── PRODUCTION TIME ───────────────────────────────────────────────────────────
-
 # Screen Print constants
 SP_SETUP_MINUTES = {1: 5, 2: 9, 3: 13, 4: 17, 5: 21, 6: 25}
 SP_BASE_RATE     = 375   # pieces/hour at 1-2 colors
 SP_COLOR_PENALTY = 0.10  # 10% run rate reduction per color above 2C
 SP_MAX_COLORS    = 6
-
 # Embroidery constants
 EMB_MINUTES_PER_RUN = 16.5
 EMB_2HEAD_HEADS     = 2
 EMB_6HEAD_HEADS     = 6
 EMB_6HEAD_THRESHOLD = 24
 EMB_DUAL_THRESHOLD  = 48
-
 # Capacity thresholds (hours)
 CAPACITY_CURRENT_HOURS = 6.25
 CAPACITY_TARGET_HOURS  = 8.0
-
-
 def sp_run_rate(colors: int) -> float:
     c = min(max(colors, 1), SP_MAX_COLORS)
     if c <= 2:
         return SP_BASE_RATE
     penalty = SP_COLOR_PENALTY * (c - 2)
     return SP_BASE_RATE * (1 - penalty)
-
-
 def sp_setup_minutes(colors: int) -> float:
     c = min(max(colors, 1), SP_MAX_COLORS)
     return SP_SETUP_MINUTES.get(c, SP_SETUP_MINUTES[SP_MAX_COLORS])
-
-
 def estimate_sp_minutes(qty: int, colors: int) -> float:
     """
     Screen print time for one imprint block:
@@ -134,8 +118,6 @@ def estimate_sp_minutes(qty: int, colors: int) -> float:
     setup = sp_setup_minutes(colors)
     run   = (qty / sp_run_rate(colors)) * 60
     return setup + run
-
-
 def estimate_emb_minutes(qty: int) -> float:
     """
     Embroidery time based on piece count and machine configuration.
@@ -155,8 +137,6 @@ def estimate_emb_minutes(qty: int) -> float:
         return math.ceil(qty / EMB_6HEAD_HEADS) * EMB_MINUTES_PER_RUN
     else:
         return math.ceil(qty / EMB_2HEAD_HEADS) * EMB_MINUTES_PER_RUN
-
-
 def format_duration(minutes: float) -> str:
     h = int(minutes // 60)
     m = int(minutes % 60)
@@ -166,8 +146,6 @@ def format_duration(minutes: float) -> str:
         return f"{h}h"
     else:
         return f"{m}m"
-
-
 def capacity_flag(total_minutes: float) -> str:
     hours = total_minutes / 60
     if hours <= CAPACITY_CURRENT_HOURS * 0.8:
@@ -178,14 +156,9 @@ def capacity_flag(total_minutes: float) -> str:
         return "🟠 Needs Extended Hours (to 4:30)"
     else:
         return "🔴 OVERLOADED — Reschedule Required"
-
-
 # ── STATUS FILTERING ──────────────────────────────────────────────────────────
-
 EXCLUDED_STATUS_PREFIXES = ["promo items"]
 EXCLUDED_STATUS_EXACT    = ["quote", "quote sent"]
-
-
 def should_exclude_status(status_name: str) -> bool:
     s = status_name.lower().strip()
     if any(s.startswith(p) for p in EXCLUDED_STATUS_PREFIXES):
@@ -193,10 +166,7 @@ def should_exclude_status(status_name: str) -> bool:
     if s in EXCLUDED_STATUS_EXACT:
         return True
     return False
-
-
 # ── DECORATION TYPE SORT ──────────────────────────────────────────────────────
-
 def imprint_type_sort_key(primary_type: str) -> int:
     t = (primary_type or "").lower()
     if "screen print" in t:
@@ -205,17 +175,14 @@ def imprint_type_sort_key(primary_type: str) -> int:
         return 2
     else:
         return 3
-
-
 # ── CORE SCHEDULE BUILDER ─────────────────────────────────────────────────────
-
 def build_production_schedule(date: str) -> str:
     """
     Builds the production schedule for a given date.
-
     Data model (per line item group):
       - total_pieces  = sum of sizes.count across all line items in the group
-      - decoration    = resolved from pricingMatrixColumn.columnName on imprint blocks
+      - decoration    = resolved from pricingMatrixColumn.columnName OR
+                        imprint.typeOfWork.name (fallback when matrix is unassigned)
       - per imprint block:
           colors      = extract_matrix_colors(columnName)
           contributes: colors to screen count, estimate_sp_minutes(total_pieces, colors) to time
@@ -224,10 +191,10 @@ def build_production_schedule(date: str) -> str:
       - group_time     = sum of estimate_sp_minutes(total_pieces, colors) per imprint block (SP)
                        = estimate_emb_minutes(total_pieces) (EMB, calculated once per group)
                        = 0 (DTF — not calculated)
-
     All group values are summed to invoice totals.
+    Fallback: if no lineItemGroups are returned OR all groups yield 0 pieces,
+    invoice.totalQuantity (fetched in Phase 1) is used as the piece count.
     """
-
     # ── Phase 1: Fetch invoices scheduled for this date ──────────────────────
     all_invoices = []
     page_query = """
@@ -248,26 +215,19 @@ def build_production_schedule(date: str) -> str:
     """
     cursor         = None
     pages_searched = 0
-
     while pages_searched < 20:
         variables = {"cursor": cursor} if cursor else {}
         result    = query_printavo(page_query, variables)
         if "error" in result:
             return f"API Error: {result['error']}"
-
         nodes     = (result.get("invoices") or {}).get("nodes", [])
         page_info = (result.get("invoices") or {}).get("pageInfo", {})
-
         for o in nodes:
-            # Use dueAt (Production Due Date) — what Printavo calendar plots against.
-            # startAt is the Power Scheduler time slot and does not match calendar dates.
             due_date_str = (o.get("dueAt") or "")[:10]
             status_name  = (o.get("status") or {}).get("name") or ""
-
             if due_date_str == date:
                 if not should_exclude_status(status_name):
                     all_invoices.append(o)
-
         if not page_info.get("hasNextPage"):
             break
         cursor = page_info.get("endCursor")
@@ -278,15 +238,8 @@ def build_production_schedule(date: str) -> str:
 
     # ── Phase 2: Fetch group/imprint detail for each invoice ─────────────────
     #
-    # Lean query — only what the new data model requires:
-    #   lineItems → sizes.count (to sum total_pieces per group)
-    #   imprints  → pricingMatrixColumn.columnName (color count + decoration type)
-    #
-    # Deliberately excludes: description, itemNumber, color, price, details,
-    # typeOfWork — none of these are needed for the calculation and their
-    # inclusion on large orders (e.g. 800+ pcs with many size variants) was
-    # responsible for exceeding Printavo's GraphQL complexity limit of 25,000.
-
+    # FIX (Bug 3): Added typeOfWork { name } to imprints so we can resolve
+    # decoration type even when pricingMatrixColumn is null/unassigned.
     detail_query = """
     query($id: ID!) {
         invoice(id: $id) {
@@ -300,6 +253,7 @@ def build_production_schedule(date: str) -> str:
                     imprints {
                         nodes {
                             pricingMatrixColumn { columnName }
+                            typeOfWork { name }
                         }
                     }
                 }
@@ -310,7 +264,6 @@ def build_production_schedule(date: str) -> str:
 
     # ── Phase 3: Parse each invoice ──────────────────────────────────────────
     order_data_list = []
-
     for o in all_invoices:
         try:
             visual_id   = o.get("visualId")
@@ -348,19 +301,18 @@ def build_production_schedule(date: str) -> str:
                     groups = (invoice_data.get("lineItemGroups") or {}).get("nodes") or []
 
             # ── Per-group calculation ─────────────────────────────────────────
-            invoice_total_pieces  = 0
+            invoice_total_pieces   = 0
             invoice_total_imprints = 0
             invoice_total_screens  = 0
             invoice_est_minutes    = 0.0
             invoice_primary_type   = "Screen Print"
             group_summaries        = []
-            data_missing           = False
+            invoice_data_missing   = False  # FIX (Bug 2): track at invoice level separately
 
-            # Pre-check: does ANY group in this invoice have sizes populated?
-            # If none do, Printavo has no size matrix data — quantity was entered
-            # as a flat number. In that case we use invoice totalQuantity and
-            # distribute it across groups proportionally (or just use it directly
-            # for single-group invoices).
+            # totalQuantity from Phase 1 — used as fallback when sizes aren't in API
+            invoice_qty_fallback = int(o.get("totalQuantity") or 0)
+
+            # Pre-check: does ANY group have sizes populated?
             any_sizes = False
             for g in groups:
                 for item in (g.get("lineItems") or {}).get("nodes") or []:
@@ -370,23 +322,19 @@ def build_production_schedule(date: str) -> str:
                 if any_sizes:
                     break
 
-            invoice_qty_fallback = int(o.get("totalQuantity") or 0)
-
             for group in groups:
+                # FIX (Bug 2): reset data_missing per group, not once for all groups
+                group_data_missing = False
 
                 # 1. Total pieces for this group
                 group_pieces = 0
                 line_items   = (group.get("lineItems") or {}).get("nodes") or []
-
                 if any_sizes:
-                    # Normal path: sum sizes.count across line items
                     for item in line_items:
                         for size in (item.get("sizes") or []):
                             group_pieces += int(size.get("count") or 0)
                 else:
-                    # Flat-quantity path: no sizes entered anywhere on this invoice.
-                    # Use totalQuantity for single-group invoices.
-                    # For multi-group: distribute evenly (best available approximation).
+                    # Flat-quantity path: no sizes entered on this invoice.
                     if len(groups) == 1:
                         group_pieces = invoice_qty_fallback
                     else:
@@ -394,34 +342,32 @@ def build_production_schedule(date: str) -> str:
 
                 # 2. Imprint blocks
                 imprint_nodes = (group.get("imprints") or {}).get("nodes") or []
-
                 if not imprint_nodes:
-                    # Group has no imprints entered — flag it but don't skip
                     group_summaries.append({
-                        "pieces":       group_pieces,
-                        "decoration":   "Screen Print",
-                        "num_imprints": 0,
+                        "pieces":         group_pieces,
+                        "decoration":     "Screen Print",
+                        "num_imprints":   0,
                         "total_imprints": 0,
-                        "screens":      0,
-                        "minutes":      0.0,
-                        "missing_data": True,
+                        "screens":        0,
+                        "minutes":        0.0,
+                        "missing_data":   True,
                     })
-                    data_missing = True
+                    invoice_data_missing = True
                     invoice_total_pieces += group_pieces
                     continue
 
                 # 3. Per imprint block: decoration type, color count
-                group_decoration = "Screen Print"  # will be set from first imprint
+                group_decoration = "Screen Print"
                 group_screens    = 0
                 group_minutes    = 0.0
                 emb_counted      = False
 
                 for imp in imprint_nodes:
                     col_name = (imp.get("pricingMatrixColumn") or {}).get("columnName") or ""
-                    dec_type = resolve_decoration_type(col_name)
+                    # FIX (Bug 3 + 4): fall back to typeOfWork.name when matrix column is unset
+                    tow_name = (imp.get("typeOfWork") or {}).get("name") or ""
+                    dec_type = resolve_decoration_type(col_name or tow_name)
 
-                    # Decoration type: first imprint block wins
-                    # (groups should never be mixed type)
                     if group_decoration == "Screen Print" and dec_type != "Screen Print":
                         group_decoration = dec_type
 
@@ -431,24 +377,18 @@ def build_production_schedule(date: str) -> str:
                             group_screens += colors
                             group_minutes += estimate_sp_minutes(group_pieces, colors)
                         else:
-                            data_missing = True
-
+                            group_data_missing = True   # FIX (Bug 2): per-group flag
                     elif dec_type == "Embroidery":
-                        # EMB time calculated once per group regardless of imprint count
                         if not emb_counted:
                             group_minutes += estimate_emb_minutes(group_pieces)
                             emb_counted    = True
-                        # EMB doesn't add screens
-
                     elif dec_type == "DTF":
-                        # DTF time not calculated
                         pass
 
                 # 4. Group totals
-                num_imprints        = len(imprint_nodes)
+                num_imprints         = len(imprint_nodes)
                 group_total_imprints = group_pieces * num_imprints
 
-                # Track primary decoration type for sort (SP > EMB > DTF)
                 if imprint_type_sort_key(group_decoration) < imprint_type_sort_key(invoice_primary_type):
                     invoice_primary_type = group_decoration
 
@@ -459,44 +399,53 @@ def build_production_schedule(date: str) -> str:
                     "total_imprints": group_total_imprints,
                     "screens":        group_screens,
                     "minutes":        group_minutes,
-                    "missing_data":   data_missing,
+                    "missing_data":   group_data_missing,  # FIX (Bug 2): use per-group flag
                 })
 
+                invoice_data_missing   = invoice_data_missing or group_data_missing
                 invoice_total_pieces   += group_pieces
                 invoice_total_imprints += group_total_imprints
                 invoice_total_screens  += group_screens
                 invoice_est_minutes    += group_minutes
 
+            # FIX (Bug 1): apply totalQuantity fallback AFTER the group loop.
+            # Previously this fallback only ran inside the loop — if groups was
+            # empty (no lineItemGroups returned), invoice_total_pieces stayed 0
+            # even when invoice.totalQuantity was non-zero.
+            if invoice_total_pieces == 0 and invoice_qty_fallback > 0:
+                invoice_total_pieces = invoice_qty_fallback
+                invoice_data_missing = True  # flag that detail data is still missing
+
             order_data_list.append({
-                "visual_id":      visual_id,
-                "customer":       customer,
-                "nickname":       nickname,
-                "status_name":    status_name,
-                "qty":            invoice_total_pieces,
-                "is_store":       False,
-                "primary_type":   invoice_primary_type,
-                "total_imprints": invoice_total_imprints,
-                "total_screens":  invoice_total_screens,
-                "est_minutes":    invoice_est_minutes,
+                "visual_id":       visual_id,
+                "customer":        customer,
+                "nickname":        nickname,
+                "status_name":     status_name,
+                "qty":             invoice_total_pieces,
+                "is_store":        False,
+                "primary_type":    invoice_primary_type,
+                "total_imprints":  invoice_total_imprints,
+                "total_screens":   invoice_total_screens,
+                "est_minutes":     invoice_est_minutes,
                 "group_summaries": group_summaries,
-                "data_missing":   data_missing,
-                "error":          None,
+                "data_missing":    invoice_data_missing,
+                "error":           None,
             })
 
         except Exception as e:
             order_data_list.append({
-                "visual_id":  o.get("visualId"),
-                "customer":   (o.get("contact") or {}).get("fullName") or "Unknown",
-                "nickname":   o.get("nickname") or "",
+                "visual_id":   o.get("visualId"),
+                "customer":    (o.get("contact") or {}).get("fullName") or "Unknown",
+                "nickname":    o.get("nickname") or "",
                 "status_name": (o.get("status") or {}).get("name") or "?",
-                "error":      str(e),
+                "error":       str(e),
                 "primary_type": "Screen Print",
-                "qty":        0,
+                "qty":         0,
                 "total_imprints": 0,
                 "total_screens":  0,
                 "est_minutes":    0.0,
                 "group_summaries": [],
-                "is_store":   False,
+                "is_store":    False,
             })
 
     # ── Phase 4: Sort — SP first, then EMB, then DTF/Store ───────────────────
@@ -504,7 +453,6 @@ def build_production_schedule(date: str) -> str:
 
     # ── Phase 5: Render output ────────────────────────────────────────────────
     lines = [f"*PRODUCTION SCHEDULE — {date}*", ""]
-
     grand_total_qty      = 0
     grand_total_imprints = 0
     grand_total_screens  = 0
@@ -517,8 +465,8 @@ def build_production_schedule(date: str) -> str:
             lines.append("")
             continue
 
-        grand_total_qty     += od["qty"]
-        grand_total_minutes += od["est_minutes"]
+        grand_total_qty      += od["qty"]
+        grand_total_minutes  += od["est_minutes"]
         grand_total_imprints += od["total_imprints"]
         grand_total_screens  += od["total_screens"]
 
@@ -562,7 +510,6 @@ def build_production_schedule(date: str) -> str:
                     f"{g['screens']} screens | "
                     f"{format_duration(g['minutes']) if g['minutes'] else '⚠️ unknown'}"
                 )
-
         lines.append("")
 
     # ── Daily totals ──────────────────────────────────────────────────────────
@@ -587,9 +534,7 @@ def build_production_schedule(date: str) -> str:
 
     return "\n".join(lines)
 
-
 # ── BACKGROUND SLACK SCHEDULER ────────────────────────────────────────────────
-
 def run_daily_scheduler():
     """Posts production schedule to Slack at 6am CST on weekdays."""
     CST = timezone(timedelta(hours=-6))
@@ -599,11 +544,9 @@ def run_daily_scheduler():
         if now >= target:
             target += timedelta(days=1)
         time.sleep((target - now).total_seconds())
-
         fire_time = datetime.now(CST)
         if fire_time.weekday() >= 5:
             continue
-
         today    = fire_time.strftime("%Y-%m-%d")
         day_name = fire_time.strftime("%A, %B %d")
         schedule = build_production_schedule(today)
@@ -612,7 +555,6 @@ def run_daily_scheduler():
             f"Here's your production schedule for *{day_name}*:\n\n{schedule}"
         )
         post_to_slack(message)
-
 
 # ── TOOL 1: Get Recent Orders ─────────────────────────────────────────────────
 @mcp.tool()
@@ -650,7 +592,6 @@ def get_recent_orders(limit: int = 10) -> str:
         )
     return "\n".join(lines)
 
-
 # ── TOOL 2: Search Orders by Customer Name ────────────────────────────────────
 @mcp.tool()
 def search_orders(customer_name: str) -> str:
@@ -685,7 +626,6 @@ def search_orders(customer_name: str) -> str:
             f"Status: {o.get('status', {}).get('name', '?')} | Due: {due_clean}"
         )
     return "\n".join(lines)
-
 
 # ── TOOL 3: Get Order Details ─────────────────────────────────────────────────
 @mcp.tool()
@@ -761,7 +701,6 @@ def get_order_details(order_number: str) -> str:
             )
     return "\n".join(lines)
 
-
 # ── TOOL 4: Get All Statuses ──────────────────────────────────────────────────
 @mcp.tool()
 def get_statuses() -> str:
@@ -785,7 +724,6 @@ def get_statuses() -> str:
             f"  ID: {s.get('id')} | Name: {s.get('name')} | Color: {s.get('color')}"
         )
     return "\n".join(lines)
-
 
 # ── TOOL 5: Outstanding Balances ──────────────────────────────────────────────
 @mcp.tool()
@@ -835,7 +773,6 @@ def get_outstanding_balances() -> str:
         )
     return "\n".join(lines)
 
-
 # ── TOOL 6: Create a Quote ────────────────────────────────────────────────────
 @mcp.tool()
 def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
@@ -881,7 +818,6 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
         f"For: {contact['fullName']} | Due: {quote.get('dueAt', '')[:10]}"
     )
 
-
 # ── TOOL 7: Inspect API Field Names ──────────────────────────────────────────
 @mcp.tool()
 def inspect_fields(type_name: str) -> str:
@@ -910,7 +846,6 @@ def inspect_fields(type_name: str) -> str:
         lines.append(f"  {f.get('name')} ({type_info.get('name', type_info.get('kind', '?'))})")
     return "\n".join(lines)
 
-
 # ── TOOL 8: Production Schedule ───────────────────────────────────────────────
 @mcp.tool()
 def get_production_schedule(date: str) -> str:
@@ -918,16 +853,13 @@ def get_production_schedule(date: str) -> str:
     Get all in-house orders scheduled for production on a given date.
     Excludes PROMO ITEMS and quote/quote-sent statuses.
     Sorted: Screen Print → Embroidery → DTF → Store Orders.
-
     Per order shows:
       - Total pieces, total imprints, total screens, estimated production time
       - Per line item group breakdown
-
-    Decoration type resolved from pricing matrix name — no manual text parsing.
+    Decoration type resolved from pricing matrix name OR typeOfWork name (fallback).
     date: format YYYY-MM-DD (e.g. 2026-06-09)
     """
     return build_production_schedule(date)
-
 
 # ── TOOL 9: Send Production Schedule to Slack ─────────────────────────────────
 @mcp.tool()
@@ -948,53 +880,39 @@ def send_schedule_to_slack(date: str) -> str:
     else:
         return "Failed to post to Slack. Check SLACK_WEBHOOK_URL in Railway variables."
 
-
 # ── TOOL 10: Production Time Estimate ────────────────────────────────────────
 @mcp.tool()
 def get_production_time_estimate(date: str) -> str:
     """
     Returns a focused production time estimate for a given date.
     Shows per-order time, daily total, and capacity status.
-
     Capacity thresholds:
       🟢 On Track       = under 80% of current capacity (~5h)
       🟡 Full Day       = 80–100% of current capacity (5–6h 15m)
       🟠 Extended Hours = requires staying to 4:30pm (6h 15m–8h)
       🔴 Overloaded     = exceeds even extended hours (8h+)
-
     date: format YYYY-MM-DD (e.g. 2026-06-09)
     """
     raw = build_production_schedule(date)
     if "No in-house orders" in raw or "API Error" in raw:
         return raw
-
-    # Extract per-order time lines and daily totals from rendered schedule
     order_times  = []
     total_line   = ""
     status_line  = ""
     current_vid  = None
-
     for line in raw.split("\n"):
         stripped = line.strip()
-
-        # Capture order visual ID
         if stripped.startswith("#") and "|" in stripped:
             current_vid = stripped.split("|")[0].strip()
-
-        # Capture Est. Time from the order detail line
         if "Est. Time:" in stripped and current_vid:
             time_part = stripped.split("Est. Time:")[-1].strip()
-            # Strip any trailing warning flags
             time_part = time_part.split("|")[0].strip()
             order_times.append(f"  {current_vid} — {time_part}")
             current_vid = None
-
         if "Est. Production Time:" in stripped:
             total_line = stripped.split("Est. Production Time:")[-1].strip()
-
         if "Capacity Status:" in stripped:
             status_line = stripped.split("Capacity Status:")[-1].strip()
-
     lines = [f"*PRODUCTION TIME ESTIMATE — {date}*", ""]
     if order_times:
         lines.append("  PER ORDER:")
@@ -1008,15 +926,11 @@ def get_production_time_estimate(date: str) -> str:
     lines.append("    🟡 Full Day        = 5h – 6h 15m (current standard)")
     lines.append("    🟠 Extended Hours  = 6h 15m – 8h (requires 8am–4:30pm)")
     lines.append("    🔴 Overloaded      = over 8h — reschedule required")
-
     return "\n".join(lines)
 
-
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
     scheduler_thread.start()
-
     port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="sse", host="0.0.0.0", port=port)

@@ -1103,16 +1103,11 @@ def update_line_item(
     except Exception as e:
         return f"Invalid sizes_json — could not parse JSON: {e}\nExpected: '{{\"S\": 12, \"M\": 10}}'"
 
-    sizes_input = [
-        {"size": _normalize_size_key(k), "count": int(v)}
+    # Build inline size literals with unquoted enum values (GraphQL enum, not string)
+    sizes_gql = ", ".join(
+        f'{{size: {_normalize_size_key(k)}, count: {int(v)}}}'
         for k, v in sizes_dict.items()
         if int(v) > 0
-    ]
-
-    # Inline sizes as literals to avoid undefined SizeInput type issue
-    sizes_gql = ", ".join(
-        f'{{size: "{s["size"]}", count: {s["count"]}}}'
-        for s in sizes_input
     )
 
     mutation = f"""
@@ -1145,13 +1140,16 @@ def update_line_item(
         for s in (item.get("sizes") or [])
         if (s.get("count") or 0) > 0
     )
+    sizes_display = sizes_summary or ", ".join(
+        f"{k}:{v}" for k, v in sizes_dict.items() if int(v) > 0
+    )
     return (
         f"Line item updated!\n"
         f"  ID: {item.get('id')}\n"
         f"  Item #: {item.get('itemNumber')}\n"
         f"  Color: {item.get('color')}\n"
         f"  Description: {(item.get('description') or '')[:100]}\n"
-        f"  Sizes: {sizes_summary}"
+        f"  Sizes: {sizes_display}"
     )
 
 

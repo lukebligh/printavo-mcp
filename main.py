@@ -18,7 +18,7 @@ API_URL          = "https://www.printavo.com/api/v2"
 
 # ── CORE HELPER ───────────────────────────────────────────────────────────────
 
-def query_printavo(query: str, variables: dict = None):
+def query_printavo(query: str, variables: dict = None, allow_partial: bool = False):
     payload = {"query": query}
     if variables:
         payload["variables"] = variables
@@ -29,7 +29,9 @@ def query_printavo(query: str, variables: dict = None):
         timeout=30,
     )
     data = response.json()
-    if "errors" in data:
+    has_errors = "errors" in data
+    has_data = bool(data.get("data"))
+    if has_errors and (not allow_partial or not has_data):
         return {"error": data["errors"]}
     return data.get("data", {})
 
@@ -675,7 +677,7 @@ def _find_invoice_internal_id(visual_id: str):
         }
     }
     """
-    result = query_printavo(q, {"q": str(visual_id)})
+    result = query_printavo(q, {"q": str(visual_id)}, allow_partial=True)
     if "error" in result:
         return None, f"API Error: {result['error']}"
     nodes = (
@@ -930,7 +932,7 @@ def get_invoice_structure(visual_id: str) -> str:
         quote(id: $id) {{ {fragment} }}
     }}
     """
-    result = query_printavo(q, {"id": internal_id})
+    result = query_printavo(q, {"id": internal_id}, allow_partial=True)
     if "error" in result:
         return f"API Error: {result['error']}"
 
@@ -991,7 +993,7 @@ def delete_production_files(visual_id: str) -> str:
         quote(id: $id) { productionFiles { nodes { id name } } }
     }
     """
-    result = query_printavo(q, {"id": internal_id})
+    result = query_printavo(q, {"id": internal_id}, allow_partial=True)
     if "error" in result:
         return f"API Error: {result['error']}"
 

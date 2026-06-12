@@ -1529,4 +1529,5 @@ scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
 scheduler_thread.start()
 
 if __name__ == "__main__":
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    _port = int(os.environ.get("PORT", 8000))
+    mcp.run(transport="sse", host="0.0.0.0", port=_port)

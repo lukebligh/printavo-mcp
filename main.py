@@ -48,7 +48,7 @@ def get_recent_orders(limit: int = 10) -> str:
                 nickname
                 total
                 dueAt
-                productionAt
+                startAt
                 status { name }
                 contact { fullName email }
             }
@@ -68,7 +68,7 @@ def get_recent_orders(limit: int = 10) -> str:
         status = (inv.get("status") or {}).get("name", "?")
         contact = (inv.get("contact") or {}).get("fullName", "?")
         due = (inv.get("dueAt") or "")[:10]
-        prod = (inv.get("productionAt") or "")[:10]
+        prod = (inv.get("startAt") or "")[:10]
         lines.append(
             f"  #{inv.get('visualId')} | {inv.get('nickname', '')} | "
             f"${inv.get('total', 0)} | {status} | Customer: {contact} | "
@@ -134,11 +134,11 @@ def get_order_details(visual_id: str) -> str:
                 nickname
                 total
                 dueAt
-                productionAt
-                orderedAt
-                pONumber
+                startAt
+                invoiceAt
+                visualPoNumber
                 status { name }
-                contact { fullName email company }
+                contact { fullName email }
                 lineItemGroups {
                     nodes {
                         id
@@ -181,13 +181,13 @@ def get_order_details(visual_id: str) -> str:
 
     lines = [
         f"ORDER #{inv.get('visualId')} | {inv.get('nickname', '')}",
-        f"  Customer:       {contact.get('fullName', '?')} ({contact.get('company', '')})",
+        f"  Customer:       {contact.get('fullName', '?')}",
         f"  Status:         {status}",
         f"  Total:          ${inv.get('total', 0)}",
-        f"  PO #:           {inv.get('pONumber', '')}",
+        f"  PO #:           {inv.get('visualPoNumber', '')}",
         f"  Due Date:       {(inv.get('dueAt') or '')[:10]}",
-        f"  Production Date:{(inv.get('productionAt') or '')[:10]}",
-        f"  Invoice Date:   {(inv.get('orderedAt') or '')[:10]}",
+        f"  Production Date:{(inv.get('startAt') or '')[:10]}",
+        f"  Invoice Date:   {(inv.get('invoiceAt') or '')[:10]}",
         f"  Internal ID:    {inv.get('id')}",
     ]
 
@@ -205,7 +205,7 @@ def get_order_details(visual_id: str) -> str:
             sizes_str = ", ".join(
                 f"{s.get('size','?').replace('size_','').upper()}: {s.get('count',0)}"
                 for s in (item.get("sizes") or [])
-                if s.get("count", 0) > 0
+                if (s.get("count") or 0) > 0
             )
             lines.append(
                 f"    Item ID {item.get('id')}: #{item.get('itemNumber','?')} | "
@@ -263,7 +263,7 @@ def get_outstanding_balances(limit: int = 20) -> str:
                 total
                 amountPaid
                 dueAt
-                contact { fullName company }
+                contact { fullName }
                 status { name }
             }
         }
@@ -425,9 +425,9 @@ def diagnose_order(visual_id: str) -> str:
     query($q: String) {
         invoices(first: 5, query: $q) {
             nodes {
-                id visualId nickname total dueAt productionAt orderedAt pONumber
+                id visualId nickname total dueAt startAt invoiceAt visualPoNumber
                 status { name }
-                contact { fullName email company }
+                contact { fullName email }
                 lineItemGroups {
                     nodes {
                         id
@@ -467,13 +467,13 @@ def diagnose_order(visual_id: str) -> str:
     # Check header fields
     if not inv.get("nickname"):
         issues.append("⚠ MISSING: nickname")
-    if not inv.get("pONumber"):
+    if not inv.get("visualPoNumber"):
         issues.append("⚠ MISSING: PO number")
     if not inv.get("dueAt"):
         issues.append("⚠ MISSING: due date")
-    if not inv.get("productionAt"):
+    if not inv.get("startAt"):
         issues.append("⚠ MISSING: production date")
-    if not inv.get("orderedAt"):
+    if not inv.get("invoiceAt"):
         issues.append("⚠ MISSING: invoice date")
 
     groups = (inv.get("lineItemGroups") or {}).get("nodes", [])
@@ -510,9 +510,9 @@ def diagnose_order(visual_id: str) -> str:
         f"  Status: {status} | Total: ${inv.get('total',0)}",
         f"  Customer: {contact.get('fullName','?')}",
         f"  Due: {(inv.get('dueAt') or '')[:10]} | "
-        f"Prod: {(inv.get('productionAt') or '')[:10]} | "
-        f"Invoice: {(inv.get('orderedAt') or '')[:10]}",
-        f"  PO #: {inv.get('pONumber','')}",
+        f"Prod: {(inv.get('startAt') or '')[:10]} | "
+        f"Invoice: {(inv.get('invoiceAt') or '')[:10]}",
+        f"  PO #: {inv.get('visualPoNumber','')}",
         f"  Production Files: {len(prod_files)} | Mockups: {len(mockups)}",
         f"  Line Item Groups: {len(groups)}",
     ]
@@ -542,9 +542,9 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         invoices(first: $first, query: $q, sortOn: PRODUCTION_AT, sortDirection: ASC) {
             nodes {
                 visualId nickname total
-                dueAt productionAt
+                dueAt startAt
                 status { name }
-                contact { fullName company }
+                contact { fullName }
                 lineItemGroups {
                     nodes {
                         lineItems {
@@ -580,7 +580,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     for inv in nodes:
         contact  = inv.get("contact") or {}
         status   = (inv.get("status") or {}).get("name", "?")
-        prod_dt  = (inv.get("productionAt") or "")[:10]
+        prod_dt  = (inv.get("startAt") or "")[:10]
         due_dt   = (inv.get("dueAt") or "")[:10]
 
         lines.append(
@@ -831,7 +831,7 @@ def duplicate_invoice(source_visual_id: str) -> str:
 
     mutation = """
     mutation($id: ID!) {
-        invoiceDuplicate(input: { invoiceId: $id }) {
+        invoiceDuplicate(invoiceId: $id) {
             invoice { id visualId nickname }
             errors { message }
         }
@@ -893,31 +893,31 @@ def update_invoice_fields(
     mutation(
         $id: ID!,
         $nickname: String,
-        $pONumber: String,
-        $productionAt: ISO8601DateTime,
+        $visualPoNumber: String,
+        $startAt: ISO8601DateTime,
         $dueAt: ISO8601DateTime,
-        $orderedAt: ISO8601DateTime
+        $invoiceAt: ISO8601DateTime
     ) {
         invoiceUpdate(input: {
             id: $id,
             nickname: $nickname,
-            pONumber: $pONumber,
-            productionAt: $productionAt,
+            visualPoNumber: $visualPoNumber,
+            startAt: $startAt,
             dueAt: $dueAt,
-            orderedAt: $orderedAt
+            invoiceAt: $invoiceAt
         }) {
-            invoice { id visualId nickname pONumber dueAt productionAt orderedAt }
+            invoice { id visualId nickname visualPoNumber dueAt startAt invoiceAt }
             errors { message }
         }
     }
     """
     variables = {
-        "id":           internal_id,
-        "nickname":     nickname,
-        "pONumber":     po_number,
-        "productionAt": f"{production_date}T12:00:00Z",
-        "dueAt":        f"{customer_due_date}T12:00:00Z",
-        "orderedAt":    f"{invoice_date}T12:00:00Z",
+        "id":             internal_id,
+        "nickname":       nickname,
+        "visualPoNumber": po_number,
+        "startAt":        f"{production_date}T12:00:00Z",
+        "dueAt":          f"{customer_due_date}T12:00:00Z",
+        "invoiceAt":      f"{invoice_date}T12:00:00Z",
     }
     result = query_printavo(mutation, variables)
     if "error" in result:
@@ -932,10 +932,10 @@ def update_invoice_fields(
     return (
         f"Invoice #{inv.get('visualId')} header updated!\n"
         f"  Nickname:          {inv.get('nickname')}\n"
-        f"  PO #:              {inv.get('pONumber')}\n"
-        f"  Production Date:   {(inv.get('productionAt') or '')[:10]}\n"
+        f"  PO #:              {inv.get('visualPoNumber')}\n"
+        f"  Production Date:   {(inv.get('startAt') or '')[:10]}\n"
         f"  Customer Due Date: {(inv.get('dueAt') or '')[:10]}\n"
-        f"  Invoice Date:      {(inv.get('orderedAt') or '')[:10]}"
+        f"  Invoice Date:      {(inv.get('invoiceAt') or '')[:10]}"
     )
 
 
@@ -1001,7 +1001,7 @@ def get_invoice_structure(visual_id: str) -> str:
             sizes_str = ", ".join(
                 f"{s.get('size','?').replace('size_','').upper()}:{s.get('count',0)}"
                 for s in (item.get("sizes") or [])
-                if s.get("count", 0) > 0
+                if (s.get("count") or 0) > 0
             )
             lines.append(
                 f"    Line Item {ii} | ID: {item.get('id')} | "

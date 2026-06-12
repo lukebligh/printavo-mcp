@@ -1004,9 +1004,8 @@ def delete_production_files(visual_id: str) -> str:
 
     delete_mutation = """
     mutation($id: ID!) {
-        productionFileDelete(input: { id: $id }) {
-            deletedId
-            errors { message }
+        productionFileDelete(id: $id) {
+            id
         }
     }
     """
@@ -1017,12 +1016,7 @@ def delete_production_files(visual_id: str) -> str:
         if "error" in dr:
             failed.append(f"{pf.get('name', pf['id'])}: {dr['error']}")
         else:
-            dd = dr.get("productionFileDelete", {})
-            errs = dd.get("errors", [])
-            if errs:
-                failed.append(f"{pf.get('name', pf['id'])}: {[e.get('message') for e in errs]}")
-            else:
-                deleted.append(pf.get("name", pf["id"]))
+            deleted.append(pf.get("name", pf["id"]))
 
     lines = [f"Deleted {len(deleted)}/{len(files)} production file(s) from order #{visual_id}:"]
     for name in deleted:

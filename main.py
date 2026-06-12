@@ -1109,39 +1109,41 @@ def update_line_item(
         if int(v) > 0
     ]
 
-    mutation = """
-    mutation($id: ID!, $itemNumber: String, $color: String, $description: String, $sizes: [SizeInput!]) {
-        lineItemUpdate(input: {
-            id: $id,
+    # Inline sizes as literals to avoid undefined SizeInput type issue
+    sizes_gql = ", ".join(
+        f'{{size: "{s["size"]}", count: {s["count"]}}}'
+        for s in sizes_input
+    )
+
+    mutation = f"""
+    mutation($id: ID!, $itemNumber: String, $color: String, $description: String) {{
+        lineItemUpdate(id: $id, input: {{
             itemNumber: $itemNumber,
             color: $color,
             description: $description,
-            sizes: $sizes
-        }) {
-            lineItem { id itemNumber description color }
-            errors { message }
-        }
-    }
+            position: 1,
+            sizes: [{sizes_gql}]
+        }}) {{
+            id itemNumber description color
+            sizes {{ size count }}
+        }}
+    }}
     """
     variables = {
         "id":          line_item_id,
         "itemNumber":  item_number,
         "color":       color,
         "description": description,
-        "sizes":       sizes_input,
     }
     result = query_printavo(mutation, variables)
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    upd = result.get("lineItemUpdate", {})
-    errors = upd.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    item = upd.get("lineItem", {})
+    item = result.get("lineItemUpdate", {})
     sizes_summary = ", ".join(
-        f"{k.upper()}:{v}" for k, v in sizes_dict.items() if int(v) > 0
+        f"{s.get('size')}:{s.get('count')}"
+        for s in (item.get("sizes") or [])
+        if (s.get("count") or 0) > 0
     )
     return (
         f"Line item updated!\n"

@@ -135,7 +135,22 @@ def get_order_details(visual_id: str) -> str:
                 visualId
                 nickname
                 total
-                dueAt
+                customerDueAt
+                startAt
+                invoiceAt
+                visualPoNumber
+                status { name }
+                contact { fullName email }
+                productionFiles { nodes { id name } }
+            }
+        }
+        quotes(first: 5, query: $q) {
+            nodes {
+                id
+                visualId
+                nickname
+                total
+                customerDueAt
                 startAt
                 invoiceAt
                 visualPoNumber
@@ -146,12 +161,14 @@ def get_order_details(visual_id: str) -> str:
         }
     }
     """
-    result = query_printavo(q, {"q": str(visual_id)})
+    result = query_printavo(q, {"q": str(visual_id)}, allow_partial=True)
     if "error" in result:
         return f"Error: {result['error']}"
 
-    nodes = result.get("invoices", {}).get("nodes", [])
-    matching = [n for n in nodes if str(n.get("visualId")) == str(visual_id)]
+    invoice_nodes = result.get("invoices", {}).get("nodes", [])
+    quote_nodes   = result.get("quotes",   {}).get("nodes", [])
+    all_nodes = invoice_nodes + quote_nodes
+    matching = [n for n in all_nodes if str(n.get("visualId")) == str(visual_id)]
     if not matching:
         return f"Order #{visual_id} not found."
 
@@ -165,9 +182,9 @@ def get_order_details(visual_id: str) -> str:
         f"  Status:         {status}",
         f"  Total:          ${inv.get('total', 0)}",
         f"  PO #:           {inv.get('visualPoNumber', '')}",
-        f"  Due Date:       {(inv.get('dueAt') or '')[:10]}",
+        f"  Customer Due:   {inv.get('customerDueAt', '')}",
         f"  Production Date:{(inv.get('startAt') or '')[:10]}",
-        f"  Invoice Date:   {(inv.get('invoiceAt') or '')[:10]}",
+        f"  Invoice Date:   {inv.get('invoiceAt', '')}",
         f"  Internal ID:    {inv.get('id')}",
     ]
 
@@ -378,11 +395,8 @@ def diagnose_order(visual_id: str) -> str:
     imprint pricing, line items, and flags any issues.
     visual_id: order number shown in Printavo UI
     """
-    q = """
-    query($q: String) {
-        invoices(first: 5, query: $q) {
-            nodes {
-                id visualId nickname total dueAt startAt invoiceAt visualPoNumber
+    frag = """
+                id visualId nickname total customerDueAt startAt invoiceAt visualPoNumber
                 status { name }
                 contact { fullName email }
                 lineItemGroups {
@@ -405,16 +419,22 @@ def diagnose_order(visual_id: str) -> str:
                 }
                 productionFiles { nodes { id name } }
                 mockups { nodes { id fileName } }
-            }
-        }
-    }
     """
-    result = query_printavo(q, {"q": str(visual_id)})
+    q = f"""
+    query($q: String) {{
+        invoices(first: 5, query: $q) {{ nodes {{ {frag} }} }}
+        quotes(first: 5, query: $q)   {{ nodes {{ {frag} }} }}
+    }}
+    """
+    result = query_printavo(q, {"q": str(visual_id)}, allow_partial=True)
     if "error" in result:
         return f"Error: {result['error']}"
 
-    nodes = result.get("invoices", {}).get("nodes", [])
-    matching = [n for n in nodes if str(n.get("visualId")) == str(visual_id)]
+    all_nodes = (
+        result.get("invoices", {}).get("nodes", []) +
+        result.get("quotes",   {}).get("nodes", [])
+    )
+    matching = [n for n in all_nodes if str(n.get("visualId")) == str(visual_id)]
     if not matching:
         return f"Order #{visual_id} not found."
 
@@ -426,8 +446,8 @@ def diagnose_order(visual_id: str) -> str:
         issues.append("⚠ MISSING: nickname")
     if not inv.get("visualPoNumber"):
         issues.append("⚠ MISSING: PO number")
-    if not inv.get("dueAt"):
-        issues.append("⚠ MISSING: due date")
+    if not inv.get("customerDueAt"):
+        issues.append("⚠ MISSING: customer due date")
     if not inv.get("startAt"):
         issues.append("⚠ MISSING: production date")
     if not inv.get("invoiceAt"):
@@ -466,9 +486,9 @@ def diagnose_order(visual_id: str) -> str:
         f"DIAGNOSTIC — Order #{inv.get('visualId')} | {inv.get('nickname','')}",
         f"  Status: {status} | Total: ${inv.get('total',0)}",
         f"  Customer: {contact.get('fullName','?')}",
-        f"  Due: {(inv.get('dueAt') or '')[:10]} | "
+        f"  Due: {inv.get('customerDueAt', '')} | "
         f"Prod: {(inv.get('startAt') or '')[:10]} | "
-        f"Invoice: {(inv.get('invoiceAt') or '')[:10]}",
+        f"Invoice: {inv.get('invoiceAt', '')}",
         f"  PO #: {inv.get('visualPoNumber','')}",
         f"  Production Files: {len(prod_files)} | Mockups: {len(mockups)}",
         f"  Line Item Groups: {len(groups)}",
@@ -857,17 +877,17 @@ def update_invoice_fields(
         $nickname: String,
         $visualPoNumber: String,
         $startAt: ISO8601DateTime,
-        $dueAt: ISO8601DateTime,
+        $customerDueAt: ISO8601Date,
         $invoiceAt: ISO8601Date
     ) {{
         {update_field}(id: $id, input: {{
             nickname: $nickname,
             visualPoNumber: $visualPoNumber,
             startAt: $startAt,
-            dueAt: $dueAt,
+            customerDueAt: $customerDueAt,
             invoiceAt: $invoiceAt
         }}) {{
-            id visualId nickname visualPoNumber dueAt startAt invoiceAt
+            id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
         }}
     }}
     """
@@ -876,7 +896,7 @@ def update_invoice_fields(
         "nickname":       nickname,
         "visualPoNumber": po_number,
         "startAt":        f"{production_date}T12:00:00Z",
-        "dueAt":          f"{customer_due_date}T12:00:00Z",
+        "customerDueAt":  customer_due_date,
         "invoiceAt":      invoice_date,
     }
     result = query_printavo(mutation, variables)
@@ -889,8 +909,8 @@ def update_invoice_fields(
         f"  Nickname:          {inv.get('nickname')}\n"
         f"  PO #:              {inv.get('visualPoNumber')}\n"
         f"  Production Date:   {(inv.get('startAt') or '')[:10]}\n"
-        f"  Customer Due Date: {(inv.get('dueAt') or '')[:10]}\n"
-        f"  Invoice Date:      {(inv.get('invoiceAt') or '')[:10]}"
+        f"  Customer Due Date: {inv.get('customerDueAt', '')}\n"
+        f"  Invoice Date:      {inv.get('invoiceAt', '')}"
     )
 
 

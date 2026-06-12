@@ -1103,11 +1103,19 @@ def update_line_item(
     except Exception as e:
         return f"Invalid sizes_json — could not parse JSON: {e}\nExpected: '{{\"S\": 12, \"M\": 10}}'"
 
+    # Always send all standard sizes (zero out template residue for sizes not in this order)
+    STANDARD_SIZES = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"]
+    normalized_input = {k.strip().upper(): int(v) for k, v in sizes_dict.items()}
+    full_sizes = {s: normalized_input.get(s, 0) for s in STANDARD_SIZES}
+    # Also include any non-standard sizes from the input
+    for k, v in normalized_input.items():
+        if k not in STANDARD_SIZES:
+            full_sizes[k] = v
+
     # Build inline size literals with unquoted enum values (GraphQL enum, not string)
     sizes_gql = ", ".join(
-        f'{{size: {_normalize_size_key(k)}, count: {int(v)}}}'
-        for k, v in sizes_dict.items()
-        if int(v) > 0
+        f'{{size: {_normalize_size_key(k)}, count: {v}}}'
+        for k, v in full_sizes.items()
     )
 
     mutation = f"""

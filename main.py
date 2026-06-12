@@ -139,28 +139,6 @@ def get_order_details(visual_id: str) -> str:
                 visualPoNumber
                 status { name }
                 contact { fullName email }
-                lineItemGroups {
-                    nodes {
-                        id
-                        lineItems {
-                            nodes {
-                                id
-                                itemNumber
-                                description
-                                color
-                                price
-                                sizes { size count }
-                            }
-                        }
-                        imprints {
-                            nodes {
-                                id
-                                typeOfWork { name }
-                                pricingMatrixColumn { id columnName }
-                            }
-                        }
-                    }
-                }
                 productionFiles { nodes { id name } }
             }
         }
@@ -196,33 +174,10 @@ def get_order_details(visual_id: str) -> str:
         lines.append(f"\n  Production Files ({len(prod_files)}):")
         for pf in prod_files:
             lines.append(f"    - {pf.get('name', 'unnamed')} (ID: {pf.get('id')})")
+    else:
+        lines.append("\n  Production Files: none")
 
-    groups = (inv.get("lineItemGroups") or {}).get("nodes", [])
-    for gi, g in enumerate(groups, 1):
-        lines.append(f"\n  Line Item Group {gi} (ID: {g.get('id')}):")
-        items = (g.get("lineItems") or {}).get("nodes", [])
-        for item in items:
-            sizes_str = ", ".join(
-                f"{s.get('size','?').replace('size_','').upper()}: {s.get('count',0)}"
-                for s in (item.get("sizes") or [])
-                if (s.get("count") or 0) > 0
-            )
-            lines.append(
-                f"    Item ID {item.get('id')}: #{item.get('itemNumber','?')} | "
-                f"{item.get('color','?')} | ${item.get('price','?')}"
-            )
-            lines.append(f"      Description: {item.get('description', '')}")
-            if sizes_str:
-                lines.append(f"      Sizes: {sizes_str}")
-
-        imprints = (g.get("imprints") or {}).get("nodes", [])
-        for imp in imprints:
-            col = (imp.get("pricingMatrixColumn") or {})
-            tow = (imp.get("typeOfWork") or {}).get("name", "?")
-            lines.append(
-                f"    Imprint ID {imp.get('id')}: {tow} | "
-                f"Column: {col.get('columnName','none')} (Col ID: {col.get('id','none')})"
-            )
+    lines.append("\n  (Use get_invoice_structure for line items and imprints)")
 
     return "\n".join(lines)
 
@@ -831,9 +786,10 @@ def duplicate_invoice(source_visual_id: str) -> str:
 
     mutation = """
     mutation($id: ID!) {
-        invoiceDuplicate(invoiceId: $id) {
-            invoice { id visualId nickname }
-            errors { message }
+        invoiceDuplicate(id: $id) {
+            id
+            visualId
+            nickname
         }
     }
     """
@@ -841,21 +797,9 @@ def duplicate_invoice(source_visual_id: str) -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    dup = result.get("invoiceDuplicate", {})
-    if not dup:
-        return (
-            f"Unexpected response — 'invoiceDuplicate' key missing.\n"
-            f"Raw result: {result}\n"
-            f"Run list_available_mutations() to find the correct mutation name."
-        )
-
-    errors = dup.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    invoice = dup.get("invoice", {})
+    invoice = result.get("invoiceDuplicate", {})
     if not invoice:
-        return f"No invoice returned in response. Full result: {result}"
+        return f"Unexpected response — 'invoiceDuplicate' key missing. Raw: {result}"
 
     return (
         f"Invoice duplicated!\n"

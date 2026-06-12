@@ -902,39 +902,41 @@ def get_invoice_structure(visual_id: str) -> str:
     if err:
         return err
 
-    q = """
-    query($id: ID!) {
-        invoice(id: $id) {
-            visualId
-            nickname
-            productionFiles { nodes { id name } }
-            lineItemGroups {
-                nodes {
-                    id
-                    lineItems {
-                        nodes {
-                            id itemNumber description color
-                            sizes { size count }
-                        }
+    fragment = """
+        visualId
+        nickname
+        productionFiles { nodes { id name } }
+        lineItemGroups {
+            nodes {
+                id
+                lineItems {
+                    nodes {
+                        id itemNumber description color
+                        sizes { size count }
                     }
-                    imprints {
-                        nodes {
-                            id
-                            pricingMatrixColumn { id columnName }
-                        }
+                }
+                imprints {
+                    nodes {
+                        id
+                        pricingMatrixColumn { id columnName }
                     }
                 }
             }
         }
-    }
+    """
+    q = f"""
+    query($id: ID!) {{
+        invoice(id: $id) {{ {fragment} }}
+        quote(id: $id) {{ {fragment} }}
+    }}
     """
     result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    inv = result.get("invoice", {})
+    inv = result.get("invoice") or result.get("quote") or {}
     if not inv:
-        return f"Invoice #{visual_id} not found via direct ID lookup."
+        return f"Order #{visual_id} not found via direct ID lookup."
 
     lines = [f"STRUCTURE — Order #{inv.get('visualId')} | {inv.get('nickname', '')}"]
 
@@ -985,16 +987,16 @@ def delete_production_files(visual_id: str) -> str:
 
     q = """
     query($id: ID!) {
-        invoice(id: $id) {
-            productionFiles { nodes { id name } }
-        }
+        invoice(id: $id) { productionFiles { nodes { id name } } }
+        quote(id: $id) { productionFiles { nodes { id name } } }
     }
     """
     result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    files = (result.get("invoice") or {}).get("productionFiles", {}).get("nodes", [])
+    obj = result.get("invoice") or result.get("quote") or {}
+    files = obj.get("productionFiles", {}).get("nodes", [])
     if not files:
         return f"No production files found on order #{visual_id}. Nothing to delete."
 

@@ -663,10 +663,14 @@ def get_production_time_estimate(visual_id: str) -> str:
 # ── PRIVATE HELPERS (not tools) ───────────────────────────────────────────────
 
 def _find_invoice_internal_id(visual_id: str):
-    """Returns (internal_id, error_string). One will be None."""
+    """Returns (internal_id, error_string). One will be None.
+    Searches both invoices and quotes (duplicates create quotes)."""
     q = """
     query($q: String) {
         invoices(first: 5, query: $q) {
+            nodes { id visualId }
+        }
+        quotes(first: 5, query: $q) {
             nodes { id visualId }
         }
     }
@@ -674,10 +678,13 @@ def _find_invoice_internal_id(visual_id: str):
     result = query_printavo(q, {"q": str(visual_id)})
     if "error" in result:
         return None, f"API Error: {result['error']}"
-    nodes = result.get("invoices", {}).get("nodes", [])
+    nodes = (
+        result.get("invoices", {}).get("nodes", []) +
+        result.get("quotes", {}).get("nodes", [])
+    )
     matching = [n for n in nodes if str(n.get("visualId")) == str(visual_id)]
     if not matching:
-        return None, f"Invoice #{visual_id} not found."
+        return None, f"Order #{visual_id} not found in invoices or quotes."
     return matching[0]["id"], None
 
 

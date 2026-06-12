@@ -667,6 +667,13 @@ def get_production_time_estimate(visual_id: str) -> str:
 def _find_invoice_internal_id(visual_id: str):
     """Returns (internal_id, error_string). One will be None.
     Searches both invoices and quotes (duplicates create quotes)."""
+    internal_id, _order_type, err = _find_order(visual_id)
+    return internal_id, err
+
+
+def _find_order(visual_id: str):
+    """Returns (internal_id, order_type, error_string).
+    order_type is 'invoice' or 'quote'. Searches both types."""
     q = """
     query($q: String) {
         invoices(first: 5, query: $q) {
@@ -679,15 +686,16 @@ def _find_invoice_internal_id(visual_id: str):
     """
     result = query_printavo(q, {"q": str(visual_id)}, allow_partial=True)
     if "error" in result:
-        return None, f"API Error: {result['error']}"
-    nodes = (
-        result.get("invoices", {}).get("nodes", []) +
-        result.get("quotes", {}).get("nodes", [])
-    )
-    matching = [n for n in nodes if str(n.get("visualId")) == str(visual_id)]
-    if not matching:
-        return None, f"Order #{visual_id} not found in invoices or quotes."
-    return matching[0]["id"], None
+        return None, None, f"API Error: {result['error']}"
+    invoice_nodes = result.get("invoices", {}).get("nodes", [])
+    quote_nodes   = result.get("quotes",   {}).get("nodes", [])
+    for n in invoice_nodes:
+        if str(n.get("visualId")) == str(visual_id):
+            return n["id"], "invoice", None
+    for n in quote_nodes:
+        if str(n.get("visualId")) == str(visual_id):
+            return n["id"], "quote", None
+    return None, None, f"Order #{visual_id} not found in invoices or quotes."
 
 
 def _get_status_id_by_name(status_name: str):
@@ -838,11 +846,12 @@ def update_invoice_fields(
     customer_due_date: YYYY-MM-DD  (carrier date from UGP)
     invoice_date: YYYY-MM-DD  (same as production_date)
     """
-    internal_id, err = _find_invoice_internal_id(visual_id)
+    internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
 
-    mutation = """
+    update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
+    mutation = f"""
     mutation(
         $id: ID!,
         $nickname: String,
@@ -850,17 +859,17 @@ def update_invoice_fields(
         $startAt: ISO8601DateTime,
         $dueAt: ISO8601DateTime,
         $invoiceAt: ISO8601Date
-    ) {
-        invoiceUpdate(id: $id, input: {
+    ) {{
+        {update_field}(id: $id, input: {{
             nickname: $nickname,
             visualPoNumber: $visualPoNumber,
             startAt: $startAt,
             dueAt: $dueAt,
             invoiceAt: $invoiceAt
-        }) {
+        }}) {{
             id visualId nickname visualPoNumber dueAt startAt invoiceAt
-        }
-    }
+        }}
+    }}
     """
     variables = {
         "id":             internal_id,
@@ -874,9 +883,9 @@ def update_invoice_fields(
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    inv = result.get("invoiceUpdate", {})
+    inv = result.get(update_field, {})
     return (
-        f"Invoice #{inv.get('visualId')} header updated!\n"
+        f"Order #{inv.get('visualId')} header updated!\n"
         f"  Nickname:          {inv.get('nickname')}\n"
         f"  PO #:              {inv.get('visualPoNumber')}\n"
         f"  Production Date:   {(inv.get('startAt') or '')[:10]}\n"
@@ -1283,7 +1292,7 @@ def set_order_status(visual_id: str, status_name: str) -> str:
     status_name: exact status name e.g. 'Quote Approved', 'Art Approved', 'Quote'
                  Use get_statuses() to see all available names.
     """
-    internal_id, err = _find_invoice_internal_id(visual_id)
+    internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
 
@@ -1291,18 +1300,19 @@ def set_order_status(visual_id: str, status_name: str) -> str:
     if err:
         return err
 
-    mutation = """
-    mutation($id: ID!, $statusId: ID!) {
-        invoiceUpdate(id: $id, input: { statusId: $statusId }) {
-            id visualId status { name }
-        }
-    }
+    update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
+    mutation = f"""
+    mutation($id: ID!, $statusId: ID!) {{
+        {update_field}(id: $id, input: {{ statusId: $statusId }}) {{
+            id visualId status {{ name }}
+        }}
+    }}
     """
     result = query_printavo(mutation, {"id": internal_id, "statusId": status_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    inv = result.get("invoiceUpdate", {})
+    inv = result.get(update_field, {})
     new_status = (inv.get("status") or {}).get("name", "?")
     return f"Order #{inv.get('visualId')} status → {new_status}"
 

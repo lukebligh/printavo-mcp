@@ -849,18 +849,16 @@ def update_invoice_fields(
         $visualPoNumber: String,
         $startAt: ISO8601DateTime,
         $dueAt: ISO8601DateTime,
-        $invoiceAt: ISO8601DateTime
+        $invoiceAt: ISO8601Date
     ) {
-        invoiceUpdate(input: {
-            id: $id,
+        invoiceUpdate(id: $id, input: {
             nickname: $nickname,
             visualPoNumber: $visualPoNumber,
             startAt: $startAt,
             dueAt: $dueAt,
             invoiceAt: $invoiceAt
         }) {
-            invoice { id visualId nickname visualPoNumber dueAt startAt invoiceAt }
-            errors { message }
+            id visualId nickname visualPoNumber dueAt startAt invoiceAt
         }
     }
     """
@@ -870,18 +868,13 @@ def update_invoice_fields(
         "visualPoNumber": po_number,
         "startAt":        f"{production_date}T12:00:00Z",
         "dueAt":          f"{customer_due_date}T12:00:00Z",
-        "invoiceAt":      f"{invoice_date}T12:00:00Z",
+        "invoiceAt":      invoice_date,
     }
     result = query_printavo(mutation, variables)
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    upd = result.get("invoiceUpdate", {})
-    errors = upd.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    inv = upd.get("invoice", {})
+    inv = result.get("invoiceUpdate", {})
     return (
         f"Invoice #{inv.get('visualId')} header updated!\n"
         f"  Nickname:          {inv.get('nickname')}\n"
@@ -1300,9 +1293,8 @@ def set_order_status(visual_id: str, status_name: str) -> str:
 
     mutation = """
     mutation($id: ID!, $statusId: ID!) {
-        invoiceUpdate(input: { id: $id, statusId: $statusId }) {
-            invoice { id visualId status { name } }
-            errors { message }
+        invoiceUpdate(id: $id, input: { statusId: $statusId }) {
+            id visualId status { name }
         }
     }
     """
@@ -1310,12 +1302,7 @@ def set_order_status(visual_id: str, status_name: str) -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    upd = result.get("invoiceUpdate", {})
-    errors = upd.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    inv = upd.get("invoice", {})
+    inv = result.get("invoiceUpdate", {})
     new_status = (inv.get("status") or {}).get("name", "?")
     return f"Order #{inv.get('visualId')} status → {new_status}"
 

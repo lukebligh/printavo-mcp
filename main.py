@@ -871,34 +871,63 @@ def update_invoice_fields(
         return err
 
     update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
-    mutation = f"""
-    mutation(
-        $id: ID!,
-        $nickname: String,
-        $visualPoNumber: String,
-        $startAt: ISO8601DateTime,
-        $customerDueAt: ISO8601Date,
-        $invoiceAt: ISO8601Date
-    ) {{
-        {update_field}(id: $id, input: {{
-            nickname: $nickname,
-            visualPoNumber: $visualPoNumber,
-            startAt: $startAt,
-            customerDueAt: $customerDueAt,
-            invoiceAt: $invoiceAt
-        }}) {{
-            id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
+    # Quotes: omit invoiceAt — Printavo rejects it when customerDueAt < invoiceAt+payment_terms
+    # Invoices: include invoiceAt
+    if order_type == "quote":
+        mutation = f"""
+        mutation(
+            $id: ID!,
+            $nickname: String,
+            $visualPoNumber: String,
+            $startAt: ISO8601DateTime,
+            $customerDueAt: ISO8601Date
+        ) {{
+            {update_field}(id: $id, input: {{
+                nickname: $nickname,
+                visualPoNumber: $visualPoNumber,
+                startAt: $startAt,
+                customerDueAt: $customerDueAt
+            }}) {{
+                id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
+            }}
         }}
-    }}
-    """
-    variables = {
-        "id":             internal_id,
-        "nickname":       nickname,
-        "visualPoNumber": po_number,
-        "startAt":        f"{production_date}T12:00:00Z",
-        "customerDueAt":  customer_due_date,
-        "invoiceAt":      invoice_date,
-    }
+        """
+        variables = {
+            "id":             internal_id,
+            "nickname":       nickname,
+            "visualPoNumber": po_number,
+            "startAt":        f"{production_date}T12:00:00Z",
+            "customerDueAt":  customer_due_date,
+        }
+    else:
+        mutation = f"""
+        mutation(
+            $id: ID!,
+            $nickname: String,
+            $visualPoNumber: String,
+            $startAt: ISO8601DateTime,
+            $customerDueAt: ISO8601Date,
+            $invoiceAt: ISO8601Date
+        ) {{
+            {update_field}(id: $id, input: {{
+                nickname: $nickname,
+                visualPoNumber: $visualPoNumber,
+                startAt: $startAt,
+                customerDueAt: $customerDueAt,
+                invoiceAt: $invoiceAt
+            }}) {{
+                id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
+            }}
+        }}
+        """
+        variables = {
+            "id":             internal_id,
+            "nickname":       nickname,
+            "visualPoNumber": po_number,
+            "startAt":        f"{production_date}T12:00:00Z",
+            "customerDueAt":  customer_due_date,
+            "invoiceAt":      invoice_date,
+        }
     result = query_printavo(mutation, variables)
     if "error" in result:
         return f"API Error: {result['error']}"

@@ -185,8 +185,7 @@ def get_order_details(visual_id: str) -> str:
         f"  Total:          ${inv.get('total', 0)}",
         f"  PO #:           {inv.get('visualPoNumber', '')}",
         f"  Customer Due:   {inv.get('customerDueAt', '')}",
-        f"  dueAt:          {(inv.get('dueAt') or '')[:10]}",
-        f"  startAt:        {(inv.get('startAt') or '')[:10]}",
+        f"  Production Date:{(inv.get('dueAt') or inv.get('startAt') or '')[:10]}",
         f"  Invoice Date:   {inv.get('invoiceAt', '')}",
         f"  Internal ID:    {inv.get('id')}",
     ]
@@ -841,8 +840,6 @@ def update_invoice_fields(
         return err
 
     update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
-    # Quotes: omit invoiceAt — Printavo rejects it when customerDueAt < invoiceAt+payment_terms
-    # Invoices: include invoiceAt
     if order_type == "quote":
         mutation = f"""
         mutation(
@@ -850,13 +847,15 @@ def update_invoice_fields(
             $nickname: String,
             $visualPoNumber: String,
             $dueAt: ISO8601DateTime,
-            $customerDueAt: ISO8601Date
+            $customerDueAt: ISO8601Date,
+            $invoiceAt: ISO8601Date
         ) {{
             {update_field}(id: $id, input: {{
                 nickname: $nickname,
                 visualPoNumber: $visualPoNumber,
                 dueAt: $dueAt,
-                customerDueAt: $customerDueAt
+                customerDueAt: $customerDueAt,
+                invoiceAt: $invoiceAt
             }}) {{
                 id visualId nickname visualPoNumber customerDueAt dueAt startAt invoiceAt
             }}
@@ -868,6 +867,7 @@ def update_invoice_fields(
             "visualPoNumber": po_number,
             "dueAt":          f"{production_date}T12:00:00Z",
             "customerDueAt":  customer_due_date,
+            "invoiceAt":      invoice_date,
         }
     else:
         mutation = f"""

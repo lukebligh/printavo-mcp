@@ -458,7 +458,7 @@ def diagnose_order(visual_id: str) -> str:
             if not items:
                 issues.append(f"⚠ Group {gi}: no line items")
             for item in items:
-                total_qty = sum(s.get("count", 0) for s in (item.get("sizes") or []))
+                total_qty = sum((s.get("count") or 0) for s in (item.get("sizes") or []))
                 if total_qty == 0:
                     issues.append(f"⚠ Line item {item.get('id')}: no sizes/qty")
                 if not item.get("price") or float(item.get("price") or 0) == 0:
@@ -565,7 +565,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         for g in groups:
             items = (g.get("lineItems") or {}).get("nodes", [])
             for item in items:
-                qty = sum(s.get("count", 0) for s in (item.get("sizes") or []))
+                qty = sum((s.get("count") or 0) for s in (item.get("sizes") or []))
                 lines.append(f"  {item.get('color','?')} | {item.get('description','')[:60]} | Qty: {qty}")
 
             imprints = (g.get("imprints") or {}).get("nodes", [])
@@ -642,7 +642,7 @@ def get_production_time_estimate(visual_id: str) -> str:
     for g in groups:
         items = (g.get("lineItems") or {}).get("nodes", [])
         for item in items:
-            total_qty += sum(s.get("count", 0) for s in (item.get("sizes") or []))
+            total_qty += sum((s.get("count") or 0) for s in (item.get("sizes") or []))
 
         imprints = (g.get("imprints") or {}).get("nodes", [])
         total_prints += len(imprints)

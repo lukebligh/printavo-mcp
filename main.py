@@ -511,7 +511,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
 
     q = """
     query($q: String, $first: Int) {
-        invoices(first: $first, query: $q, sortOn: PRODUCTION_AT, sortDirection: ASC) {
+        invoices(first: $first, query: $q) {
             nodes {
                 visualId nickname total
                 dueAt startAt

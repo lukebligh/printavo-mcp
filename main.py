@@ -739,12 +739,14 @@ def _find_pricing_matrix_column_id(color_count: int):
     """
     q = """
     query {
-        pricingMatrices(first: 50) {
-            nodes {
-                id
-                name
-                pricingMatrixColumns(first: 20) {
-                    nodes { id columnName }
+        account {
+            pricingMatrices(first: 50) {
+                nodes {
+                    id
+                    name
+                    pricingMatrixColumns(first: 20) {
+                        nodes { id columnName }
+                    }
                 }
             }
         }
@@ -754,7 +756,7 @@ def _find_pricing_matrix_column_id(color_count: int):
     if "error" in result:
         return None, f"API Error: {result['error']}"
 
-    matrices = result.get("pricingMatrices", {}).get("nodes", [])
+    matrices = result.get("account", {}).get("pricingMatrices", {}).get("nodes", [])
     target = None
     for m in matrices:
         if "contract sp 2025" in m.get("name", "").lower():
@@ -1220,12 +1222,10 @@ def set_imprint_pricing(imprint_id: str, color_count: int) -> str:
 
     mutation = """
     mutation($id: ID!, $pricingMatrixColumnId: ID!) {
-        imprintUpdate(input: {
-            id: $id,
+        imprintUpdate(id: $id, input: {
             pricingMatrixColumnId: $pricingMatrixColumnId
         }) {
-            imprint { id pricingMatrixColumn { id columnName } }
-            errors { message }
+            id pricingMatrixColumn { id columnName }
         }
     }
     """
@@ -1233,19 +1233,7 @@ def set_imprint_pricing(imprint_id: str, color_count: int) -> str:
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    upd = result.get("imprintUpdate", {})
-    if not upd:
-        return (
-            f"Unexpected response — 'imprintUpdate' key missing.\n"
-            f"Raw: {result}\n"
-            f"Run list_available_mutations() to verify the mutation name."
-        )
-
-    errors = upd.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    imp = upd.get("imprint", {})
+    imp = result.get("imprintUpdate", {})
     col_name = (imp.get("pricingMatrixColumn") or {}).get("columnName", "?")
     return f"Imprint {imprint_id} pricing set to: {col_name}"
 

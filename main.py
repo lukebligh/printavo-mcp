@@ -77,101 +77,148 @@ def _color_count(imprint_node: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _fetch_imprints_for_order(internal_id: str) -> list:
-    """
-    Fetch imprint nodes for a single order by internal ID.
-    Returns a list of imprint dicts with keys: type, colors, col_name.
-    Returns None on API error.
+def _parse_obj_imprints(obj: dict) -> list:
+    """Parse imprint list from a lineItemGroups-bearing object (invoice or quote node)."""
+    groups = (obj.get("lineItemGroups") or {}).get("nodes", [])
+    imprints = []
+    for g in groups:
+        for imp in (g.get("imprints") or {}).get("nodes", []):
+            imprints.append({
+                "type":     _decoration_type(imp),
+                "colors":   _color_count(imp),
+                "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
+            })
+    return imprints
 
-    Tries invoice(id) first; if that returns null, falls back to quote(id).
-    The inProductionAfter list may return IDs for records that are quotes
-    rather than invoices in some cases, so both are attempted.
-    Sequential queries (not combined) avoids partial-error handling complexity.
-    """
-    frag = """
-        lineItemGroups {
-            nodes {
-                imprints {
-                    nodes {
-                        typeOfWork { name }
-                        pricingMatrixColumn { columnName matrix { name } }
-                    }
+
+def _parse_obj_qty(obj: dict) -> int:
+    """Sum size counts across all line items in a lineItemGroups-bearing object."""
+    total = 0
+    for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
+        for item in (g.get("lineItems") or {}).get("nodes", []):
+            total += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
+    return total
+
+
+_IMPRINT_FRAG = """
+    lineItemGroups {
+        nodes {
+            imprints {
+                nodes {
+                    typeOfWork { name }
+                    pricingMatrixColumn { columnName matrix { name } }
                 }
             }
         }
+    }
+"""
+
+_QTY_FRAG = """
+    lineItemGroups {
+        nodes {
+            lineItems {
+                nodes { sizes { size count } }
+            }
+        }
+    }
+"""
+
+
+def _fetch_imprints_batch(id_list: list) -> dict:
     """
+    Fetch imprint data for multiple orders in ONE GraphQL query using field aliases.
+    Batching eliminates per-order HTTP calls and avoids rate limiting.
 
-    def _parse_imprints(obj: dict) -> list:
-        groups = (obj.get("lineItemGroups") or {}).get("nodes", [])
-        imprints = []
-        for g in groups:
-            for imp in (g.get("imprints") or {}).get("nodes", []):
-                imprints.append({
-                    "type":     _decoration_type(imp),
-                    "colors":   _color_count(imp),
-                    "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
-                })
-        return imprints
+    Returns dict: internal_id → list of imprint dicts (or None on error).
+    If an ID resolves as a quote (invoice returns null), that ID is returned
+    with value None so the caller can run a quote fallback batch.
+    """
+    if not id_list:
+        return {}
 
-    # Try invoice first
-    q_inv = f"query($id: ID!) {{ invoice(id: $id) {{ {frag} }} }}"
-    r1 = query_printavo(q_inv, {"id": internal_id})
-    if "error" not in r1:
-        inv = r1.get("invoice")
-        if inv is not None:
-            return _parse_imprints(inv)
+    # Build aliased query: inv0: invoice(id: "X") { ... }  inv1: invoice(id: "Y") ...
+    parts = [f'  inv{i}: invoice(id: "{iid}") {{ {_IMPRINT_FRAG} }}'
+             for i, iid in enumerate(id_list)]
+    q = "query {\n" + "\n".join(parts) + "\n}"
 
-    # Fall back to quote
-    q_qt = f"query($id: ID!) {{ quote(id: $id) {{ {frag} }} }}"
-    r2 = query_printavo(q_qt, {"id": internal_id})
-    if "error" not in r2:
-        qt = r2.get("quote")
-        if qt is not None:
-            return _parse_imprints(qt)
+    result = query_printavo(q)
+    if "error" in result:
+        # Entire batch failed (e.g. auth error) — signal all as None
+        return {iid: None for iid in id_list}
 
-    # Both failed — return None to signal API error
-    return None
+    out = {}
+    for i, iid in enumerate(id_list):
+        obj = result.get(f"inv{i}")
+        out[iid] = _parse_obj_imprints(obj) if obj is not None else None
+    return out
+
+
+def _fetch_imprints_quote_batch(id_list: list) -> dict:
+    """
+    Same as _fetch_imprints_batch but queries quote(id) instead of invoice(id).
+    Used as fallback for IDs that returned null from the invoice batch.
+    """
+    if not id_list:
+        return {}
+    parts = [f'  qt{i}: quote(id: "{iid}") {{ {_IMPRINT_FRAG} }}'
+             for i, iid in enumerate(id_list)]
+    q = "query {\n" + "\n".join(parts) + "\n}"
+    result = query_printavo(q, allow_partial=True)  # quote "not found" errors are expected
+    if "error" in result:
+        return {iid: None for iid in id_list}
+    out = {}
+    for i, iid in enumerate(id_list):
+        obj = result.get(f"qt{i}")
+        out[iid] = _parse_obj_imprints(obj) if obj is not None else []
+    return out
+
+
+def _fetch_qty_batch(id_list: list) -> dict:
+    """
+    Batch-fetch quantity fallback for orders where totalQuantity=0.
+    Returns dict: internal_id → total quantity int.
+    """
+    if not id_list:
+        return {}
+    parts = [f'  inv{i}: invoice(id: "{iid}") {{ {_QTY_FRAG} }}'
+             for i, iid in enumerate(id_list)]
+    q = "query {\n" + "\n".join(parts) + "\n}"
+    result = query_printavo(q)
+    if "error" in result:
+        return {iid: 0 for iid in id_list}
+    out = {}
+    for i, iid in enumerate(id_list):
+        obj = result.get(f"inv{i}")
+        out[iid] = _parse_obj_qty(obj) if obj is not None else 0
+    return out
 
 
 def _fetch_qty_from_line_items(internal_id: str) -> int:
-    """
-    Fallback quantity fetch — sums size counts across all line items.
-    Used when totalQuantity on the invoice node returns 0 (common for
-    EMB pre-production and some UGP contract orders).
-    Tries invoice(id) first, then falls back to quote(id).
-    """
-    frag = """
-        lineItemGroups {
-            nodes {
-                lineItems {
-                    nodes { sizes { size count } }
-                }
-            }
-        }
-    """
+    """Single-order qty fallback — kept for use by other tools."""
+    q = f"query($id: ID!) {{ invoice(id: $id) {{ {_QTY_FRAG} }} }}"
+    r = query_printavo(q, {"id": internal_id})
+    if "error" in r:
+        return 0
+    obj = r.get("invoice")
+    return _parse_obj_qty(obj) if obj is not None else 0
 
-    def _sum_qty(obj: dict) -> int:
-        total = 0
-        for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
-            for item in (g.get("lineItems") or {}).get("nodes", []):
-                total += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
-        return total
 
-    q_inv = f"query($id: ID!) {{ invoice(id: $id) {{ {frag} }} }}"
-    r1 = query_printavo(q_inv, {"id": internal_id})
-    if "error" not in r1:
-        inv = r1.get("invoice")
-        if inv is not None:
-            return _sum_qty(inv)
-
-    q_qt = f"query($id: ID!) {{ quote(id: $id) {{ {frag} }} }}"
-    r2 = query_printavo(q_qt, {"id": internal_id})
+def _fetch_imprints_for_order(internal_id: str) -> list:
+    """Single-order imprint fetch — kept for use by other tools (e.g. get_production_time_estimate)."""
+    q = f"query($id: ID!) {{ invoice(id: $id) {{ {_IMPRINT_FRAG} }} }}"
+    r = query_printavo(q, {"id": internal_id})
+    if "error" not in r:
+        obj = r.get("invoice")
+        if obj is not None:
+            return _parse_obj_imprints(obj)
+    # Fall back to quote
+    q2 = f"query($id: ID!) {{ quote(id: $id) {{ {_IMPRINT_FRAG} }} }}"
+    r2 = query_printavo(q2, {"id": internal_id})
     if "error" not in r2:
-        qt = r2.get("quote")
-        if qt is not None:
-            return _sum_qty(qt)
-
-    return 0
+        obj2 = r2.get("quote")
+        if obj2 is not None:
+            return _parse_obj_imprints(obj2)
+    return None
 
 
 def _format_est_time(total_min: int) -> str:
@@ -645,10 +692,26 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     if not nodes:
         return f"No orders scheduled for production in the next {days_ahead} days."
 
-    # ── Step 2: per-order imprint fetch via invoice(id) ─────────────────────
-    # Uses _fetch_imprints_for_order() which queries invoice(id) — a single-
-    # object query — so it reliably gets lineItemGroups.nodes even for orders
-    # in ART APPROVAL SENT, PRINT READY, and other non-contract statuses.
+    # ── Step 2: batch imprint fetch ──────────────────────────────────────────
+    # All orders are fetched in ONE GraphQL query using field aliases.
+    # This eliminates per-order HTTP calls and avoids Printavo rate limits.
+    # IDs that return null from the invoice batch are retried as quotes.
+
+    all_ids = [n["id"] for n in nodes if n.get("id")]
+    imprint_map = _fetch_imprints_batch(all_ids)
+
+    # Quote fallback for IDs where invoice returned null
+    null_ids = [iid for iid, v in imprint_map.items() if v is None]
+    if null_ids:
+        qt_map = _fetch_imprints_quote_batch(null_ids)
+        imprint_map.update(qt_map)
+
+    # Qty fallback batch for orders where Step 1 totalQuantity=0
+    zero_qty_ids = [
+        n["id"] for n in nodes
+        if n.get("id") and int(n.get("totalQuantity") or 0) == 0
+    ]
+    qty_map = _fetch_qty_batch(zero_qty_ids) if zero_qty_ids else {}
 
     today_str = now.strftime("%Y-%m-%d")
     lines = [
@@ -669,8 +732,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         # Header line
         lines.append(f"#{inv.get('visualId')} | {contact} | {inv.get('nickname', '')}")
 
-        # Fetch imprint data (imprints only — no lineItems nesting)
-        imprint_nodes = _fetch_imprints_for_order(internal_id) if internal_id else None
+        imprint_nodes = imprint_map.get(internal_id) if internal_id else None
         if imprint_nodes is None:
             lines.append(
                 f"  Status: {status} | Prod: {prod_dt} | Due: {due_dt} | "
@@ -679,11 +741,9 @@ def get_production_schedule(days_ahead: int = 7) -> str:
             lines.append("")
             continue
 
-        # If Step 1 totalQuantity is 0, fall back to summing line item sizes.
-        # This handles EMB pre-production and some contract orders where
-        # totalQuantity isn't populated until later in the workflow.
+        # If Step 1 totalQuantity is 0, use the qty batch fallback.
         if total_qty == 0 and internal_id:
-            total_qty = _fetch_qty_from_line_items(internal_id)
+            total_qty = qty_map.get(internal_id, 0)
 
         if not imprint_nodes:
             # Order is in schedule but has no imprints set in Printavo

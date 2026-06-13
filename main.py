@@ -1385,13 +1385,13 @@ def upload_production_file(visual_id: str, file_path: str) -> str:
         return "file_path must be an https:// URL. Local paths are not supported on the remote server."
 
     mutation = """
-    mutation($orderId: ID!, $url: String!) {
-        productionFileCreate(orderId: $orderId, input: { publicFileUrl: $url }) {
+    mutation($parentId: ID!, $url: String!) {
+        productionFileCreate(parentId: $parentId, publicFileUrl: $url) {
             id name
         }
     }
     """
-    result = query_printavo(mutation, {"orderId": internal_id, "url": file_path})
+    result = query_printavo(mutation, {"parentId": internal_id, "url": file_path})
     if "error" in result:
         return f"API Error: {result['error']}"
 
@@ -1443,7 +1443,7 @@ def attach_mockup_to_order(visual_id: str, file_path: str) -> str:
 
     mutation = """
     mutation($lineItemId: ID!, $url: String!) {
-        lineItemMockupCreate(lineItemId: $lineItemId, input: { publicFileUrl: $url }) {
+        lineItemMockupCreate(lineItemId: $lineItemId, publicImageUrl: $url) {
             id fullImageUrl
         }
     }

@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 mcp = FastMCP("Printavo Assistant")
 
@@ -15,9 +16,7 @@ TOKEN            = os.environ.get("PRINTAVO_TOKEN", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 API_URL          = "https://www.printavo.com/api/v2"
 
-
 # ── CORE HELPER ───────────────────────────────────────────────────────────────
-
 def query_printavo(query: str, variables: dict = None, allow_partial: bool = False):
     payload = {"query": query}
     if variables:
@@ -34,6 +33,102 @@ def query_printavo(query: str, variables: dict = None, allow_partial: bool = Fal
     if has_errors and (not allow_partial or not has_data):
         return {"error": data["errors"]}
     return data.get("data", {})
+
+
+# ── DECORATION TYPE HELPERS ───────────────────────────────────────────────────
+
+# Matrix name → decoration type (lowercase key matching)
+_MATRIX_TYPE_MAP = {
+    "contract sp":       "Screen Print",
+    "direct 2024":       "Screen Print",
+    "freshprints":       "Screen Print",
+    "wholesale direct":  "Screen Print",
+    "contract emb":      "Embroidery",
+    "embroidery 2025":   "Embroidery",
+    "transfers":         "DTF",
+}
+
+def _decoration_type(imprint_node: dict) -> str:
+    """Determine decoration type from an imprint node."""
+    tow = (imprint_node.get("typeOfWork") or {}).get("name", "")
+    if tow:
+        t = tow.lower()
+        if "emb" in t:
+            return "Embroidery"
+        if "dtf" in t or "transfer" in t:
+            return "DTF"
+        return "Screen Print"
+    matrix_name = (
+        (imprint_node.get("pricingMatrixColumn") or {})
+        .get("matrix", {})
+        .get("name", "")
+        .lower()
+    )
+    for key, deco in _MATRIX_TYPE_MAP.items():
+        if key in matrix_name:
+            return deco
+    return "Screen Print"  # safe default
+
+
+def _color_count(imprint_node: dict) -> int:
+    """Extract screen/color count from pricingMatrixColumn.columnName."""
+    col_name = (imprint_node.get("pricingMatrixColumn") or {}).get("columnName", "")
+    m = re.search(r'(\d+)\s*[Cc]olor', col_name)
+    return int(m.group(1)) if m else 0
+
+
+def _fetch_imprints_for_order(internal_id: str) -> list:
+    """
+    Fetch imprint nodes for a single order by internal ID.
+    Returns a list of imprint dicts with keys: type, colors, col_name.
+    Returns None on API error.
+
+    Uses invoice(id) — a single-object query — which reliably traverses
+    lineItemGroups.nodes without hitting complexity limits.
+    """
+    q = """
+    query($id: ID!) {
+        invoice(id: $id) {
+            totalQuantity
+            lineItemGroups {
+                nodes {
+                    imprints {
+                        nodes {
+                            typeOfWork { name }
+                            pricingMatrixColumn { columnName matrix { name } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+    result = query_printavo(q, {"id": internal_id})
+    if "error" in result:
+        return None
+    inv = result.get("invoice") or {}
+    groups = inv.get("lineItemGroups", {}).get("nodes", [])
+    imprints = []
+    for g in groups:
+        for imp in g.get("imprints", {}).get("nodes", []):
+            imprints.append({
+                "type":     _decoration_type(imp),
+                "colors":   _color_count(imp),
+                "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
+            })
+    # Also capture totalQuantity from this fetch (more reliable than list query)
+    return imprints, int(inv.get("totalQuantity") or 0)
+
+
+def _format_est_time(total_min: int) -> str:
+    if total_min <= 0:
+        return "?"
+    h, m = divmod(total_min, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
 
 
 # ── EXISTING TOOLS ────────────────────────────────────────────────────────────
@@ -60,11 +155,9 @@ def get_recent_orders(limit: int = 10) -> str:
     result = query_printavo(q, {"first": limit})
     if "error" in result:
         return f"Error: {result['error']}"
-
     nodes = result.get("invoices", {}).get("nodes", [])
     if not nodes:
         return "No recent orders found."
-
     lines = [f"RECENT ORDERS (last {len(nodes)}):"]
     for inv in nodes:
         status = (inv.get("status") or {}).get("name", "?")
@@ -103,11 +196,9 @@ def search_orders(query: str, limit: int = 10) -> str:
     result = query_printavo(q, {"q": query, "first": limit})
     if "error" in result:
         return f"Error: {result['error']}"
-
     nodes = result.get("invoices", {}).get("nodes", [])
     if not nodes:
         return f"No orders found matching '{query}'."
-
     lines = [f"SEARCH RESULTS for '{query}' ({len(nodes)} found):"]
     for inv in nodes:
         status = (inv.get("status") or {}).get("name", "?")
@@ -166,18 +257,15 @@ def get_order_details(visual_id: str) -> str:
     result = query_printavo(q, {"q": str(visual_id)}, allow_partial=True)
     if "error" in result:
         return f"Error: {result['error']}"
-
     invoice_nodes = result.get("invoices", {}).get("nodes", [])
     quote_nodes   = result.get("quotes",   {}).get("nodes", [])
     all_nodes = invoice_nodes + quote_nodes
     matching = [n for n in all_nodes if str(n.get("visualId")) == str(visual_id)]
     if not matching:
         return f"Order #{visual_id} not found."
-
     inv = matching[0]
     contact = inv.get("contact") or {}
     status  = (inv.get("status") or {}).get("name", "?")
-
     lines = [
         f"ORDER #{inv.get('visualId')} | {inv.get('nickname', '')}",
         f"  Customer:       {contact.get('fullName', '?')}",
@@ -189,7 +277,6 @@ def get_order_details(visual_id: str) -> str:
         f"  Invoice Date:   {inv.get('invoiceAt', '')}",
         f"  Internal ID:    {inv.get('id')}",
     ]
-
     prod_files = (inv.get("productionFiles") or {}).get("nodes", [])
     if prod_files:
         lines.append(f"\n  Production Files ({len(prod_files)}):")
@@ -197,9 +284,7 @@ def get_order_details(visual_id: str) -> str:
             lines.append(f"    - {pf.get('name', 'unnamed')} (ID: {pf.get('id')})")
     else:
         lines.append("\n  Production Files: none")
-
     lines.append("\n  (Use get_invoice_structure for line items and imprints)")
-
     return "\n".join(lines)
 
 
@@ -216,11 +301,9 @@ def get_statuses() -> str:
     result = query_printavo(q)
     if "error" in result:
         return f"Error: {result['error']}"
-
     nodes = result.get("statuses", {}).get("nodes", [])
     if not nodes:
         return "No statuses found."
-
     lines = ["AVAILABLE STATUSES:"]
     for s in nodes:
         lines.append(f"  ID: {s.get('id')} | Name: {s.get('name')} | Color: {s.get('color','')}")
@@ -248,11 +331,9 @@ def get_outstanding_balances(limit: int = 20) -> str:
     result = query_printavo(q, {"first": limit})
     if "error" in result:
         return f"Error: {result['error']}"
-
     nodes = result.get("invoices", {}).get("nodes", [])
     if not nodes:
         return "No outstanding balances found."
-
     lines = [f"OUTSTANDING BALANCES ({len(nodes)} orders):"]
     total_outstanding = 0.0
     for inv in nodes:
@@ -278,7 +359,6 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     order_name: nickname/label for the order
     due_date: ISO date string e.g. '2026-06-19'
     """
-    # Find customer's contact ID
     cq = """
     query($email: String) {
         contacts(first: 5, query: $email) {
@@ -289,12 +369,10 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     cresult = query_printavo(cq, {"email": customer_email})
     if "error" in cresult:
         return f"Error finding customer: {cresult['error']}"
-
     contacts = cresult.get("contacts", {}).get("nodes", [])
     if not contacts:
         return f"No customer found with email '{customer_email}'."
     contact_id = contacts[0]["id"]
-
     mutation = """
     mutation($contactId: ID!, $nickname: String, $dueAt: ISO8601DateTime) {
         quoteCreate(input: { contactId: $contactId, nickname: $nickname, dueAt: $dueAt }) {
@@ -310,12 +388,10 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
     })
     if "error" in result:
         return f"Error: {result['error']}"
-
     qc = result.get("quoteCreate", {})
     errors = qc.get("errors", [])
     if errors:
         return f"Printavo error: {[e.get('message') for e in errors]}"
-
     quote = qc.get("quote", {})
     return (
         f"Quote created!\n"
@@ -330,33 +406,20 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
 def inspect_fields(type_name: str) -> str:
     """
     Inspect the GraphQL fields available on a Printavo type.
-    Useful for discovering what fields can be queried or mutated.
     type_name: GraphQL type name (e.g. 'Invoice', 'LineItem', 'Imprint', 'Contact')
     """
     q = """
     query($name: String!) {
         __type(name: $name) {
-            name
-            kind
+            name kind
             fields {
                 name
-                type {
-                    name
-                    kind
-                    ofType { name kind }
-                }
-                args {
-                    name
-                    type { name kind ofType { name kind } }
-                }
+                type { name kind ofType { name kind } }
+                args { name type { name kind ofType { name kind } } }
             }
             inputFields {
                 name
-                type {
-                    name
-                    kind
-                    ofType { name kind }
-                }
+                type { name kind ofType { name kind } }
             }
         }
     }
@@ -364,13 +427,10 @@ def inspect_fields(type_name: str) -> str:
     result = query_printavo(q, {"name": type_name})
     if "error" in result:
         return f"Error: {result['error']}"
-
     t = result.get("__type")
     if not t:
         return f"Type '{type_name}' not found. Try: Invoice, LineItem, LineItemGroup, Imprint, Contact, Status, PricingMatrix, PricingMatrixColumn"
-
     lines = [f"TYPE: {t.get('name')} ({t.get('kind')})"]
-
     fields = t.get("fields") or []
     if fields:
         lines.append("\nFIELDS:")
@@ -378,7 +438,6 @@ def inspect_fields(type_name: str) -> str:
             ftype = f.get("type") or {}
             tname = ftype.get("name") or ((ftype.get("ofType") or {}).get("name"))
             lines.append(f"  {f.get('name')}: {tname or ftype.get('kind','?')}")
-
     input_fields = t.get("inputFields") or []
     if input_fields:
         lines.append("\nINPUT FIELDS:")
@@ -386,7 +445,6 @@ def inspect_fields(type_name: str) -> str:
             ftype = f.get("type") or {}
             tname = ftype.get("name") or ((ftype.get("ofType") or {}).get("name"))
             lines.append(f"  {f.get('name')}: {tname or ftype.get('kind','?')}")
-
     return "\n".join(lines)
 
 
@@ -400,7 +458,6 @@ def diagnose_order(visual_id: str) -> str:
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return f"Error: {err}"
-
     frag = """
                 id visualId nickname total customerDueAt startAt invoiceAt visualPoNumber
                 status { name }
@@ -432,25 +489,15 @@ def diagnose_order(visual_id: str) -> str:
     result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"Error: {result['error']}"
-
     inv = result.get(order_type)
     if not inv:
         return f"Order #{visual_id} not found."
-
     issues = []
-
-    # Check header fields
-    if not inv.get("nickname"):
-        issues.append("⚠ MISSING: nickname")
-    if not inv.get("visualPoNumber"):
-        issues.append("⚠ MISSING: PO number")
-    if not inv.get("customerDueAt"):
-        issues.append("⚠ MISSING: customer due date")
-    if not inv.get("startAt"):
-        issues.append("⚠ MISSING: production date")
-    if not inv.get("invoiceAt"):
-        issues.append("⚠ MISSING: invoice date")
-
+    if not inv.get("nickname"):      issues.append("⚠ MISSING: nickname")
+    if not inv.get("visualPoNumber"): issues.append("⚠ MISSING: PO number")
+    if not inv.get("customerDueAt"): issues.append("⚠ MISSING: customer due date")
+    if not inv.get("startAt"):       issues.append("⚠ MISSING: production date")
+    if not inv.get("invoiceAt"):     issues.append("⚠ MISSING: invoice date")
     groups = (inv.get("lineItemGroups") or {}).get("nodes", [])
     if not groups:
         issues.append("⚠ MISSING: no line item groups")
@@ -465,7 +512,6 @@ def diagnose_order(visual_id: str) -> str:
                     issues.append(f"⚠ Line item {item.get('id')}: no sizes/qty")
                 if not item.get("price") or float(item.get("price") or 0) == 0:
                     issues.append(f"⚠ Line item {item.get('id')}: $0 price (pricing not set?)")
-
             imprints = (g.get("imprints") or {}).get("nodes", [])
             if not imprints:
                 issues.append(f"⚠ Group {gi}: no imprints")
@@ -473,12 +519,9 @@ def diagnose_order(visual_id: str) -> str:
                 col = (imp.get("pricingMatrixColumn") or {})
                 if not col.get("id"):
                     issues.append(f"⚠ Imprint {imp.get('id')}: no pricing matrix column set")
-
-    # Summarize
     contact = inv.get("contact") or {}
     status  = (inv.get("status") or {}).get("name", "?")
     prod_files = (inv.get("productionFiles") or {}).get("nodes", [])
-
     lines = [
         f"DIAGNOSTIC — Order #{inv.get('visualId')} | {inv.get('nickname','')}",
         f"  Status: {status} | Total: ${inv.get('total',0)}",
@@ -496,26 +539,37 @@ def diagnose_order(visual_id: str) -> str:
             lines.append(f"  {issue}")
     else:
         lines.append("\n✓ No issues found — order looks complete.")
-
     return "\n".join(lines)
 
+
+# ── FIXED: get_production_schedule ────────────────────────────────────────────
+# BUG (original): the query never fetched lineItemGroups/imprints at all,
+# so Items and Imprints were always 0 for every order.
+#
+# FIX: two-step approach
+#   Step 1 — get order list with minimal fields (avoids complexity limit)
+#   Step 2 — per order, call invoice(id) → lineItemGroups → imprints
+#             invoice(id) is a single-object query and reliably traverses
+#             nested .nodes without hitting the 25k complexity ceiling.
 
 @mcp.tool()
 def get_production_schedule(days_ahead: int = 7) -> str:
     """
-    Get the production schedule — orders due in the next N days.
+    Get the production schedule — orders due in the next N days, with full
+    imprint, screen count, and estimated production time per order.
     days_ahead: how many days ahead to look (default 7)
     """
-    now       = datetime.now(timezone.utc)
-    end_date  = now + timedelta(days=days_ahead)
+    now      = datetime.now(timezone.utc)
+    end_date = now + timedelta(days=days_ahead)
     start_str = now.strftime("%Y-%m-%d")
     end_str   = end_date.strftime("%Y-%m-%d")
 
-    q = """
+    # ── Step 1: lightweight list query (no nested collections) ──────────────
+    q_list = """
     query($q: String, $first: Int) {
         invoices(first: $first, query: $q) {
             nodes {
-                visualId nickname total
+                id visualId nickname total
                 dueAt startAt
                 status { name }
                 contact { fullName }
@@ -524,30 +578,101 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     }
     """
     search_q = f"production_at >= {start_str} production_at <= {end_str}"
-    result   = query_printavo(q, {"q": search_q, "first": 20})
+    result = query_printavo(q_list, {"q": search_q, "first": 25})
     if "error" in result:
         return f"Error: {result['error']}"
-
     nodes = result.get("invoices", {}).get("nodes", [])
     if not nodes:
         return f"No orders scheduled for production in the next {days_ahead} days."
 
-    lines = [f"PRODUCTION SCHEDULE — Next {days_ahead} days ({start_str} to {end_str}):"]
-    lines.append(f"Total orders: {len(nodes)}\n")
+    # ── Step 2: per-order imprint fetch via invoice(id) ─────────────────────
+    # Uses _fetch_imprints_for_order() which queries invoice(id) — a single-
+    # object query — so it reliably gets lineItemGroups.nodes even for orders
+    # in ART APPROVAL SENT, PRINT READY, and other non-contract statuses.
+
+    today_str = now.strftime("%Y-%m-%d")
+    lines = [
+        f"PRODUCTION SCHEDULE — {start_str} to {end_str}",
+        f"  {len(nodes)} orders | Generated {today_str}\n",
+    ]
 
     for inv in nodes:
-        contact  = inv.get("contact") or {}
-        status   = (inv.get("status") or {}).get("name", "?")
-        prod_dt  = (inv.get("startAt") or "")[:10]
-        due_dt   = (inv.get("dueAt") or "")[:10]
+        internal_id = inv.get("id")
+        status  = (inv.get("status") or {}).get("name", "?")
+        contact = (inv.get("contact") or {}).get("fullName", "Unknown")
+        prod_dt = (inv.get("startAt") or "")[:10]
+        due_dt  = (inv.get("dueAt") or "")[:10]
 
+        # Header line
+        lines.append(f"#{inv.get('visualId')} | {contact} | {inv.get('nickname', '')}")
+
+        # Fetch imprint data
+        fetch_result = _fetch_imprints_for_order(internal_id) if internal_id else None
+        if fetch_result is None:
+            lines.append(
+                f"  Status: {status} | Prod: {prod_dt} | Due: {due_dt} | "
+                f"⚠️ could not fetch imprint data"
+            )
+            lines.append("")
+            continue
+
+        imprint_nodes, total_qty = fetch_result
+
+        if not imprint_nodes:
+            # Order is in schedule but has no imprints set in Printavo
+            lines.append(
+                f"  Status: {status} | Items: {total_qty} | "
+                f"Total Imprints: 0 | Screens: ⚠️ not entered | "
+                f"Est. Time: ⚠️ unknown"
+            )
+            if total_qty > 0:
+                lines.append(f"  ⚠️ {total_qty} pcs — no imprints entered")
+            lines.append("")
+            continue
+
+        # ── Calculate totals ─────────────────────────────────────────────────
+        num_locations  = len(imprint_nodes)
+        total_imprints = total_qty * num_locations
+        total_screens  = sum(i["colors"] for i in imprint_nodes)
+
+        # Group by decoration type for per-type breakdown
+        type_groups: dict = defaultdict(lambda: {"locations": 0, "screens": 0})
+        for imp in imprint_nodes:
+            tg = type_groups[imp["type"]]
+            tg["locations"] += 1
+            tg["screens"]   += imp["colors"]
+
+        # Estimate time (SP only; EMB/DTF get flat 15 min/location rough est.)
+        sp_qty    = total_qty * type_groups.get("Screen Print", {}).get("locations", 0)
+        sp_colors = type_groups.get("Screen Print", {}).get("screens", 0)
+        sp_run_min = int((sp_qty * (sp_colors or 1)) / 350 * 60) if sp_qty else 0
+        emb_dtf_min = (
+            type_groups.get("Embroidery", {}).get("locations", 0) +
+            type_groups.get("DTF", {}).get("locations", 0)
+        ) * 15
+        setup_min  = num_locations * 30
+        total_min  = setup_min + sp_run_min + emb_dtf_min
+        est_time   = _format_est_time(total_min)
+
+        screens_str = str(total_screens) if total_screens > 0 else "N/A"
         lines.append(
-            f"#{inv.get('visualId')} | {inv.get('nickname','')} | "
-            f"{contact.get('fullName','?')} | Status: {status} | "
-            f"Prod: {prod_dt} | Due: {due_dt}"
+            f"  Status: {status} | Items: {total_qty} | "
+            f"Total Imprints: {total_imprints} | Screens: {screens_str} | "
+            f"Est. Time: {est_time}"
         )
 
-        lines.append("")
+        # Per-decoration-type breakdown
+        for deco_type, tg in type_groups.items():
+            locs        = tg["locations"]
+            type_total  = total_qty * locs
+            scr         = tg["screens"]
+            detail = f"  {deco_type} | {total_qty} pcs × {locs} imprint(s) = {type_total} imprints"
+            if scr > 0:
+                detail += f" | {scr} screens"
+            detail += f" | {est_time}"
+            lines.append(detail)
+
+        lines.append("")  # blank line between orders
 
     return "\n".join(lines)
 
@@ -557,9 +682,7 @@ def send_schedule_to_slack(days_ahead: int = 7) -> str:
     """Post the production schedule to the configured Slack channel."""
     if not SLACK_WEBHOOK_URL:
         return "Error: SLACK_WEBHOOK_URL environment variable not set."
-
     schedule_text = get_production_schedule(days_ahead)
-
     payload = {
         "text": f"*Printavo Production Schedule*\n```{schedule_text}```"
     }
@@ -569,27 +692,36 @@ def send_schedule_to_slack(days_ahead: int = 7) -> str:
     return f"Slack error: HTTP {response.status_code} — {response.text}"
 
 
+# ── FIXED: get_production_time_estimate ───────────────────────────────────────
+# BUG (original): used invoices(query) list query with nested lineItemGroups.
+# List queries with deeply nested nodes hit the 25k complexity ceiling for
+# some orders (especially those not yet in CONTRACT status), returning
+# empty lineItemGroups and therefore 0 imprints.
+#
+# FIX: use _find_order() to get the internal ID, then invoice(id) for
+# the nested data — same reliable single-object pattern used everywhere else.
+
 @mcp.tool()
 def get_production_time_estimate(visual_id: str) -> str:
     """
     Estimate production time for an order based on quantity, imprint count, and decoration type.
     visual_id: order number shown in Printavo UI
     """
-    q = """
-    query($q: String) {
-        invoices(first: 5, query: $q) {
-            nodes {
-                visualId nickname
-                lineItemGroups {
-                    nodes {
-                        lineItems {
-                            nodes { sizes { size count } }
-                        }
-                        imprints {
-                            nodes {
-                                typeOfWork { name }
-                                pricingMatrixColumn { columnName }
-                            }
+    internal_id, _order_type, err = _find_order(visual_id)
+    if err:
+        return f"Error finding order: {err}"
+
+    # Fetch basic info
+    q_basic = """
+    query($id: ID!) {
+        invoice(id: $id) {
+            visualId nickname totalQuantity
+            lineItemGroups {
+                nodes {
+                    imprints {
+                        nodes {
+                            typeOfWork { name }
+                            pricingMatrixColumn { columnName matrix { name } }
                         }
                     }
                 }
@@ -597,56 +729,42 @@ def get_production_time_estimate(visual_id: str) -> str:
         }
     }
     """
-    result = query_printavo(q, {"q": str(visual_id)})
+    result = query_printavo(q_basic, {"id": internal_id})
     if "error" in result:
         return f"Error: {result['error']}"
 
-    nodes = result.get("invoices", {}).get("nodes", [])
-    matching = [n for n in nodes if str(n.get("visualId")) == str(visual_id)]
-    if not matching:
+    inv = result.get("invoice")
+    if not inv:
         return f"Order #{visual_id} not found."
 
-    inv = matching[0]
-    groups = (inv.get("lineItemGroups") or {}).get("nodes", [])
-
-    total_qty    = 0
-    total_prints = 0
+    total_qty = int(inv.get("totalQuantity") or 0)
+    groups = inv.get("lineItemGroups", {}).get("nodes", [])
     imprint_info = []
-
     for g in groups:
-        items = (g.get("lineItems") or {}).get("nodes", [])
-        for item in items:
-            total_qty += sum((s.get("count") or 0) for s in (item.get("sizes") or []))
+        for imp in g.get("imprints", {}).get("nodes", []):
+            imprint_info.append({
+                "type":   _decoration_type(imp),
+                "colors": _color_count(imp),
+            })
 
-        imprints = (g.get("imprints") or {}).get("nodes", [])
-        total_prints += len(imprints)
-        for imp in imprints:
-            tow = (imp.get("typeOfWork") or {}).get("name", "?")
-            col = (imp.get("pricingMatrixColumn") or {}).get("columnName", "?")
-            # Extract color count from column name like "Contract SP 2025 (NEW) • 3 Color"
-            color_match = re.search(r'(\d+)\s+[Cc]olor', col)
-            num_colors = int(color_match.group(1)) if color_match else 1
-            imprint_info.append({"type": tow, "colors": num_colors})
+    total_prints = len(imprint_info)
 
-    # Rough estimates: ~350 pcs/hour per color per screen print location
-    setup_time_hrs = total_prints * 0.5  # 30 min setup per screen
     if total_qty > 0 and imprint_info:
-        avg_colors = sum(i["colors"] for i in imprint_info) / len(imprint_info)
-        run_time_hrs = (total_qty * avg_colors) / 350
+        sp_items = [(i["colors"] or 1) for i in imprint_info if i["type"] == "Screen Print"]
+        sp_run_min  = int(sum(total_qty * c for c in sp_items) / 350 * 60) if sp_items else 0
+        emb_dtf_min = sum(15 for i in imprint_info if i["type"] in ("Embroidery", "DTF"))
+        setup_min   = total_prints * 30
+        total_min   = setup_min + sp_run_min + emb_dtf_min
     else:
-        run_time_hrs = 0
-
-    total_hrs = setup_time_hrs + run_time_hrs
+        total_min = 0
 
     lines = [
         f"PRODUCTION TIME ESTIMATE — Order #{inv.get('visualId')} | {inv.get('nickname','')}",
         f"  Total Quantity:  {total_qty} pcs",
         f"  Print Locations: {total_prints}",
         f"  Imprint Details: {imprint_info}",
-        f"  Setup Time:      {setup_time_hrs:.1f} hrs",
-        f"  Run Time:        {run_time_hrs:.1f} hrs",
-        f"  TOTAL ESTIMATE:  {total_hrs:.1f} hrs ({math.ceil(total_hrs * 60)} min)",
-        f"  Note: Estimates based on ~350 impressions/hr. Actual times vary.",
+        f"  TOTAL ESTIMATE:  {_format_est_time(total_min)} ({total_min} min)",
+        f"  Note: Estimates based on ~350 SP impressions/hr. Actual times vary.",
     ]
     return "\n".join(lines)
 
@@ -654,15 +772,12 @@ def get_production_time_estimate(visual_id: str) -> str:
 # ── PRIVATE HELPERS (not tools) ───────────────────────────────────────────────
 
 def _find_invoice_internal_id(visual_id: str):
-    """Returns (internal_id, error_string). One will be None.
-    Searches both invoices and quotes (duplicates create quotes)."""
     internal_id, _order_type, err = _find_order(visual_id)
     return internal_id, err
 
 
 def _find_order(visual_id: str):
-    """Returns (internal_id, order_type, error_string).
-    order_type is 'invoice' or 'quote'. Searches both types."""
+    """Returns (internal_id, order_type, error_string). Searches invoices and quotes."""
     q = """
     query($q: String) {
         invoices(first: 5, query: $q) {
@@ -688,7 +803,6 @@ def _find_order(visual_id: str):
 
 
 def _get_status_id_by_name(status_name: str):
-    """Returns (status_id, error_string). One will be None."""
     q = """query { statuses(first: 50) { nodes { id name } } }"""
     result = query_printavo(q)
     if "error" in result:
@@ -702,17 +816,12 @@ def _get_status_id_by_name(status_name: str):
 
 
 def _find_pricing_matrix_column_id(color_count: int):
-    """
-    Find the pricing matrix column ID for 'Contract SP 2025 (NEW)' + N colors.
-    Returns (column_id, error_string). One will be None.
-    """
     q = """
     query {
         account {
             pricingMatrices(first: 50) {
                 nodes {
-                    id
-                    name
+                    id name
                     columns { id columnName }
                 }
             }
@@ -722,7 +831,6 @@ def _find_pricing_matrix_column_id(color_count: int):
     result = query_printavo(q)
     if "error" in result:
         return None, f"API Error: {result['error']}"
-
     matrices = result.get("account", {}).get("pricingMatrices", {}).get("nodes", [])
     target = None
     for m in matrices:
@@ -732,19 +840,15 @@ def _find_pricing_matrix_column_id(color_count: int):
     if not target:
         names = [m.get("name") for m in matrices]
         return None, f"'Contract SP 2025 (NEW)' matrix not found. Available: {names}"
-
     columns = target.get("columns", [])
     for col in columns:
-        col_name = col.get("columnName", "")
-        if re.search(rf'\b{color_count}\s+[Cc]olor', col_name):
+        if re.search(rf'\b{color_count}\s+[Cc]olor', col.get("columnName", "")):
             return col["id"], None
-
     col_names = [c.get("columnName") for c in columns]
     return None, f"No {color_count}-color column found in matrix '{target.get('name')}'. Columns: {col_names}"
 
 
 def _upload_file_rest(endpoint: str, file_path: str, extra_data: dict) -> dict:
-    """Upload a file via REST multipart POST to Printavo API."""
     if not os.path.exists(file_path):
         return {"error": f"File not found: {file_path}"}
     with open(file_path, "rb") as f:
@@ -765,7 +869,6 @@ def _upload_file_rest(endpoint: str, file_path: str, extra_data: dict) -> dict:
 
 
 def _normalize_size_key(size_str: str) -> str:
-    """Convert common size abbreviations to Printavo's internal format."""
     size_map = {
         "XS": "size_xs", "S": "size_s", "M": "size_m", "L": "size_l",
         "XL": "size_xl", "2XL": "size_2xl", "XXL": "size_2xl",
@@ -783,30 +886,24 @@ def _normalize_size_key(size_str: str) -> str:
 def duplicate_invoice(source_visual_id: str) -> str:
     """
     Duplicate a Printavo invoice (used to copy template order 6817 for each UGP order).
-    Returns the new invoice's visual ID and internal ID.
     source_visual_id: the order number to duplicate (e.g. '6817')
     """
     internal_id, err = _find_invoice_internal_id(source_visual_id)
     if err:
         return err
-
     mutation = """
     mutation($id: ID!) {
         invoiceDuplicate(id: $id) {
-            id
-            visualId
-            nickname
+            id visualId nickname
         }
     }
     """
     result = query_printavo(mutation, {"id": internal_id})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     invoice = result.get("invoiceDuplicate", {})
     if not invoice:
         return f"Unexpected response — 'invoiceDuplicate' key missing. Raw: {result}"
-
     return (
         f"Invoice duplicated!\n"
         f"New Order # (visual): {invoice.get('visualId')}\n"
@@ -831,76 +928,49 @@ def update_invoice_fields(
     visual_id: order number shown in Printavo UI (e.g. '6999')
     nickname: e.g. 'Minot AF Ball Tees - 1151454'
     po_number: UGP order number as PO (e.g. '1151454')
-    production_date: YYYY-MM-DD  (2 business days before due date)
-    customer_due_date: YYYY-MM-DD  (carrier date from UGP)
-    invoice_date: YYYY-MM-DD  (same as production_date)
+    production_date: YYYY-MM-DD
+    customer_due_date: YYYY-MM-DD
+    invoice_date: YYYY-MM-DD
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
-
     update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
     if order_type == "quote":
-        # invoiceAt omitted: Printavo validates invoiceAt + payment_terms <= customerDueAt,
-        # which always fails for short-turn UGP orders (template has Net 30 terms).
         mutation = f"""
-        mutation(
-            $id: ID!,
-            $nickname: String,
-            $visualPoNumber: String,
-            $dueAt: ISO8601DateTime,
-            $customerDueAt: ISO8601Date
-        ) {{
+        mutation($id: ID!, $nickname: String, $visualPoNumber: String, $dueAt: ISO8601DateTime, $customerDueAt: ISO8601Date) {{
             {update_field}(id: $id, input: {{
-                nickname: $nickname,
-                visualPoNumber: $visualPoNumber,
-                dueAt: $dueAt,
-                customerDueAt: $customerDueAt
+                nickname: $nickname, visualPoNumber: $visualPoNumber,
+                dueAt: $dueAt, customerDueAt: $customerDueAt
             }}) {{
                 id visualId nickname visualPoNumber customerDueAt dueAt startAt invoiceAt
             }}
         }}
         """
         variables = {
-            "id":             internal_id,
-            "nickname":       nickname,
-            "visualPoNumber": po_number,
-            "dueAt":          f"{production_date}T12:00:00Z",
-            "customerDueAt":  customer_due_date,
+            "id": internal_id, "nickname": nickname,
+            "visualPoNumber": po_number, "dueAt": f"{production_date}T12:00:00Z",
+            "customerDueAt": customer_due_date,
         }
     else:
         mutation = f"""
-        mutation(
-            $id: ID!,
-            $nickname: String,
-            $visualPoNumber: String,
-            $startAt: ISO8601DateTime,
-            $customerDueAt: ISO8601Date,
-            $invoiceAt: ISO8601Date
-        ) {{
+        mutation($id: ID!, $nickname: String, $visualPoNumber: String, $startAt: ISO8601DateTime, $customerDueAt: ISO8601Date, $invoiceAt: ISO8601Date) {{
             {update_field}(id: $id, input: {{
-                nickname: $nickname,
-                visualPoNumber: $visualPoNumber,
-                startAt: $startAt,
-                customerDueAt: $customerDueAt,
-                invoiceAt: $invoiceAt
+                nickname: $nickname, visualPoNumber: $visualPoNumber,
+                startAt: $startAt, customerDueAt: $customerDueAt, invoiceAt: $invoiceAt
             }}) {{
                 id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
             }}
         }}
         """
         variables = {
-            "id":             internal_id,
-            "nickname":       nickname,
-            "visualPoNumber": po_number,
-            "startAt":        f"{production_date}T12:00:00Z",
-            "customerDueAt":  customer_due_date,
-            "invoiceAt":      invoice_date,
+            "id": internal_id, "nickname": nickname, "visualPoNumber": po_number,
+            "startAt": f"{production_date}T12:00:00Z", "customerDueAt": customer_due_date,
+            "invoiceAt": invoice_date,
         }
     result = query_printavo(mutation, variables)
     if "error" in result:
         return f"API Error: {result['error']}"
-
     inv = result.get(update_field, {})
     prod_date = (inv.get('dueAt') or inv.get('startAt') or '')[:10]
     return (
@@ -917,17 +987,13 @@ def update_invoice_fields(
 def get_invoice_structure(visual_id: str) -> str:
     """
     Get all line item group IDs, line item IDs, and imprint IDs for an invoice.
-    Call this after duplicating to get the IDs needed for update_line_item,
-    set_imprint_pricing, attach_mockup_to_order, etc.
     visual_id: order number shown in Printavo UI
     """
     internal_id, err = _find_invoice_internal_id(visual_id)
     if err:
         return err
-
     fragment = """
-        visualId
-        nickname
+        visualId nickname
         productionFiles { nodes { id name } }
         lineItemGroups {
             nodes {
@@ -956,18 +1022,14 @@ def get_invoice_structure(visual_id: str) -> str:
     result = query_printavo(q, {"id": internal_id}, allow_partial=True)
     if "error" in result:
         return f"API Error: {result['error']}"
-
     inv = result.get("invoice") or result.get("quote") or {}
     if not inv:
         return f"Order #{visual_id} not found via direct ID lookup."
-
     lines = [f"STRUCTURE — Order #{inv.get('visualId')} | {inv.get('nickname', '')}"]
-
     prod_files = (inv.get("productionFiles") or {}).get("nodes", [])
     lines.append(f"\nProduction Files ({len(prod_files)}):")
     for pf in prod_files:
         lines.append(f"  ID: {pf.get('id')} | {pf.get('name', 'unnamed')}")
-
     groups = (inv.get("lineItemGroups") or {}).get("nodes", [])
     lines.append(f"\nLine Item Groups ({len(groups)}):")
     for gi, g in enumerate(groups, 1):
@@ -993,7 +1055,6 @@ def get_invoice_structure(visual_id: str) -> str:
                 f"    Imprint {ii} | ID: {imp.get('id')} | "
                 f"Column: {col.get('columnName', 'none')} (Col ID: {col.get('id', 'none')})"
             )
-
     return "\n".join(lines)
 
 
@@ -1001,15 +1062,12 @@ def get_invoice_structure(visual_id: str) -> str:
 def delete_production_files(visual_id: str) -> str:
     """
     Delete ALL inherited files from a Printavo order after duplicating template 6817.
-    Removes: production files (EPS) AND line item mockups (spec sheet images).
     visual_id: order number shown in Printavo UI
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
-
-    # Query only the detected type to stay under 25k complexity limit
-    type_field = order_type  # 'invoice' or 'quote'
+    type_field = order_type
     q = f"""
     query($id: ID!) {{
         {type_field}(id: $id) {{
@@ -1021,46 +1079,32 @@ def delete_production_files(visual_id: str) -> str:
     result = query_printavo(q, {"id": internal_id}, allow_partial=True)
     if "error" in result:
         return f"API Error: {result['error']}"
-
     obj = result.get(type_field) or {}
-
-    # --- Delete production files ---
     files = obj.get("productionFiles", {}).get("nodes", [])
     del_pf_mutation = """mutation($id: ID!) { productionFileDelete(id: $id) { id } }"""
     deleted_files, failed_files = [], []
     for pf in files:
         dr = query_printavo(del_pf_mutation, {"id": pf["id"]})
-        if "error" in dr:
-            failed_files.append(pf.get("name", pf["id"]))
-        else:
-            deleted_files.append(pf.get("name", pf["id"]))
-
-    # --- Delete line item mockups ---
+        (failed_files if "error" in dr else deleted_files).append(pf.get("name", pf["id"]))
     mockups_to_delete = []
     for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
         for item in (g.get("lineItems") or {}).get("nodes", []):
             for m in (item.get("mockups") or {}).get("nodes", []):
                 mockups_to_delete.append(m["id"])
-
     del_mockup_mutation = """mutation($id: ID!) { mockupDelete(id: $id) { id } }"""
     deleted_mockups, failed_mockups = [], []
     for mid in mockups_to_delete:
         dr = query_printavo(del_mockup_mutation, {"id": mid})
-        if "error" in dr:
-            failed_mockups.append(mid)
-        else:
-            deleted_mockups.append(mid)
-
-    lines = []
-    lines.append(f"Order #{visual_id} — inherited files cleared:")
-    lines.append(f"  Production files: {len(deleted_files)}/{len(files)} deleted")
+        (failed_mockups if "error" in dr else deleted_mockups).append(mid)
+    lines = [
+        f"Order #{visual_id} — inherited files cleared:",
+        f"  Production files: {len(deleted_files)}/{len(files)} deleted",
+    ]
     for name in deleted_files:
         lines.append(f"    ✓ {name}")
     lines.append(f"  Line item mockups: {len(deleted_mockups)}/{len(mockups_to_delete)} deleted")
-    if failed_files:
-        lines.append(f"  FAILED files: {failed_files}")
-    if failed_mockups:
-        lines.append(f"  FAILED mockups: {failed_mockups}")
+    if failed_files:   lines.append(f"  FAILED files: {failed_files}")
+    if failed_mockups: lines.append(f"  FAILED mockups: {failed_mockups}")
     return "\n".join(lines)
 
 
@@ -1074,75 +1118,56 @@ def update_line_item(
 ) -> str:
     """
     Update a line item's item number, color, description, and size quantities.
-    Use get_invoice_structure to get the line_item_id first.
-
     line_item_id: internal GraphQL ID of the line item
-    color: garment color (e.g. 'Royal', 'Black', 'White')
-    description: multi-line. Line 1: garment description (e.g. '5000G - Gildan Heavy Cotton Basic T-Shirt')
-                 Line 2+: imprint abbreviations, one per line (e.g. '1C FF\\n1C FB')
-    sizes_json: JSON object e.g. '{"S": 12, "M": 12, "L": 12, "XL": 12, "2XL": 12}'
+    color: garment color
+    description: multi-line description
+    sizes_json: JSON object e.g. '{"S": 12, "M": 12}'
     item_number: always 'SCRN' for screen print orders (default)
     """
     try:
         sizes_dict = json.loads(sizes_json)
     except Exception as e:
-        return f"Invalid sizes_json — could not parse JSON: {e}\nExpected: '{{\"S\": 12, \"M\": 10}}'"
-
-    # Always send all standard sizes (zero out template residue for sizes not in this order)
+        return f"Invalid sizes_json: {e}"
     STANDARD_SIZES = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"]
     normalized_input = {k.strip().upper(): int(v) for k, v in sizes_dict.items()}
     full_sizes = {s: normalized_input.get(s, 0) for s in STANDARD_SIZES}
-    # Also include any non-standard sizes from the input
     for k, v in normalized_input.items():
         if k not in STANDARD_SIZES:
             full_sizes[k] = v
-
-    # Build inline size literals with unquoted enum values (GraphQL enum, not string)
     sizes_gql = ", ".join(
         f'{{size: {_normalize_size_key(k)}, count: {v}}}'
         for k, v in full_sizes.items()
     )
-
     mutation = f"""
     mutation($id: ID!, $itemNumber: String, $color: String, $description: String) {{
         lineItemUpdate(id: $id, input: {{
-            itemNumber: $itemNumber,
-            color: $color,
-            description: $description,
-            position: 1,
-            sizes: [{sizes_gql}]
+            itemNumber: $itemNumber, color: $color, description: $description,
+            position: 1, sizes: [{sizes_gql}]
         }}) {{
             id itemNumber description color
             sizes {{ size count }}
         }}
     }}
     """
-    variables = {
-        "id":          line_item_id,
-        "itemNumber":  item_number,
-        "color":       color,
-        "description": description,
-    }
-    result = query_printavo(mutation, variables)
+    result = query_printavo(mutation, {
+        "id": line_item_id, "itemNumber": item_number,
+        "color": color, "description": description,
+    })
     if "error" in result:
         return f"API Error: {result['error']}"
-
     item = result.get("lineItemUpdate", {})
     sizes_summary = ", ".join(
         f"{s.get('size')}:{s.get('count')}"
         for s in (item.get("sizes") or [])
         if (s.get("count") or 0) > 0
-    )
-    sizes_display = sizes_summary or ", ".join(
-        f"{k}:{v}" for k, v in sizes_dict.items() if int(v) > 0
-    )
+    ) or ", ".join(f"{k}:{v}" for k, v in sizes_dict.items() if int(v) > 0)
     return (
         f"Line item updated!\n"
         f"  ID: {item.get('id')}\n"
         f"  Item #: {item.get('itemNumber')}\n"
         f"  Color: {item.get('color')}\n"
         f"  Description: {(item.get('description') or '')[:100]}\n"
-        f"  Sizes: {sizes_display}"
+        f"  Sizes: {sizes_summary}"
     )
 
 
@@ -1150,11 +1175,8 @@ def update_line_item(
 def duplicate_line_item(line_item_id: str) -> str:
     """
     Duplicate a line item within its line item group.
-    Use for multi-product orders: duplicate the first item, then update the copy.
-    Returns the new line item ID to use with update_line_item.
     line_item_id: internal GraphQL ID of the line item to duplicate
     """
-    # Step 1: fetch the existing line item's data + parent group ID
     fetch_q = """
     query($id: ID!) {
         lineItem(id: $id) {
@@ -1170,27 +1192,19 @@ def duplicate_line_item(line_item_id: str) -> str:
     src_item = src.get("lineItem")
     if not src_item:
         return f"Line item {line_item_id} not found."
-
     group_id = (src_item.get("lineItemGroup") or {}).get("id")
     if not group_id:
-        return "Could not determine line item group ID from source item."
-
-    # Sizes from API are already proper enum values (e.g. size_m, size_l) — use directly
+        return "Could not determine line item group ID."
     sizes_gql = ", ".join(
         f'{{size: {s["size"]}, count: {s["count"] or 0}}}'
         for s in (src_item.get("sizes") or [])
     )
-
-    # Step 2: create a copy in the same group
     next_pos = (src_item.get("position") or 1) + 1
     create_mutation = f"""
     mutation($groupId: ID!, $itemNumber: String, $color: String, $description: String) {{
         lineItemCreate(lineItemGroupId: $groupId, input: {{
-            itemNumber: $itemNumber,
-            color: $color,
-            description: $description,
-            position: {next_pos},
-            sizes: [{sizes_gql}]
+            itemNumber: $itemNumber, color: $color, description: $description,
+            position: {next_pos}, sizes: [{sizes_gql}]
         }}) {{
             id itemNumber description color
             sizes {{ size count }}
@@ -1198,18 +1212,14 @@ def duplicate_line_item(line_item_id: str) -> str:
     }}
     """
     result = query_printavo(create_mutation, {
-        "groupId":     group_id,
-        "itemNumber":  src_item.get("itemNumber", "SCRN"),
-        "color":       src_item.get("color", ""),
-        "description": src_item.get("description", ""),
+        "groupId": group_id, "itemNumber": src_item.get("itemNumber", "SCRN"),
+        "color": src_item.get("color", ""), "description": src_item.get("description", ""),
     })
     if "error" in result:
         return f"API Error: {result['error']}"
-
     item = result.get("lineItemCreate")
     if not item:
         return f"Unexpected response — 'lineItemCreate' key missing. Raw: {result}"
-
     return (
         f"Line item duplicated!\n"
         f"New Line Item ID: {item.get('id')}\n"
@@ -1223,19 +1233,15 @@ def duplicate_line_item(line_item_id: str) -> str:
 def set_imprint_pricing(imprint_id: str, color_count: int) -> str:
     """
     Set an imprint's pricing to 'Contract SP 2025 (NEW)' matrix with the given color count.
-    Use get_invoice_structure to get the imprint_id first.
     imprint_id: internal GraphQL ID of the imprint
-    color_count: number of ink colors for this imprint (1, 2, 3, 4, 5, or 6)
+    color_count: number of ink colors (1–6)
     """
     col_id, err = _find_pricing_matrix_column_id(color_count)
     if err:
         return f"Could not find pricing column: {err}"
-
     mutation = """
     mutation($id: ID!, $colId: ID!) {
-        imprintUpdate(id: $id, input: {
-            pricingMatrixColumn: { id: $colId }
-        }) {
+        imprintUpdate(id: $id, input: { pricingMatrixColumn: { id: $colId } }) {
             id pricingMatrixColumn { id columnName }
         }
     }
@@ -1243,7 +1249,6 @@ def set_imprint_pricing(imprint_id: str, color_count: int) -> str:
     result = query_printavo(mutation, {"id": imprint_id, "colId": col_id})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     imp = result.get("imprintUpdate", {})
     col_name = (imp.get("pricingMatrixColumn") or {}).get("columnName", "?")
     return f"Imprint {imprint_id} pricing set to: {col_name}"
@@ -1253,39 +1258,25 @@ def set_imprint_pricing(imprint_id: str, color_count: int) -> str:
 def add_imprint(line_item_group_id: str, color_count: int) -> str:
     """
     Add a new imprint row to a line item group and set its pricing matrix.
-    Use when an order has 2+ print locations (e.g. Full Front + Full Back).
-    Use get_invoice_structure to get the line_item_group_id.
     line_item_group_id: internal GraphQL ID of the line item group
-    color_count: number of ink colors for this imprint (1-6)
+    color_count: number of ink colors (1–6)
     """
     col_id, err = _find_pricing_matrix_column_id(color_count)
     if err:
         return f"Could not find pricing column: {err}"
-
     mutation = """
     mutation($groupId: ID!, $colId: ID!) {
-        imprintCreate(lineItemGroupId: $groupId, input: {
-            pricingMatrixColumn: { id: $colId }
-        }) {
+        imprintCreate(lineItemGroupId: $groupId, input: { pricingMatrixColumn: { id: $colId } }) {
             id pricingMatrixColumn { id columnName }
         }
     }
     """
-    result = query_printavo(mutation, {
-        "groupId": line_item_group_id,
-        "colId":   col_id,
-    })
+    result = query_printavo(mutation, {"groupId": line_item_group_id, "colId": col_id})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     cr = result.get("imprintCreate", {})
     if not cr:
-        return (
-            f"Unexpected response — 'imprintCreate' key missing.\n"
-            f"Raw: {result}\n"
-            f"Run list_available_mutations() to verify the mutation name."
-        )
-
+        return f"Unexpected response — 'imprintCreate' key missing.\nRaw: {result}"
     col_name = (cr.get("pricingMatrixColumn") or {}).get("columnName", "?")
     return (
         f"Imprint added!\n"
@@ -1297,25 +1288,20 @@ def add_imprint(line_item_group_id: str, color_count: int) -> str:
 @mcp.tool()
 def refresh_invoice_pricing(visual_id: str) -> str:
     """
-    Verify current pricing on an order. Printavo API auto-calculates pricing
-    when imprint matrix columns are set — no explicit refresh mutation exists.
-    Returns the current order total.
+    Verify current pricing on an order.
     visual_id: order number shown in Printavo UI
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
-
-    fragment = "id visualId total"
     q = f"""
     query($id: ID!) {{
-        {order_type}(id: $id) {{ {fragment} }}
+        {order_type}(id: $id) {{ id visualId total }}
     }}
     """
     result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     inv = result.get(order_type, {})
     total = inv.get("total", "?")
     if not total or float(total or 0) == 0:
@@ -1331,17 +1317,14 @@ def set_order_status(visual_id: str, status_name: str) -> str:
     """
     Set a Printavo order's status by name.
     visual_id: order number shown in Printavo UI
-    status_name: exact status name e.g. 'Quote Approved', 'Art Approved', 'Quote'
-                 Use get_statuses() to see all available names.
+    status_name: exact status name — use get_statuses() to see all available names.
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
-
     status_id, err = _get_status_id_by_name(status_name)
     if err:
         return err
-
     mutation = """
     mutation($parentId: ID!, $statusId: ID!) {
         statusUpdate(parentId: $parentId, statusId: $statusId) {
@@ -1353,7 +1336,6 @@ def set_order_status(visual_id: str, status_name: str) -> str:
     result = query_printavo(mutation, {"parentId": internal_id, "statusId": status_id})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     inv = result.get("statusUpdate", {})
     new_status = (inv.get("status") or {}).get("name", "?")
     return f"Order #{inv.get('visualId')} status → {new_status}"
@@ -1364,16 +1346,13 @@ def upload_production_file(visual_id: str, file_path: str) -> str:
     """
     Upload a file to a Printavo order as a production file.
     visual_id: order number shown in Printavo UI
-    file_path: https:// URL to the file (Printavo fetches it directly)
-               e.g. 'https://ugp-files-production.s3.us-east-2.amazonaws.com/...'
+    file_path: https:// URL to the file
     """
     internal_id, err = _find_invoice_internal_id(visual_id)
     if err:
         return err
-
     if not file_path.startswith("http"):
-        return "file_path must be an https:// URL. Local paths are not supported on the remote server."
-
+        return "file_path must be an https:// URL."
     mutation = """
     mutation($parentId: ID!, $url: String!) {
         productionFileCreate(parentId: $parentId, publicFileUrl: $url) {
@@ -1384,7 +1363,6 @@ def upload_production_file(visual_id: str, file_path: str) -> str:
     result = query_printavo(mutation, {"parentId": internal_id, "url": file_path})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     pf = result.get("productionFileCreate", {})
     filename = file_path.split("/")[-1].split("?")[0]
     return f"Production file uploaded: {pf.get('name', filename)} (ID: {pf.get('id')}) → Order #{visual_id}"
@@ -1395,42 +1373,30 @@ def attach_mockup_to_order(visual_id: str, file_path: str) -> str:
     """
     Attach a PDF spec sheet as a mockup to the first line item of an order.
     visual_id: order number shown in Printavo UI
-    file_path: https:// URL to the PDF (Printavo fetches it directly)
-               e.g. 'https://ugp-files-production.s3.us-east-2.amazonaws.com/...pdf'
+    file_path: https:// URL to the PDF
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
-
     if not file_path.startswith("http"):
-        return "file_path must be an https:// URL. Local paths are not supported on the remote server."
-
-    # Get first line item ID
+        return "file_path must be an https:// URL."
     q = f"""
     query($id: ID!) {{
         {order_type}(id: $id) {{
-            lineItemGroups {{
-                nodes {{
-                    lineItems {{ nodes {{ id }} }}
-                }}
-            }}
+            lineItemGroups {{ nodes {{ lineItems {{ nodes {{ id }} }} }} }}
         }}
     }}
     """
     result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"API Error: {result['error']}"
-
     groups = (result.get(order_type) or {}).get("lineItemGroups", {}).get("nodes", [])
     if not groups:
         return f"No line item groups found on order #{visual_id}."
-
     items = (groups[0].get("lineItems") or {}).get("nodes", [])
     if not items:
         return f"No line items found in first group of order #{visual_id}."
-
     line_item_id = items[0]["id"]
-
     mutation = """
     mutation($lineItemId: ID!, $url: String!) {
         lineItemMockupCreate(lineItemId: $lineItemId, publicImageUrl: $url) {
@@ -1441,37 +1407,27 @@ def attach_mockup_to_order(visual_id: str, file_path: str) -> str:
     upload_result = query_printavo(mutation, {"lineItemId": line_item_id, "url": file_path})
     if "error" in upload_result:
         return f"Mockup upload failed: {upload_result['error']}"
-
     mockup = upload_result.get("lineItemMockupCreate", {})
     filename = file_path.split("/")[-1].split("?")[0]
     return f"Mockup attached: {filename} → Order #{visual_id} (Mockup ID: {mockup.get('id')})"
 
 
-
 @mcp.tool()
 def list_available_mutations() -> str:
-    """
-    Diagnostic: list all GraphQL mutations available in the Printavo API.
-    Use this if a mutation call returns an unexpected 'key missing' error —
-    paste the output to verify the correct mutation name.
-    """
+    """List all GraphQL mutations available in the Printavo API."""
     q = """
     query {
         __schema {
-            mutationType {
-                fields { name }
-            }
+            mutationType { fields { name } }
         }
     }
     """
     result = query_printavo(q)
     if "error" in result:
         return f"API Error: {result['error']}"
-
     mt = result.get("__schema", {}).get("mutationType", {})
     if not mt:
-        return "Could not retrieve mutation list — __schema.mutationType not returned."
-
+        return "Could not retrieve mutation list."
     fields = sorted(f.get("name") for f in mt.get("fields", []))
     return "AVAILABLE MUTATIONS:\n" + "\n".join(f"  {n}" for n in fields)
 
@@ -1479,45 +1435,24 @@ def list_available_mutations() -> str:
 # ── DAILY SLACK SCHEDULER ─────────────────────────────────────────────────────
 
 def _is_us_federal_holiday(dt: datetime) -> bool:
-    """Returns True if the given date is a major US federal holiday."""
     month, day, weekday = dt.month, dt.day, dt.weekday()
-    # New Year's Day
-    if month == 1 and day == 1:
-        return True
-    # MLK Day — 3rd Monday in January
-    if month == 1 and weekday == 0 and 15 <= day <= 21:
-        return True
-    # Presidents Day — 3rd Monday in February
-    if month == 2 and weekday == 0 and 15 <= day <= 21:
-        return True
-    # Memorial Day — last Monday in May
-    if month == 5 and weekday == 0 and day >= 25:
-        return True
-    # Juneteenth
-    if month == 6 and day == 19:
-        return True
-    # Independence Day
-    if month == 7 and day == 4:
-        return True
-    # Labor Day — 1st Monday in September
-    if month == 9 and weekday == 0 and day <= 7:
-        return True
-    # Thanksgiving — 4th Thursday in November
-    if month == 11 and weekday == 3 and 22 <= day <= 28:
-        return True
-    # Christmas
-    if month == 12 and day == 25:
-        return True
+    if month == 1  and day == 1:                           return True
+    if month == 1  and weekday == 0 and 15 <= day <= 21:  return True
+    if month == 2  and weekday == 0 and 15 <= day <= 21:  return True
+    if month == 5  and weekday == 0 and day >= 25:        return True
+    if month == 6  and day == 19:                          return True
+    if month == 7  and day == 4:                           return True
+    if month == 9  and weekday == 0 and day <= 7:         return True
+    if month == 11 and weekday == 3 and 22 <= day <= 28:  return True
+    if month == 12 and day == 25:                          return True
     return False
 
 
 def run_daily_scheduler():
     """Background thread: post production schedule to Slack at 6am CST weekdays."""
     CST_OFFSET = timedelta(hours=-6)
-
     while True:
         now_cst = datetime.now(timezone.utc) + CST_OFFSET
-        # Only run on weekdays (Mon–Fri)
         if now_cst.weekday() < 5 and not _is_us_federal_holiday(now_cst):
             target = now_cst.replace(hour=6, minute=0, second=0, microsecond=0)
             if now_cst >= target and now_cst < target + timedelta(minutes=5):
@@ -1525,7 +1460,7 @@ def run_daily_scheduler():
                     send_schedule_to_slack(days_ahead=7)
                 except Exception:
                     pass
-        time.sleep(300)  # Check every 5 minutes
+        time.sleep(300)
 
 
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)

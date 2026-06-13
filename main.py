@@ -418,7 +418,6 @@ def diagnose_order(visual_id: str) -> str:
                     }
                 }
                 productionFiles { nodes { id name } }
-                mockups { nodes { id fileName } }
     """
     q = f"""
     query($q: String) {{
@@ -480,7 +479,6 @@ def diagnose_order(visual_id: str) -> str:
     contact = inv.get("contact") or {}
     status  = (inv.get("status") or {}).get("name", "?")
     prod_files = (inv.get("productionFiles") or {}).get("nodes", [])
-    mockups    = (inv.get("mockups") or {}).get("nodes", [])
 
     lines = [
         f"DIAGNOSTIC — Order #{inv.get('visualId')} | {inv.get('nickname','')}",
@@ -490,7 +488,7 @@ def diagnose_order(visual_id: str) -> str:
         f"Prod: {(inv.get('startAt') or '')[:10]} | "
         f"Invoice: {inv.get('invoiceAt', '')}",
         f"  PO #: {inv.get('visualPoNumber','')}",
-        f"  Production Files: {len(prod_files)} | Mockups: {len(mockups)}",
+        f"  Production Files: {len(prod_files)}",
         f"  Line Item Groups: {len(groups)}",
     ]
     if issues:
@@ -1336,19 +1334,19 @@ def set_order_status(visual_id: str, status_name: str) -> str:
     if err:
         return err
 
-    update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
-    mutation = f"""
-    mutation($id: ID!, $statusId: ID!) {{
-        {update_field}(id: $id, input: {{ statusId: $statusId }}) {{
-            id visualId status {{ name }}
-        }}
-    }}
+    mutation = """
+    mutation($id: ID!, $statusId: ID!) {
+        statusUpdate(id: $id, input: { statusId: $statusId }) {
+            ... on Quote   { id visualId status { name } }
+            ... on Invoice { id visualId status { name } }
+        }
+    }
     """
     result = query_printavo(mutation, {"id": internal_id, "statusId": status_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    inv = result.get(update_field, {})
+    inv = result.get("statusUpdate", {})
     new_status = (inv.get("status") or {}).get("name", "?")
     return f"Order #{inv.get('visualId')} status → {new_status}"
 

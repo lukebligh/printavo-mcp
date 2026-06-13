@@ -1219,15 +1219,15 @@ def set_imprint_pricing(imprint_id: str, color_count: int) -> str:
         return f"Could not find pricing column: {err}"
 
     mutation = """
-    mutation($id: ID!, $pricingMatrixColumnId: ID!) {
+    mutation($id: ID!, $colId: ID!) {
         imprintUpdate(id: $id, input: {
-            pricingMatrixColumnId: $pricingMatrixColumnId
+            pricingMatrixColumn: { id: $colId }
         }) {
             id pricingMatrixColumn { id columnName }
         }
     }
     """
-    result = query_printavo(mutation, {"id": imprint_id, "pricingMatrixColumnId": col_id})
+    result = query_printavo(mutation, {"id": imprint_id, "colId": col_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 

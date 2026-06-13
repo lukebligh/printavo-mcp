@@ -1004,27 +1004,25 @@ def delete_production_files(visual_id: str) -> str:
     Removes: production files (EPS) AND line item mockups (spec sheet images).
     visual_id: order number shown in Printavo UI
     """
-    internal_id, err = _find_invoice_internal_id(visual_id)
+    internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
 
-    q = """
-    query($id: ID!) {
-        invoice(id: $id) {
-            productionFiles { nodes { id name } }
-            lineItemGroups { nodes { lineItems { nodes { id mockups { nodes { id fullImageUrl } } } } } }
-        }
-        quote(id: $id) {
-            productionFiles { nodes { id name } }
-            lineItemGroups { nodes { lineItems { nodes { id mockups { nodes { id fullImageUrl } } } } } }
-        }
-    }
+    # Query only the detected type to stay under 25k complexity limit
+    type_field = order_type  # 'invoice' or 'quote'
+    q = f"""
+    query($id: ID!) {{
+        {type_field}(id: $id) {{
+            productionFiles {{ nodes {{ id name }} }}
+            lineItemGroups {{ nodes {{ lineItems {{ nodes {{ id mockups {{ nodes {{ id }} }} }} }} }} }}
+        }}
+    }}
     """
     result = query_printavo(q, {"id": internal_id}, allow_partial=True)
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    obj = result.get("invoice") or result.get("quote") or {}
+    obj = result.get(type_field) or {}
 
     # --- Delete production files ---
     files = obj.get("productionFiles", {}).get("nodes", [])

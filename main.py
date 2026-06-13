@@ -517,21 +517,6 @@ def get_production_schedule(days_ahead: int = 7) -> str:
                 dueAt startAt
                 status { name }
                 contact { fullName }
-                lineItemGroups {
-                    nodes {
-                        lineItems {
-                            nodes {
-                                description color
-                            }
-                        }
-                        imprints {
-                            nodes {
-                                typeOfWork { name }
-                                pricingMatrixColumn { columnName }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -560,17 +545,6 @@ def get_production_schedule(days_ahead: int = 7) -> str:
             f"Prod: {prod_dt} | Due: {due_dt}"
         )
 
-        groups = (inv.get("lineItemGroups") or {}).get("nodes", [])
-        for g in groups:
-            items = (g.get("lineItems") or {}).get("nodes", [])
-            for item in items:
-                lines.append(f"  {item.get('color','?')} | {item.get('description','')[:60]}")
-
-            imprints = (g.get("imprints") or {}).get("nodes", [])
-            for imp in imprints:
-                tow = (imp.get("typeOfWork") or {}).get("name", "?")
-                col = (imp.get("pricingMatrixColumn") or {}).get("columnName", "?")
-                lines.append(f"  Imprint: {tow} | {col}")
         lines.append("")
 
     return "\n".join(lines)

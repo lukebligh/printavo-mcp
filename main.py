@@ -43,7 +43,7 @@ def get_recent_orders(limit: int = 10) -> str:
     """Get the most recent Printavo orders."""
     q = """
     query($first: Int) {
-        invoices(first: $first, sortOn: UPDATED_AT, sortDirection: DESC) {
+        invoices(first: $first) {
             nodes {
                 id
                 visualId
@@ -1164,33 +1164,61 @@ def duplicate_line_item(line_item_id: str) -> str:
     Returns the new line item ID to use with update_line_item.
     line_item_id: internal GraphQL ID of the line item to duplicate
     """
-    mutation = """
-    mutation($id: ID!) {
-        lineItemDuplicate(input: { lineItemId: $id }) {
-            lineItem { id description color itemNumber }
-            errors { message }
+    # Step 1: fetch the existing line item's data + parent group ID
+    fetch_q = """
+    query($id: ID!) {
+        lineItem(id: $id) {
+            id itemNumber color description position
+            lineItemGroup { id }
+            sizes { size count }
         }
     }
     """
-    result = query_printavo(mutation, {"id": line_item_id})
+    src = query_printavo(fetch_q, {"id": line_item_id})
+    if "error" in src:
+        return f"API Error fetching source line item: {src['error']}"
+    src_item = src.get("lineItem")
+    if not src_item:
+        return f"Line item {line_item_id} not found."
+
+    group_id = (src_item.get("lineItemGroup") or {}).get("id")
+    if not group_id:
+        return "Could not determine line item group ID from source item."
+
+    # Rebuild sizes as inline GraphQL enum literals
+    sizes_gql = ", ".join(
+        f'{{size: {_normalize_size_key(s["size"])}, count: {s["count"] or 0}}}'
+        for s in (src_item.get("sizes") or [])
+    )
+
+    # Step 2: create a copy in the same group
+    next_pos = (src_item.get("position") or 1) + 1
+    create_mutation = f"""
+    mutation($groupId: ID!, $itemNumber: String, $color: String, $description: String) {{
+        lineItemCreate(lineItemGroupId: $groupId, input: {{
+            itemNumber: $itemNumber,
+            color: $color,
+            description: $description,
+            position: {next_pos},
+            sizes: [{sizes_gql}]
+        }}) {{
+            id itemNumber description color
+            sizes {{ size count }}
+        }}
+    }}
+    """
+    result = query_printavo(create_mutation, {
+        "groupId":     group_id,
+        "itemNumber":  src_item.get("itemNumber", "SCRN"),
+        "color":       src_item.get("color", ""),
+        "description": src_item.get("description", ""),
+    })
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    dup = result.get("lineItemDuplicate", {})
-    if not dup:
-        return (
-            f"Unexpected response — 'lineItemDuplicate' key missing.\n"
-            f"Raw: {result}\n"
-            f"Run list_available_mutations() to verify the mutation name."
-        )
-
-    errors = dup.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    item = dup.get("lineItem", {})
+    item = result.get("lineItemCreate")
     if not item:
-        return f"No lineItem returned. Full result: {result}"
+        return f"Unexpected response — 'lineItemCreate' key missing. Raw: {result}"
 
     return (
         f"Line item duplicated!\n"
@@ -1245,19 +1273,17 @@ def add_imprint(line_item_group_id: str, color_count: int) -> str:
         return f"Could not find pricing column: {err}"
 
     mutation = """
-    mutation($groupId: ID!, $pricingMatrixColumnId: ID!) {
-        imprintCreate(input: {
-            lineItemGroupId: $groupId,
-            pricingMatrixColumnId: $pricingMatrixColumnId
+    mutation($groupId: ID!, $colId: ID!) {
+        imprintCreate(lineItemGroupId: $groupId, input: {
+            pricingMatrixColumn: { id: $colId }
         }) {
-            imprint { id pricingMatrixColumn { id columnName } }
-            errors { message }
+            id pricingMatrixColumn { id columnName }
         }
     }
     """
     result = query_printavo(mutation, {
-        "groupId":               line_item_group_id,
-        "pricingMatrixColumnId": col_id,
+        "groupId": line_item_group_id,
+        "colId":   col_id,
     })
     if "error" in result:
         return f"API Error: {result['error']}"
@@ -1270,15 +1296,10 @@ def add_imprint(line_item_group_id: str, color_count: int) -> str:
             f"Run list_available_mutations() to verify the mutation name."
         )
 
-    errors = cr.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    imp = cr.get("imprint", {})
-    col_name = (imp.get("pricingMatrixColumn") or {}).get("columnName", "?")
+    col_name = (cr.get("pricingMatrixColumn") or {}).get("columnName", "?")
     return (
         f"Imprint added!\n"
-        f"New Imprint ID: {imp.get('id')}\n"
+        f"New Imprint ID: {cr.get('id')}\n"
         f"Matrix column: {col_name}"
     )
 

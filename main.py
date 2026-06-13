@@ -1374,122 +1374,88 @@ def upload_production_file(visual_id: str, file_path: str) -> str:
     """
     Upload a file to a Printavo order as a production file.
     visual_id: order number shown in Printavo UI
-    file_path: absolute local path OR an https:// URL to the file
-               e.g. '/Users/a13145/Downloads/Full Front.eps'
-               or   'https://ugp-files-production.s3.amazonaws.com/...'
+    file_path: https:// URL to the file (Printavo fetches it directly)
+               e.g. 'https://ugp-files-production.s3.us-east-2.amazonaws.com/...'
     """
     internal_id, err = _find_invoice_internal_id(visual_id)
     if err:
         return err
 
-    tmp_path = None
-    actual_path = file_path
-    if file_path.startswith("http"):
-        import tempfile
-        url_filename = file_path.split("/")[-1].split("?")[0] or "production_file"
-        suffix = ("." + url_filename.rsplit(".", 1)[-1]) if "." in url_filename else ""
-        try:
-            resp = httpx.get(file_path, timeout=60, follow_redirects=True)
-            if resp.status_code != 200:
-                return f"Failed to download file: HTTP {resp.status_code}"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(resp.content)
-            tmp.close()
-            tmp_path = tmp.name
-            actual_path = tmp_path
-        except Exception as e:
-            return f"Failed to download file: {e}"
-    elif not os.path.exists(file_path):
-        return f"File not found: {file_path}"
+    if not file_path.startswith("http"):
+        return "file_path must be an https:// URL. Local paths are not supported on the remote server."
 
-    try:
-        result = _upload_file_rest(
-            "production_files",
-            actual_path,
-            {"invoice_id": internal_id},
-        )
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
+    mutation = """
+    mutation($orderId: ID!, $url: String!) {
+        productionFileCreate(orderId: $orderId, input: { publicFileUrl: $url }) {
+            id name
+        }
+    }
+    """
+    result = query_printavo(mutation, {"orderId": internal_id, "url": file_path})
     if "error" in result:
-        return f"Upload failed: {result['error']}"
+        return f"API Error: {result['error']}"
 
-    filename = url_filename if file_path.startswith("http") else os.path.basename(file_path)
-    return f"Production file uploaded: {filename} → Order #{visual_id}"
+    pf = result.get("productionFileCreate", {})
+    filename = file_path.split("/")[-1].split("?")[0]
+    return f"Production file uploaded: {pf.get('name', filename)} (ID: {pf.get('id')}) → Order #{visual_id}"
 
 
 @mcp.tool()
 def attach_mockup_to_order(visual_id: str, file_path: str) -> str:
     """
-    Attach a PDF spec sheet as a mockup to the first line item group of an order.
+    Attach a PDF spec sheet as a mockup to the first line item of an order.
     visual_id: order number shown in Printavo UI
-    file_path: absolute local path OR an https:// URL to the PDF
-               e.g. '/Users/a13145/Downloads/spec-1151454.pdf'
-               or   'https://ugp-files-production.s3.amazonaws.com/...pdf'
+    file_path: https:// URL to the PDF (Printavo fetches it directly)
+               e.g. 'https://ugp-files-production.s3.us-east-2.amazonaws.com/...pdf'
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
 
-    tmp_path = None
-    actual_path = file_path
-    url_filename = None
-    if file_path.startswith("http"):
-        import tempfile
-        url_filename = file_path.split("/")[-1].split("?")[0] or "spec.pdf"
-        suffix = ("." + url_filename.rsplit(".", 1)[-1]) if "." in url_filename else ".pdf"
-        try:
-            resp = httpx.get(file_path, timeout=60, follow_redirects=True)
-            if resp.status_code != 200:
-                return f"Failed to download file: HTTP {resp.status_code}"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(resp.content)
-            tmp.close()
-            tmp_path = tmp.name
-            actual_path = tmp_path
-        except Exception as e:
-            return f"Failed to download file: {e}"
-    elif not os.path.exists(file_path):
-        return f"File not found: {file_path}"
+    if not file_path.startswith("http"):
+        return "file_path must be an https:// URL. Local paths are not supported on the remote server."
 
-    # Get first line item group ID (works for both invoice and quote)
+    # Get first line item ID
     q = f"""
     query($id: ID!) {{
         {order_type}(id: $id) {{
-            lineItemGroups {{ nodes {{ id }} }}
+            lineItemGroups {{
+                nodes {{
+                    lineItems {{ nodes {{ id }} }}
+                }}
+            }}
         }}
     }}
     """
     result = query_printavo(q, {"id": internal_id})
     if "error" in result:
-        if tmp_path:
-            os.unlink(tmp_path)
         return f"API Error: {result['error']}"
 
     groups = (result.get(order_type) or {}).get("lineItemGroups", {}).get("nodes", [])
     if not groups:
-        if tmp_path:
-            os.unlink(tmp_path)
         return f"No line item groups found on order #{visual_id}."
 
-    group_id = groups[0]["id"]
+    items = (groups[0].get("lineItems") or {}).get("nodes", [])
+    if not items:
+        return f"No line items found in first group of order #{visual_id}."
 
-    try:
-        upload_result = _upload_file_rest(
-            "mockups",
-            actual_path,
-            {"line_item_group_id": group_id},
-        )
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+    line_item_id = items[0]["id"]
 
+    mutation = """
+    mutation($lineItemId: ID!, $url: String!) {
+        lineItemMockupCreate(lineItemId: $lineItemId, input: { publicFileUrl: $url }) {
+            id fullImageUrl
+        }
+    }
+    """
+    upload_result = query_printavo(mutation, {"lineItemId": line_item_id, "url": file_path})
     if "error" in upload_result:
         return f"Mockup upload failed: {upload_result['error']}"
 
-    filename = url_filename if url_filename else os.path.basename(file_path)
-    return f"Mockup attached: {filename} → Order #{visual_id} (Group ID: {group_id})"
+    mockup = upload_result.get("lineItemMockupCreate", {})
+    filename = file_path.split("/")[-1].split("?")[0]
+    return f"Mockup attached: {filename} → Order #{visual_id} (Mockup ID: {mockup.get('id')})"
+
 
 
 @mcp.tool()

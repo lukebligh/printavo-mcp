@@ -83,9 +83,10 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
     Returns a list of imprint dicts with keys: type, colors, col_name.
     Returns None on API error.
 
-    Queries both invoice(id) and quote(id) in one call — the inProductionAfter
-    list query may return IDs that resolve as quotes rather than invoices for
-    some record types, so we need both to ensure we always get data.
+    Tries invoice(id) first; if that returns null, falls back to quote(id).
+    The inProductionAfter list may return IDs for records that are quotes
+    rather than invoices in some cases, so both are attempted.
+    Sequential queries (not combined) avoids partial-error handling complexity.
     """
     frag = """
         lineItemGroups {
@@ -99,26 +100,37 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
             }
         }
     """
-    q = f"""
-    query($id: ID!) {{
-        invoice(id: $id) {{ {frag} }}
-        quote(id: $id)   {{ {frag} }}
-    }}
-    """
-    result = query_printavo(q, {"id": internal_id}, allow_partial=True)
-    if "error" in result:
-        return None
-    obj = result.get("invoice") or result.get("quote") or {}
-    groups = obj.get("lineItemGroups", {}).get("nodes", [])
-    imprints = []
-    for g in groups:
-        for imp in g.get("imprints", {}).get("nodes", []):
-            imprints.append({
-                "type":     _decoration_type(imp),
-                "colors":   _color_count(imp),
-                "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
-            })
-    return imprints
+
+    def _parse_imprints(obj: dict) -> list:
+        groups = (obj.get("lineItemGroups") or {}).get("nodes", [])
+        imprints = []
+        for g in groups:
+            for imp in (g.get("imprints") or {}).get("nodes", []):
+                imprints.append({
+                    "type":     _decoration_type(imp),
+                    "colors":   _color_count(imp),
+                    "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
+                })
+        return imprints
+
+    # Try invoice first
+    q_inv = f"query($id: ID!) {{ invoice(id: $id) {{ {frag} }} }}"
+    r1 = query_printavo(q_inv, {"id": internal_id})
+    if "error" not in r1:
+        inv = r1.get("invoice")
+        if inv is not None:
+            return _parse_imprints(inv)
+
+    # Fall back to quote
+    q_qt = f"query($id: ID!) {{ quote(id: $id) {{ {frag} }} }}"
+    r2 = query_printavo(q_qt, {"id": internal_id})
+    if "error" not in r2:
+        qt = r2.get("quote")
+        if qt is not None:
+            return _parse_imprints(qt)
+
+    # Both failed — return None to signal API error
+    return None
 
 
 def _fetch_qty_from_line_items(internal_id: str) -> int:
@@ -126,7 +138,7 @@ def _fetch_qty_from_line_items(internal_id: str) -> int:
     Fallback quantity fetch — sums size counts across all line items.
     Used when totalQuantity on the invoice node returns 0 (common for
     EMB pre-production and some UGP contract orders).
-    Queries both invoice(id) and quote(id) to handle both record types.
+    Tries invoice(id) first, then falls back to quote(id).
     """
     frag = """
         lineItemGroups {
@@ -137,21 +149,29 @@ def _fetch_qty_from_line_items(internal_id: str) -> int:
             }
         }
     """
-    q = f"""
-    query($id: ID!) {{
-        invoice(id: $id) {{ {frag} }}
-        quote(id: $id)   {{ {frag} }}
-    }}
-    """
-    result = query_printavo(q, {"id": internal_id}, allow_partial=True)
-    if "error" in result:
-        return 0
-    obj = result.get("invoice") or result.get("quote") or {}
-    total = 0
-    for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
-        for item in (g.get("lineItems") or {}).get("nodes", []):
-            total += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
-    return total
+
+    def _sum_qty(obj: dict) -> int:
+        total = 0
+        for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
+            for item in (g.get("lineItems") or {}).get("nodes", []):
+                total += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
+        return total
+
+    q_inv = f"query($id: ID!) {{ invoice(id: $id) {{ {frag} }} }}"
+    r1 = query_printavo(q_inv, {"id": internal_id})
+    if "error" not in r1:
+        inv = r1.get("invoice")
+        if inv is not None:
+            return _sum_qty(inv)
+
+    q_qt = f"query($id: ID!) {{ quote(id: $id) {{ {frag} }} }}"
+    r2 = query_printavo(q_qt, {"id": internal_id})
+    if "error" not in r2:
+        qt = r2.get("quote")
+        if qt is not None:
+            return _sum_qty(qt)
+
+    return 0
 
 
 def _format_est_time(total_min: int) -> str:

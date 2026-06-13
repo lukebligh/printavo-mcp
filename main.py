@@ -522,7 +522,6 @@ def get_production_schedule(days_ahead: int = 7) -> str:
                         lineItems {
                             nodes {
                                 description color
-                                sizes { size count }
                             }
                         }
                         imprints {
@@ -538,7 +537,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     }
     """
     search_q = f"production_at >= {start_str} production_at <= {end_str}"
-    result   = query_printavo(q, {"q": search_q, "first": 50})
+    result   = query_printavo(q, {"q": search_q, "first": 20})
     if "error" in result:
         return f"Error: {result['error']}"
 
@@ -565,8 +564,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         for g in groups:
             items = (g.get("lineItems") or {}).get("nodes", [])
             for item in items:
-                qty = sum((s.get("count") or 0) for s in (item.get("sizes") or []))
-                lines.append(f"  {item.get('color','?')} | {item.get('description','')[:60]} | Qty: {qty}")
+                lines.append(f"  {item.get('color','?')} | {item.get('description','')[:60]}")
 
             imprints = (g.get("imprints") or {}).get("nodes", [])
             for imp in imprints:

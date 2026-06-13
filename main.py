@@ -1291,40 +1291,33 @@ def add_imprint(line_item_group_id: str, color_count: int) -> str:
 @mcp.tool()
 def refresh_invoice_pricing(visual_id: str) -> str:
     """
-    Trigger pricing recalculation on an invoice.
-    Call after setting all imprint pricing to update line item prices.
+    Verify current pricing on an order. Printavo API auto-calculates pricing
+    when imprint matrix columns are set — no explicit refresh mutation exists.
+    Returns the current order total.
     visual_id: order number shown in Printavo UI
     """
-    internal_id, err = _find_invoice_internal_id(visual_id)
+    internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
 
-    mutation = """
-    mutation($id: ID!) {
-        invoiceCalculate(input: { invoiceId: $id }) {
-            invoice { id visualId total }
-            errors { message }
-        }
-    }
+    fragment = "id visualId total"
+    q = f"""
+    query($id: ID!) {{
+        {order_type}(id: $id) {{ {fragment} }}
+    }}
     """
-    result = query_printavo(mutation, {"id": internal_id})
+    result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 
-    calc = result.get("invoiceCalculate", {})
-    if not calc:
+    inv = result.get(order_type, {})
+    total = inv.get("total", "?")
+    if not total or float(total or 0) == 0:
         return (
-            f"'invoiceCalculate' mutation not found or returned unexpected response.\n"
-            f"Raw: {result}\n"
-            f"Run list_available_mutations() to find the correct pricing refresh mutation."
+            f"Order #{inv.get('visualId')} total is $0 — pricing may not be set.\n"
+            f"Verify imprint matrix columns are assigned via set_imprint_pricing."
         )
-
-    errors = calc.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-
-    inv = calc.get("invoice", {})
-    return f"Pricing refreshed for order #{inv.get('visualId')} | New total: ${inv.get('total', '?')}"
+    return f"Order #{inv.get('visualId')} current total: ${total} ✓"
 
 
 @mcp.tool()

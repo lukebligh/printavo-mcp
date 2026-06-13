@@ -395,6 +395,10 @@ def diagnose_order(visual_id: str) -> str:
     imprint pricing, line items, and flags any issues.
     visual_id: order number shown in Printavo UI
     """
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return f"Error: {err}"
+
     frag = """
                 id visualId nickname total customerDueAt startAt invoiceAt visualPoNumber
                 status { name }
@@ -411,7 +415,6 @@ def diagnose_order(visual_id: str) -> str:
                         imprints {
                             nodes {
                                 id
-                                typeOfWork { name }
                                 pricingMatrixColumn { id columnName }
                             }
                         }
@@ -420,21 +423,16 @@ def diagnose_order(visual_id: str) -> str:
                 productionFiles { nodes { id name } }
     """
     q = f"""
-    query($q: String) {{
-        invoices(first: 5, query: $q) {{ nodes {{ {frag} }} }}
-        quotes(first: 5, query: $q)   {{ nodes {{ {frag} }} }}
+    query($id: ID!) {{
+        {order_type}(id: $id) {{ {frag} }}
     }}
     """
-    result = query_printavo(q, {"q": str(visual_id)}, allow_partial=True)
+    result = query_printavo(q, {"id": internal_id})
     if "error" in result:
         return f"Error: {result['error']}"
 
-    all_nodes = (
-        result.get("invoices", {}).get("nodes", []) +
-        result.get("quotes",   {}).get("nodes", [])
-    )
-    matching = [n for n in all_nodes if str(n.get("visualId")) == str(visual_id)]
-    if not matching:
+    inv = result.get(order_type)
+    if not inv:
         return f"Order #{visual_id} not found."
 
     inv    = matching[0]

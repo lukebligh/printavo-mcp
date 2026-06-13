@@ -744,9 +744,7 @@ def _find_pricing_matrix_column_id(color_count: int):
                 nodes {
                     id
                     name
-                    pricingMatrixColumns(first: 20) {
-                        nodes { id columnName }
-                    }
+                    columns { id columnName }
                 }
             }
         }
@@ -766,7 +764,7 @@ def _find_pricing_matrix_column_id(color_count: int):
         names = [m.get("name") for m in matrices]
         return None, f"'Contract SP 2025 (NEW)' matrix not found. Available: {names}"
 
-    columns = target.get("pricingMatrixColumns", {}).get("nodes", [])
+    columns = target.get("columns", [])
     for col in columns:
         col_name = col.get("columnName", "")
         if re.search(rf'\b{color_count}\s+[Cc]olor', col_name):

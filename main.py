@@ -565,9 +565,12 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     end_str   = end_date.strftime("%Y-%m-%d")
 
     # ── Step 1: lightweight list query (no nested collections) ──────────────
+    # Uses inProductionAfter/inProductionBefore named args — confirmed working
+    # in direct GraphQL testing. The query-string `production_at >=` syntax
+    # is unreliable; named params are the correct approach.
     q_list = """
-    query($q: String, $first: Int) {
-        invoices(first: $first, query: $q) {
+    query($after: ISO8601Date, $before: ISO8601Date, $first: Int) {
+        invoices(inProductionAfter: $after, inProductionBefore: $before, first: $first) {
             nodes {
                 id visualId nickname total
                 dueAt startAt
@@ -577,8 +580,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         }
     }
     """
-    search_q = f"production_at >= {start_str} production_at <= {end_str}"
-    result = query_printavo(q_list, {"q": search_q, "first": 25})
+    result = query_printavo(q_list, {"after": start_str, "before": end_str, "first": 25})
     if "error" in result:
         return f"Error: {result['error']}"
     nodes = result.get("invoices", {}).get("nodes", [])

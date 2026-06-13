@@ -841,21 +841,21 @@ def update_invoice_fields(
 
     update_field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
     if order_type == "quote":
+        # invoiceAt omitted: Printavo validates invoiceAt + payment_terms <= customerDueAt,
+        # which always fails for short-turn UGP orders (template has Net 30 terms).
         mutation = f"""
         mutation(
             $id: ID!,
             $nickname: String,
             $visualPoNumber: String,
             $dueAt: ISO8601DateTime,
-            $customerDueAt: ISO8601Date,
-            $invoiceAt: ISO8601Date
+            $customerDueAt: ISO8601Date
         ) {{
             {update_field}(id: $id, input: {{
                 nickname: $nickname,
                 visualPoNumber: $visualPoNumber,
                 dueAt: $dueAt,
-                customerDueAt: $customerDueAt,
-                invoiceAt: $invoiceAt
+                customerDueAt: $customerDueAt
             }}) {{
                 id visualId nickname visualPoNumber customerDueAt dueAt startAt invoiceAt
             }}
@@ -867,7 +867,6 @@ def update_invoice_fields(
             "visualPoNumber": po_number,
             "dueAt":          f"{production_date}T12:00:00Z",
             "customerDueAt":  customer_due_date,
-            "invoiceAt":      invoice_date,
         }
     else:
         mutation = f"""

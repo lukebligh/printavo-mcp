@@ -136,6 +136,7 @@ def get_order_details(visual_id: str) -> str:
                 nickname
                 total
                 customerDueAt
+                dueAt
                 startAt
                 invoiceAt
                 visualPoNumber
@@ -151,6 +152,7 @@ def get_order_details(visual_id: str) -> str:
                 nickname
                 total
                 customerDueAt
+                dueAt
                 startAt
                 invoiceAt
                 visualPoNumber
@@ -183,7 +185,8 @@ def get_order_details(visual_id: str) -> str:
         f"  Total:          ${inv.get('total', 0)}",
         f"  PO #:           {inv.get('visualPoNumber', '')}",
         f"  Customer Due:   {inv.get('customerDueAt', '')}",
-        f"  Production Date:{(inv.get('startAt') or '')[:10]}",
+        f"  dueAt:          {(inv.get('dueAt') or '')[:10]}",
+        f"  startAt:        {(inv.get('startAt') or '')[:10]}",
         f"  Invoice Date:   {inv.get('invoiceAt', '')}",
         f"  Internal ID:    {inv.get('id')}",
     ]
@@ -846,16 +849,16 @@ def update_invoice_fields(
             $id: ID!,
             $nickname: String,
             $visualPoNumber: String,
-            $startAt: ISO8601DateTime,
+            $dueAt: ISO8601DateTime,
             $customerDueAt: ISO8601Date
         ) {{
             {update_field}(id: $id, input: {{
                 nickname: $nickname,
                 visualPoNumber: $visualPoNumber,
-                startAt: $startAt,
+                dueAt: $dueAt,
                 customerDueAt: $customerDueAt
             }}) {{
-                id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
+                id visualId nickname visualPoNumber customerDueAt dueAt startAt invoiceAt
             }}
         }}
         """
@@ -863,7 +866,7 @@ def update_invoice_fields(
             "id":             internal_id,
             "nickname":       nickname,
             "visualPoNumber": po_number,
-            "startAt":        f"{production_date}T12:00:00Z",
+            "dueAt":          f"{production_date}T12:00:00Z",
             "customerDueAt":  customer_due_date,
         }
     else:
@@ -900,11 +903,12 @@ def update_invoice_fields(
         return f"API Error: {result['error']}"
 
     inv = result.get(update_field, {})
+    prod_date = (inv.get('dueAt') or inv.get('startAt') or '')[:10]
     return (
         f"Order #{inv.get('visualId')} header updated!\n"
         f"  Nickname:          {inv.get('nickname')}\n"
         f"  PO #:              {inv.get('visualPoNumber')}\n"
-        f"  Production Date:   {(inv.get('startAt') or '')[:10]}\n"
+        f"  Production Date:   {prod_date}\n"
         f"  Customer Due Date: {inv.get('customerDueAt', '')}\n"
         f"  Invoice Date:      {inv.get('invoiceAt', '')}"
     )

@@ -1000,8 +1000,8 @@ def get_invoice_structure(visual_id: str) -> str:
 @mcp.tool()
 def delete_production_files(visual_id: str) -> str:
     """
-    Delete all production files from a Printavo invoice.
-    Call after duplicating template 6817 to remove inherited artwork.
+    Delete ALL inherited files from a Printavo order after duplicating template 6817.
+    Removes: production files (EPS) AND line item mockups (spec sheet images).
     visual_id: order number shown in Printavo UI
     """
     internal_id, err = _find_invoice_internal_id(visual_id)
@@ -1010,8 +1010,14 @@ def delete_production_files(visual_id: str) -> str:
 
     q = """
     query($id: ID!) {
-        invoice(id: $id) { productionFiles { nodes { id name } } }
-        quote(id: $id) { productionFiles { nodes { id name } } }
+        invoice(id: $id) {
+            productionFiles { nodes { id name } }
+            lineItemGroups { nodes { lineItems { nodes { id mockups { nodes { id fullImageUrl } } } } } }
+        }
+        quote(id: $id) {
+            productionFiles { nodes { id name } }
+            lineItemGroups { nodes { lineItems { nodes { id mockups { nodes { id fullImageUrl } } } } } }
+        }
     }
     """
     result = query_printavo(q, {"id": internal_id}, allow_partial=True)
@@ -1019,33 +1025,44 @@ def delete_production_files(visual_id: str) -> str:
         return f"API Error: {result['error']}"
 
     obj = result.get("invoice") or result.get("quote") or {}
+
+    # --- Delete production files ---
     files = obj.get("productionFiles", {}).get("nodes", [])
-    if not files:
-        return f"No production files found on order #{visual_id}. Nothing to delete."
-
-    delete_mutation = """
-    mutation($id: ID!) {
-        productionFileDelete(id: $id) {
-            id
-        }
-    }
-    """
-    deleted = []
-    failed  = []
+    del_pf_mutation = """mutation($id: ID!) { productionFileDelete(id: $id) { id } }"""
+    deleted_files, failed_files = [], []
     for pf in files:
-        dr = query_printavo(delete_mutation, {"id": pf["id"]})
+        dr = query_printavo(del_pf_mutation, {"id": pf["id"]})
         if "error" in dr:
-            failed.append(f"{pf.get('name', pf['id'])}: {dr['error']}")
+            failed_files.append(pf.get("name", pf["id"]))
         else:
-            deleted.append(pf.get("name", pf["id"]))
+            deleted_files.append(pf.get("name", pf["id"]))
 
-    lines = [f"Deleted {len(deleted)}/{len(files)} production file(s) from order #{visual_id}:"]
-    for name in deleted:
-        lines.append(f"  ✓ {name}")
-    if failed:
-        lines.append(f"\nFailed ({len(failed)}):")
-        for f in failed:
-            lines.append(f"  ✗ {f}")
+    # --- Delete line item mockups ---
+    mockups_to_delete = []
+    for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
+        for item in (g.get("lineItems") or {}).get("nodes", []):
+            for m in (item.get("mockups") or {}).get("nodes", []):
+                mockups_to_delete.append(m["id"])
+
+    del_mockup_mutation = """mutation($id: ID!) { mockupDelete(id: $id) { id } }"""
+    deleted_mockups, failed_mockups = [], []
+    for mid in mockups_to_delete:
+        dr = query_printavo(del_mockup_mutation, {"id": mid})
+        if "error" in dr:
+            failed_mockups.append(mid)
+        else:
+            deleted_mockups.append(mid)
+
+    lines = []
+    lines.append(f"Order #{visual_id} — inherited files cleared:")
+    lines.append(f"  Production files: {len(deleted_files)}/{len(files)} deleted")
+    for name in deleted_files:
+        lines.append(f"    ✓ {name}")
+    lines.append(f"  Line item mockups: {len(deleted_mockups)}/{len(mockups_to_delete)} deleted")
+    if failed_files:
+        lines.append(f"  FAILED files: {failed_files}")
+    if failed_mockups:
+        lines.append(f"  FAILED mockups: {failed_mockups}")
     return "\n".join(lines)
 
 

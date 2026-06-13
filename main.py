@@ -80,30 +80,21 @@ def _color_count(imprint_node: dict) -> int:
 def _fetch_imprints_for_order(internal_id: str) -> list:
     """
     Fetch imprint nodes for a single order by internal ID.
-    Returns (imprint_list, total_qty) or None on API error.
+    Returns a list of imprint dicts with keys: type, colors, col_name.
+    Returns None on API error.
 
     Uses invoice(id) — a single-object query — which reliably traverses
     lineItemGroups.nodes without hitting complexity limits.
-
-    totalQuantity on the invoice node is sometimes 0 even when line items
-    have sizes set (common for EMB/pre-production orders). Fallback: sum
-    sizes directly from lineItems.
     """
     q = """
     query($id: ID!) {
         invoice(id: $id) {
-            totalQuantity
             lineItemGroups {
                 nodes {
                     imprints {
                         nodes {
                             typeOfWork { name }
                             pricingMatrixColumn { columnName matrix { name } }
-                        }
-                    }
-                    lineItems {
-                        nodes {
-                            sizes { size count }
                         }
                     }
                 }
@@ -117,7 +108,6 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
     inv = result.get("invoice") or {}
     groups = inv.get("lineItemGroups", {}).get("nodes", [])
     imprints = []
-    computed_qty = 0
     for g in groups:
         for imp in g.get("imprints", {}).get("nodes", []):
             imprints.append({
@@ -125,14 +115,37 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
                 "colors":   _color_count(imp),
                 "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
             })
-        for item in g.get("lineItems", {}).get("nodes", []):
-            computed_qty += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
+    return imprints
 
-    # totalQuantity is sometimes 0 for EMB/pre-production orders even when
-    # line items have sizes — fall back to the computed sum in that case.
-    api_qty = int(inv.get("totalQuantity") or 0)
-    total_qty = api_qty if api_qty > 0 else computed_qty
-    return imprints, total_qty
+
+def _fetch_qty_from_line_items(internal_id: str) -> int:
+    """
+    Fallback quantity fetch — sums size counts across all line items.
+    Used when totalQuantity on the invoice node returns 0 (common for
+    EMB pre-production and some UGP contract orders).
+    """
+    q = """
+    query($id: ID!) {
+        invoice(id: $id) {
+            lineItemGroups {
+                nodes {
+                    lineItems {
+                        nodes { sizes { size count } }
+                    }
+                }
+            }
+        }
+    }
+    """
+    result = query_printavo(q, {"id": internal_id})
+    if "error" in result:
+        return 0
+    inv = result.get("invoice") or {}
+    total = 0
+    for g in (inv.get("lineItemGroups") or {}).get("nodes", []):
+        for item in (g.get("lineItems") or {}).get("nodes", []):
+            total += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
+    return total
 
 
 def _format_est_time(total_min: int) -> str:
@@ -587,7 +600,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     query($after: ISO8601DateTime, $before: ISO8601DateTime, $first: Int) {
         invoices(inProductionAfter: $after, inProductionBefore: $before, first: $first) {
             nodes {
-                id visualId nickname total
+                id visualId nickname total totalQuantity
                 dueAt startAt
                 status { name }
                 contact { fullName }
@@ -624,12 +637,15 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         prod_dt = (inv.get("startAt") or "")[:10]
         due_dt  = (inv.get("dueAt") or "")[:10]
 
+        # totalQuantity from Step 1 (flat scalar — reliable for most orders)
+        total_qty = int(inv.get("totalQuantity") or 0)
+
         # Header line
         lines.append(f"#{inv.get('visualId')} | {contact} | {inv.get('nickname', '')}")
 
-        # Fetch imprint data
-        fetch_result = _fetch_imprints_for_order(internal_id) if internal_id else None
-        if fetch_result is None:
+        # Fetch imprint data (imprints only — no lineItems nesting)
+        imprint_nodes = _fetch_imprints_for_order(internal_id) if internal_id else None
+        if imprint_nodes is None:
             lines.append(
                 f"  Status: {status} | Prod: {prod_dt} | Due: {due_dt} | "
                 f"⚠️ could not fetch imprint data"
@@ -637,7 +653,11 @@ def get_production_schedule(days_ahead: int = 7) -> str:
             lines.append("")
             continue
 
-        imprint_nodes, total_qty = fetch_result
+        # If Step 1 totalQuantity is 0, fall back to summing line item sizes.
+        # This handles EMB pre-production and some contract orders where
+        # totalQuantity isn't populated until later in the workflow.
+        if total_qty == 0 and internal_id:
+            total_qty = _fetch_qty_from_line_items(internal_id)
 
         if not imprint_nodes:
             # Order is in schedule but has no imprints set in Printavo

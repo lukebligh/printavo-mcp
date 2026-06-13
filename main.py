@@ -1185,9 +1185,9 @@ def duplicate_line_item(line_item_id: str) -> str:
     if not group_id:
         return "Could not determine line item group ID from source item."
 
-    # Rebuild sizes as inline GraphQL enum literals
+    # Sizes from API are already proper enum values (e.g. size_m, size_l) — use directly
     sizes_gql = ", ".join(
-        f'{{size: {_normalize_size_key(s["size"])}, count: {s["count"] or 0}}}'
+        f'{{size: {s["size"]}, count: {s["count"] or 0}}}'
         for s in (src_item.get("sizes") or [])
     )
 

@@ -435,7 +435,6 @@ def diagnose_order(visual_id: str) -> str:
     if not inv:
         return f"Order #{visual_id} not found."
 
-    inv    = matching[0]
     issues = []
 
     # Check header fields

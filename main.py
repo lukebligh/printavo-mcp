@@ -569,7 +569,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     # in direct GraphQL testing. The query-string `production_at >=` syntax
     # is unreliable; named params are the correct approach.
     q_list = """
-    query($after: ISO8601Date, $before: ISO8601Date, $first: Int) {
+    query($after: ISO8601DateTime, $before: ISO8601DateTime, $first: Int) {
         invoices(inProductionAfter: $after, inProductionBefore: $before, first: $first) {
             nodes {
                 id visualId nickname total
@@ -580,7 +580,11 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         }
     }
     """
-    result = query_printavo(q_list, {"after": start_str, "before": end_str, "first": 25})
+    result = query_printavo(q_list, {
+        "after": f"{start_str}T00:00:00Z",
+        "before": f"{end_str}T23:59:59Z",
+        "first": 25,
+    })
     if "error" in result:
         return f"Error: {result['error']}"
     nodes = result.get("invoices", {}).get("nodes", [])

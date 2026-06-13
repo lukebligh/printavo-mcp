@@ -1335,14 +1335,14 @@ def set_order_status(visual_id: str, status_name: str) -> str:
         return err
 
     mutation = """
-    mutation($id: ID!, $statusId: ID!) {
-        statusUpdate(id: $id, input: { statusId: $statusId }) {
+    mutation($parentId: ID!, $statusId: ID!) {
+        statusUpdate(parentId: $parentId, statusId: $statusId) {
             ... on Quote   { id visualId status { name } }
             ... on Invoice { id visualId status { name } }
         }
     }
     """
-    result = query_printavo(mutation, {"id": internal_id, "statusId": status_id})
+    result = query_printavo(mutation, {"parentId": internal_id, "statusId": status_id})
     if "error" in result:
         return f"API Error: {result['error']}"
 

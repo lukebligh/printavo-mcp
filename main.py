@@ -80,11 +80,14 @@ def _color_count(imprint_node: dict) -> int:
 def _fetch_imprints_for_order(internal_id: str) -> list:
     """
     Fetch imprint nodes for a single order by internal ID.
-    Returns a list of imprint dicts with keys: type, colors, col_name.
-    Returns None on API error.
+    Returns (imprint_list, total_qty) or None on API error.
 
     Uses invoice(id) — a single-object query — which reliably traverses
     lineItemGroups.nodes without hitting complexity limits.
+
+    totalQuantity on the invoice node is sometimes 0 even when line items
+    have sizes set (common for EMB/pre-production orders). Fallback: sum
+    sizes directly from lineItems.
     """
     q = """
     query($id: ID!) {
@@ -98,6 +101,11 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
                             pricingMatrixColumn { columnName matrix { name } }
                         }
                     }
+                    lineItems {
+                        nodes {
+                            sizes { size count }
+                        }
+                    }
                 }
             }
         }
@@ -109,6 +117,7 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
     inv = result.get("invoice") or {}
     groups = inv.get("lineItemGroups", {}).get("nodes", [])
     imprints = []
+    computed_qty = 0
     for g in groups:
         for imp in g.get("imprints", {}).get("nodes", []):
             imprints.append({
@@ -116,8 +125,14 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
                 "colors":   _color_count(imp),
                 "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
             })
-    # Also capture totalQuantity from this fetch (more reliable than list query)
-    return imprints, int(inv.get("totalQuantity") or 0)
+        for item in g.get("lineItems", {}).get("nodes", []):
+            computed_qty += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
+
+    # totalQuantity is sometimes 0 for EMB/pre-production orders even when
+    # line items have sizes — fall back to the computed sum in that case.
+    api_qty = int(inv.get("totalQuantity") or 0)
+    total_qty = api_qty if api_qty > 0 else computed_qty
+    return imprints, total_qty
 
 
 def _format_est_time(total_min: int) -> str:

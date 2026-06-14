@@ -124,53 +124,65 @@ _QTY_FRAG = """
 """
 
 
+def _batch_query(id_list: list, prefix: str, field: str, frag: str,
+                 allow_partial: bool = False) -> dict:
+    """
+    Run aliased GraphQL queries for a list of IDs, chunked to stay under the
+    25k complexity limit. Each invoice(id) with lineItemGroups costs ~3,800
+    complexity units, so we use chunks of 5 (5 × 3,800 = 19,000 < 25,000).
+
+    prefix: alias prefix, e.g. "inv" → inv0, inv1 ...
+    field:  top-level field name, e.g. "invoice" or "quote"
+    frag:   field selection body
+    Returns dict: id → raw GraphQL object (or None if not found / error).
+    """
+    CHUNK = 5
+    out = {}
+    for chunk_start in range(0, len(id_list), CHUNK):
+        chunk = id_list[chunk_start:chunk_start + CHUNK]
+        parts = [
+            f'  {prefix}{chunk_start + i}: {field}(id: "{iid}") {{ {frag} }}'
+            for i, iid in enumerate(chunk)
+        ]
+        q = "query {\n" + "\n".join(parts) + "\n}"
+        result = query_printavo(q, allow_partial=allow_partial)
+        if "error" in result:
+            # Chunk failed entirely — mark all as None
+            for iid in chunk:
+                out[iid] = None
+        else:
+            for i, iid in enumerate(chunk):
+                out[iid] = result.get(f"{prefix}{chunk_start + i}")
+    return out
+
+
 def _fetch_imprints_batch(id_list: list) -> dict:
     """
-    Fetch imprint data for multiple orders in ONE GraphQL query using field aliases.
-    Batching eliminates per-order HTTP calls and avoids rate limiting.
-
-    Returns dict: internal_id → list of imprint dicts (or None on error).
-    If an ID resolves as a quote (invoice returns null), that ID is returned
-    with value None so the caller can run a quote fallback batch.
+    Fetch imprint data for a list of orders via chunked invoice(id) queries.
+    Returns dict: internal_id → list of imprint dicts, or None if not found.
+    IDs returning None should be retried via _fetch_imprints_quote_batch.
     """
     if not id_list:
         return {}
-
-    # Build aliased query: inv0: invoice(id: "X") { ... }  inv1: invoice(id: "Y") ...
-    parts = [f'  inv{i}: invoice(id: "{iid}") {{ {_IMPRINT_FRAG} }}'
-             for i, iid in enumerate(id_list)]
-    q = "query {\n" + "\n".join(parts) + "\n}"
-
-    result = query_printavo(q)
-    if "error" in result:
-        # Entire batch failed (e.g. auth error) — signal all as None
-        return {iid: None for iid in id_list}
-
-    out = {}
-    for i, iid in enumerate(id_list):
-        obj = result.get(f"inv{i}")
-        out[iid] = _parse_obj_imprints(obj) if obj is not None else None
-    return out
+    raw = _batch_query(id_list, "inv", "invoice", _IMPRINT_FRAG)
+    return {
+        iid: (_parse_obj_imprints(obj) if obj is not None else None)
+        for iid, obj in raw.items()
+    }
 
 
 def _fetch_imprints_quote_batch(id_list: list) -> dict:
     """
-    Same as _fetch_imprints_batch but queries quote(id) instead of invoice(id).
-    Used as fallback for IDs that returned null from the invoice batch.
+    Quote fallback for IDs that returned null from the invoice batch.
+    Returns dict: internal_id → list of imprint dicts ([] if not a quote).
     """
     if not id_list:
         return {}
-    parts = [f'  qt{i}: quote(id: "{iid}") {{ {_IMPRINT_FRAG} }}'
-             for i, iid in enumerate(id_list)]
-    q = "query {\n" + "\n".join(parts) + "\n}"
-    result = query_printavo(q, allow_partial=True)  # quote "not found" errors are expected
-    if "error" in result:
-        return {iid: None for iid in id_list}
-    out = {}
-    for i, iid in enumerate(id_list):
-        obj = result.get(f"qt{i}")
-        out[iid] = _parse_obj_imprints(obj) if obj is not None else []
-    return out
+    raw = _batch_query(id_list, "qt", "quote", _IMPRINT_FRAG, allow_partial=True)
+    return {
+        iid: (_parse_obj_imprints(obj) if obj is not None else [])
+        for iid, obj in raw.items()
+    }
 
 
 def _fetch_qty_batch(id_list: list) -> dict:
@@ -180,17 +192,11 @@ def _fetch_qty_batch(id_list: list) -> dict:
     """
     if not id_list:
         return {}
-    parts = [f'  inv{i}: invoice(id: "{iid}") {{ {_QTY_FRAG} }}'
-             for i, iid in enumerate(id_list)]
-    q = "query {\n" + "\n".join(parts) + "\n}"
-    result = query_printavo(q)
-    if "error" in result:
-        return {iid: 0 for iid in id_list}
-    out = {}
-    for i, iid in enumerate(id_list):
-        obj = result.get(f"inv{i}")
-        out[iid] = _parse_obj_qty(obj) if obj is not None else 0
-    return out
+    raw = _batch_query(id_list, "inv", "invoice", _QTY_FRAG)
+    return {
+        iid: (_parse_obj_qty(obj) if obj is not None else 0)
+        for iid, obj in raw.items()
+    }
 
 
 def _fetch_qty_from_line_items(internal_id: str) -> int:

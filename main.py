@@ -227,6 +227,21 @@ def _fetch_imprints_for_order(internal_id: str) -> list:
     return None
 
 
+def _sp_run_rate(qty: int) -> int:
+    """
+    Tiered screen-print impressions/hour.
+    Short runs are slower (press setup overhead); long runs get into a groove.
+      ≤ 72 pcs  → 250/hr
+      73–300    → 400/hr
+      301+      → 650/hr
+    """
+    if qty <= 72:
+        return 250
+    if qty <= 300:
+        return 400
+    return 650
+
+
 def _format_est_time(total_min: int) -> str:
     if total_min <= 0:
         return "?"
@@ -775,15 +790,20 @@ def get_production_schedule(days_ahead: int = 7) -> str:
             tg["locations"] += 1
             tg["screens"]   += imp["colors"]
 
-        # Estimate time (SP only; EMB/DTF get flat 15 min/location rough est.)
-        sp_qty    = total_qty * type_groups.get("Screen Print", {}).get("locations", 0)
-        sp_colors = type_groups.get("Screen Print", {}).get("screens", 0)
-        sp_run_min = int((sp_qty * (sp_colors or 1)) / 350 * 60) if sp_qty else 0
+        # Estimate time
+        # Setup:   screens × 8 min (burn + press setup per screen)
+        # SP run:  (qty × sp_locations) / tiered_rate × 60
+        # EMB/DTF: 15 min per location (rough)
+        sp_locs    = type_groups.get("Screen Print", {}).get("locations", 0)
+        sp_screens = type_groups.get("Screen Print", {}).get("screens", 0)
+        sp_imprints = total_qty * sp_locs
+        rate        = _sp_run_rate(total_qty)
+        sp_run_min  = int(sp_imprints / rate * 60) if sp_imprints else 0
         emb_dtf_min = (
             type_groups.get("Embroidery", {}).get("locations", 0) +
             type_groups.get("DTF", {}).get("locations", 0)
         ) * 15
-        setup_min  = num_locations * 30
+        setup_min  = sp_screens * 8
         total_min  = setup_min + sp_run_min + emb_dtf_min
         est_time   = _format_est_time(total_min)
 
@@ -883,10 +903,14 @@ def get_production_time_estimate(visual_id: str) -> str:
     total_prints = len(imprint_info)
 
     if total_qty > 0 and imprint_info:
-        sp_items = [(i["colors"] or 1) for i in imprint_info if i["type"] == "Screen Print"]
-        sp_run_min  = int(sum(total_qty * c for c in sp_items) / 350 * 60) if sp_items else 0
+        sp_info     = [i for i in imprint_info if i["type"] == "Screen Print"]
+        sp_locs     = len(sp_info)
+        sp_screens  = sum(i["colors"] for i in sp_info)
+        sp_imprints = total_qty * sp_locs
+        rate        = _sp_run_rate(total_qty)
+        sp_run_min  = int(sp_imprints / rate * 60) if sp_imprints else 0
         emb_dtf_min = sum(15 for i in imprint_info if i["type"] in ("Embroidery", "DTF"))
-        setup_min   = total_prints * 30
+        setup_min   = sp_screens * 8
         total_min   = setup_min + sp_run_min + emb_dtf_min
     else:
         total_min = 0
@@ -897,7 +921,7 @@ def get_production_time_estimate(visual_id: str) -> str:
         f"  Print Locations: {total_prints}",
         f"  Imprint Details: {imprint_info}",
         f"  TOTAL ESTIMATE:  {_format_est_time(total_min)} ({total_min} min)",
-        f"  Note: Estimates based on ~350 SP impressions/hr. Actual times vary.",
+        f"  Note: Tiered SP rate — ≤72 pcs: 250/hr | 73–300: 400/hr | 301+: 650/hr.",
     ]
     return "\n".join(lines)
 

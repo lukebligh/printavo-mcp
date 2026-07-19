@@ -13,8 +13,48 @@ mcp = FastMCP("Printavo Assistant")
 
 EMAIL            = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN            = os.environ.get("PRINTAVO_TOKEN", "")
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")      # production briefing → #all-est-merch
+CX_SLACK_WEBHOOK_URL = os.environ.get("CX_SLACK_WEBHOOK_URL", "") # CX digest → #cx-daily ONLY
 API_URL          = "https://www.printavo.com/api/v2"
+
+def _dry_run() -> bool:
+    """DRY_RUN=true → digest logs/returns text instead of posting to Slack."""
+    return os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+
+# ── STATUS NAMES — single source of truth ─────────────────────────────────────
+# Every Printavo status name this codebase references lives HERE and nowhere
+# else. A rename in Printavo = a one-line edit in this dict. All matching is
+# CASE-INSENSITIVE (see _norm_status / _status_matches).
+STATUS_NAMES = {
+    # CX digest Z1 — wellness calls
+    "QUOTE_APPROVED":           "QUOTE APPROVED",
+    # CX digest Z2 — lingering pickups
+    "READY_FOR_PICKUP":         "Ready for Pickup",
+    # CX digest Z3 — approval / mock-up chase
+    "QUOTE_APPROVAL_SENT":      "QUOTE APPROVAL SENT",
+    "ART_APPROVAL_SENT":        "ART APPROVAL SENT",
+    "MOCKUP_REQUESTED":         "MOCK-UP REQUESTED",
+    # CX digest Z4 — blocked
+    "CONTRACT_WAITING_ARTWORK": "CONTRACT - WAITING ON ARTWORK",
+    "CONTRACT_WAITING_GOODS":   "CONTRACT - WAITING ON GOODS",
+    "EMB_DIGITIZING":           "EMB - Digitizing",
+    "PROMO_ON_ORDER":           "Promo - On Order",
+    # Lifecycle statuses used by the Cowork skills
+    "SHIPPED":                  "SHIPPED",
+    "INVOICED":                 "INVOICED",  # formerly "ORDER SHIPPED & INVOICED"
+    "MOCKUP_READY":             "MOCK-UP READY",
+    "PICKED_UP":                "Picked Up",
+}
+
+
+def _norm_status(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+def _status_matches(live_name: str, key: str) -> bool:
+    """Case-insensitive: does a live Printavo status name equal STATUS_NAMES[key]?"""
+    return _norm_status(live_name) == _norm_status(STATUS_NAMES[key])
 
 # ── CORE HELPER ───────────────────────────────────────────────────────────────
 def query_printavo(query: str, variables: dict = None, allow_partial: bool = False):
@@ -33,6 +73,101 @@ def query_printavo(query: str, variables: dict = None, allow_partial: bool = Fal
     if has_errors and (not allow_partial or not has_data):
         return {"error": data["errors"]}
     return data.get("data", {})
+
+
+# ── PAGINATION — permanent fix for the 25-record cap ─────────────────────────
+# Printavo API v2 uses Relay-style cursor pagination (first/after, pageInfo
+# { hasNextPage endCursor }) and enforces a HARD per-request maximum of 25:
+#   invoices(first: 100) → error "'first' must not be greater than 25"
+#   statuses(first: 50)  → SILENTLY clamps to 25 (no error)
+# The only correct fix is walking pages. Printavo also has a SILENT rate
+# limit — rapid sequential calls return empty pages with no error — so we
+# sleep PAGE_DELAY_S between pages and retry empty pages with exponential
+# backoff (3 tries).
+MAX_PAGE_SIZE = 25
+PAGE_DELAY_S  = 0.4
+EMPTY_RETRIES = 3
+
+
+def _dig(data, path):
+    for k in path:
+        data = (data or {}).get(k) or {}
+    return data
+
+
+def paginate(query: str, variables: dict = None, connection_path=("invoices",),
+             max_records: int = None, max_pages: int = 400) -> dict:
+    """
+    Fetch EVERY node of a Relay connection — always returns the complete set
+    (or up to max_records if given).
+
+    `query` must declare $first and $after and select
+    `pageInfo { hasNextPage endCursor }` (and ideally `totalNodes`) on the
+    connection named by connection_path.
+
+    Returns {"nodes": [...], "totalNodes": int|None, "pages": int,
+             "throttled": int} — plus "error" only on hard failure.
+    """
+    variables = dict(variables or {})
+    nodes, total_nodes, throttled = [], None, 0
+    after, page = None, 0
+    while page < max_pages:
+        variables["first"] = MAX_PAGE_SIZE
+        variables["after"] = after
+        conn = None
+        for attempt in range(EMPTY_RETRIES):
+            r = query_printavo(query, variables)
+            if isinstance(r, dict) and "error" in r:
+                return {"nodes": nodes, "totalNodes": total_nodes, "pages": page,
+                        "throttled": throttled, "error": r["error"]}
+            c = _dig(r, connection_path)
+            if c.get("nodes"):
+                conn = c
+                break
+            # Empty page. Legit only if the whole result set is empty
+            # (page 0, no next page) — and even then we confirm once, since
+            # the silent rate limit returns exactly this shape.
+            legit_empty = (page == 0
+                           and not (c.get("pageInfo") or {}).get("hasNextPage"))
+            if legit_empty and attempt >= 1:
+                conn = c
+                break
+            throttled += 1
+            time.sleep(0.8 * (2 ** attempt))  # 0.8s → 1.6s → 3.2s
+        if conn is None:
+            return {"nodes": nodes, "totalNodes": total_nodes, "pages": page,
+                    "throttled": throttled,
+                    "error": (f"Page {page + 1} came back empty {EMPTY_RETRIES} "
+                              f"times — silent rate limit suspected.")}
+        if conn.get("totalNodes") is not None:
+            total_nodes = conn["totalNodes"]
+        nodes.extend(conn.get("nodes") or [])
+        page += 1
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage") or not pi.get("endCursor"):
+            break
+        if max_records is not None and len(nodes) >= max_records:
+            break
+        after = pi["endCursor"]
+        time.sleep(PAGE_DELAY_S)
+    if max_records is not None:
+        nodes = nodes[:max_records]
+    return {"nodes": nodes, "totalNodes": total_nodes, "pages": page,
+            "throttled": throttled}
+
+
+def fetch_all_statuses() -> dict:
+    """Return EVERY status in the account (beats the 25-per-page cap)."""
+    q = """
+    query($first: Int, $after: String) {
+        statuses(first: $first, after: $after) {
+            totalNodes
+            nodes { id name color }
+            pageInfo { hasNextPage endCursor }
+        }
+    }
+    """
+    return paginate(q, connection_path=("statuses",))
 
 
 # ── DECORATION TYPE HELPERS ───────────────────────────────────────────────────
@@ -259,8 +394,10 @@ def _format_est_time(total_min: int) -> str:
 def get_recent_orders(limit: int = 10) -> str:
     """Get the most recent Printavo orders."""
     q = """
-    query($first: Int) {
-        invoices(first: $first) {
+    query($first: Int, $after: String) {
+        invoices(first: $first, after: $after) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
             nodes {
                 id
                 visualId
@@ -274,10 +411,10 @@ def get_recent_orders(limit: int = 10) -> str:
         }
     }
     """
-    result = query_printavo(q, {"first": limit})
+    result = paginate(q, max_records=limit)
     if "error" in result:
         return f"Error: {result['error']}"
-    nodes = result.get("invoices", {}).get("nodes", [])
+    nodes = result.get("nodes", [])
     if not nodes:
         return "No recent orders found."
     lines = [f"RECENT ORDERS (last {len(nodes)}):"]
@@ -301,8 +438,10 @@ def search_orders(query: str, limit: int = 10) -> str:
     query: search string (e.g. '6817', 'Underground Printing', 'BEBT')
     """
     q = """
-    query($q: String, $first: Int) {
-        invoices(first: $first, query: $q) {
+    query($q: String, $first: Int, $after: String) {
+        invoices(first: $first, after: $after, query: $q) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
             nodes {
                 id
                 visualId
@@ -315,10 +454,10 @@ def search_orders(query: str, limit: int = 10) -> str:
         }
     }
     """
-    result = query_printavo(q, {"q": query, "first": limit})
+    result = paginate(q, {"q": query}, max_records=limit)
     if "error" in result:
         return f"Error: {result['error']}"
-    nodes = result.get("invoices", {}).get("nodes", [])
+    nodes = result.get("nodes", [])
     if not nodes:
         return f"No orders found matching '{query}'."
     lines = [f"SEARCH RESULTS for '{query}' ({len(nodes)} found):"]
@@ -412,21 +551,14 @@ def get_order_details(visual_id: str) -> str:
 
 @mcp.tool()
 def get_statuses() -> str:
-    """List all available order statuses in Printavo."""
-    q = """
-    query {
-        statuses(first: 50) {
-            nodes { id name color }
-        }
-    }
-    """
-    result = query_printavo(q)
+    """List ALL available order statuses in Printavo (paginated — complete set)."""
+    result = fetch_all_statuses()
     if "error" in result:
         return f"Error: {result['error']}"
-    nodes = result.get("statuses", {}).get("nodes", [])
+    nodes = result.get("nodes", [])
     if not nodes:
         return "No statuses found."
-    lines = ["AVAILABLE STATUSES:"]
+    lines = [f"AVAILABLE STATUSES ({len(nodes)} of {result.get('totalNodes')} total):"]
     for s in nodes:
         lines.append(f"  ID: {s.get('id')} | Name: {s.get('name')} | Color: {s.get('color','')}")
     return "\n".join(lines)
@@ -436,8 +568,10 @@ def get_statuses() -> str:
 def get_outstanding_balances(limit: int = 20) -> str:
     """Get orders with outstanding balances (unpaid invoices)."""
     q = """
-    query($first: Int) {
-        invoices(first: $first, query: "balance_due > 0") {
+    query($first: Int, $after: String) {
+        invoices(first: $first, after: $after, query: "balance_due > 0") {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
             nodes {
                 visualId
                 nickname
@@ -450,10 +584,10 @@ def get_outstanding_balances(limit: int = 20) -> str:
         }
     }
     """
-    result = query_printavo(q, {"first": limit})
+    result = paginate(q, max_records=limit)
     if "error" in result:
         return f"Error: {result['error']}"
-    nodes = result.get("invoices", {}).get("nodes", [])
+    nodes = result.get("nodes", [])
     if not nodes:
         return "No outstanding balances found."
     lines = [f"OUTSTANDING BALANCES ({len(nodes)} orders):"]
@@ -691,8 +825,10 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     # in direct GraphQL testing. The query-string `production_at >=` syntax
     # is unreliable; named params are the correct approach.
     q_list = """
-    query($after: ISO8601DateTime, $before: ISO8601DateTime, $first: Int) {
-        invoices(inProductionAfter: $after, inProductionBefore: $before, first: $first) {
+    query($prodAfter: ISO8601DateTime, $prodBefore: ISO8601DateTime, $first: Int, $after: String) {
+        invoices(inProductionAfter: $prodAfter, inProductionBefore: $prodBefore, first: $first, after: $after) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
             nodes {
                 id visualId nickname total totalQuantity
                 dueAt startAt
@@ -702,14 +838,13 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         }
     }
     """
-    result = query_printavo(q_list, {
-        "after": f"{start_str}T00:00:00Z",
-        "before": f"{end_str}T23:59:59Z",
-        "first": 25,
+    result = paginate(q_list, {
+        "prodAfter": f"{start_str}T00:00:00Z",
+        "prodBefore": f"{end_str}T23:59:59Z",
     })
     if "error" in result:
         return f"Error: {result['error']}"
-    nodes = result.get("invoices", {}).get("nodes", [])
+    nodes = result.get("nodes", [])
     if not nodes:
         return f"No orders scheduled for production in the next {days_ahead} days."
 
@@ -960,13 +1095,13 @@ def _find_order(visual_id: str):
 
 
 def _get_status_id_by_name(status_name: str):
-    q = """query { statuses(first: 50) { nodes { id name } } }"""
-    result = query_printavo(q)
+    """Case-insensitive status lookup over the COMPLETE paginated status list."""
+    result = fetch_all_statuses()
     if "error" in result:
         return None, f"API Error: {result['error']}"
-    statuses = result.get("statuses", {}).get("nodes", [])
+    statuses = result.get("nodes", [])
     for s in statuses:
-        if s.get("name", "").lower().strip() == status_name.lower().strip():
+        if _norm_status(s.get("name")) == _norm_status(status_name):
             return s["id"], None
     names = [s.get("name") for s in statuses]
     return None, f"Status '{status_name}' not found. Available: {names}"
@@ -1589,6 +1724,354 @@ def list_available_mutations() -> str:
     return "AVAILABLE MUTATIONS:\n" + "\n".join(f"  {n}" for n in fields)
 
 
+# ── DAILY CX DIGEST ───────────────────────────────────────────────────────────
+# Weekday 8:00 AM America/Chicago Slack digest with four sections:
+#   Z1 WELLNESS CALLS   — entered "Quote Approved" the previous business day
+#   Z2 LINGERING PICKUPS — in "Ready for Pickup" > 2 days
+#   Z3 APPROVAL/MOCK-UP CHASE — approval/mock-up statuses > 3 days
+#   Z4 BLOCKED          — waiting statuses > 5 days
+#
+# STATUS-AGE SOURCE: the schema has NO status-change timestamp on Invoice
+# (Invoice.timestamps is only createdAt/updatedAt, and updatedAt bumps on ANY
+# edit) — so days-in-status comes from a snapshot store persisted to JSON:
+#   {order_id: {"status": name, "first_seen": iso, "z1_reported": bool}}
+# Every run (scheduled or manual) does a full paginated scan of tracked
+# statuses and updates the snapshot. Day counts start from the first run that
+# saw the order in its current status — Z2–Z4 will fill in as the snapshot
+# ages after first deploy.
+
+# (zid, header, intro line, STATUS_NAMES keys, min days-in-status or None for Z1)
+# Copy approved by Luke 2026-07-19 — edit wording here only.
+DIGEST_SECTIONS = [
+    ("Z1", "📞 Wellness Calls",
+     "these customers approved their quote yesterday. A 2-minute \"got it, "
+     "here's what happens next\" call today buys a lot of goodwill later.",
+     ["QUOTE_APPROVED"], None),
+    ("Z2", "📦 Lingering Pickups",
+     "ready and waiting on the shelf more than 2 days. Nudge them — done work "
+     "sitting here is cash we haven't collected and space we don't have.",
+     ["READY_FOR_PICKUP"], 2),
+    ("Z3", "✏️ Approval / Mock-Up Chase",
+     "waiting on the customer to approve a quote, art, or mock-up for 3+ days. "
+     "One friendly bump usually shakes these loose.",
+     ["QUOTE_APPROVAL_SENT", "ART_APPROVAL_SENT", "MOCKUP_REQUESTED"], 3),
+    ("Z4", "🚧 Blocked",
+     "stuck 5+ days waiting on artwork, goods, digitizing, or promo stock. "
+     "These don't fix themselves — each one needs a chase or a decision today.",
+     ["CONTRACT_WAITING_ARTWORK", "CONTRACT_WAITING_GOODS",
+      "EMB_DIGITIZING", "PROMO_ON_ORDER"], 5),
+]
+
+
+def _central_now() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Chicago"))
+    except Exception:
+        # Fallback if tzdata is unavailable: fixed CST (no DST)
+        return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-6)))
+
+
+def _snapshot_path() -> str:
+    p = os.environ.get("STATUS_SNAPSHOT_PATH", "")
+    if p:
+        return p
+    if os.path.isdir("/data"):  # Railway volume default mount
+        return "/data/status_snapshot.json"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "status_snapshot.json")
+
+
+def _load_snapshot() -> dict:
+    try:
+        with open(_snapshot_path(), "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_snapshot(snap: dict):
+    path = _snapshot_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(snap, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass  # snapshot persistence is best-effort; never kill a digest run
+
+
+def _tracked_status_keys() -> list:
+    keys = []
+    for _z, _header, _intro, section_keys, _days in DIGEST_SECTIONS:
+        keys.extend(section_keys)
+    return keys
+
+
+def _fetch_tracked_orders() -> dict:
+    """
+    Full paginated scan of every order (invoices AND quotes) currently in a
+    digest-tracked status. Tries the server-side statusIds filter first;
+    falls back to an unfiltered walk with client-side filtering.
+    Returns {"orders": [...], "missing_statuses": [...]} or {"error": ...}.
+    """
+    sres = fetch_all_statuses()
+    if "error" in sres:
+        return {"error": f"Could not fetch statuses: {sres['error']}"}
+    live_by_norm = {_norm_status(s["name"]): s["id"] for s in sres["nodes"]}
+
+    tracked_norms, status_ids, missing = set(), [], []
+    for key in _tracked_status_keys():
+        norm = _norm_status(STATUS_NAMES[key])
+        tracked_norms.add(norm)
+        if norm in live_by_norm:
+            status_ids.append(live_by_norm[norm])
+        else:
+            missing.append(STATUS_NAMES[key])
+
+    frag = """
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes {
+                id visualId nickname total
+                status { name }
+                contact { fullName customer { companyName } }
+            }
+    """
+    orders, seen = [], set()
+    for field in ("invoices", "quotes"):
+        q_filtered = f"""
+        query($first: Int, $after: String, $statusIds: [ID!]) {{
+            {field}(first: $first, after: $after, statusIds: $statusIds) {{ {frag} }}
+        }}
+        """
+        r = paginate(q_filtered, {"statusIds": status_ids},
+                     connection_path=(field,))
+        if "error" in r:
+            # statusIds arg rejected or filter failed → unfiltered walk
+            q_all = f"""
+            query($first: Int, $after: String) {{
+                {field}(first: $first, after: $after) {{ {frag} }}
+            }}
+            """
+            r = paginate(q_all, connection_path=(field,))
+            if "error" in r:
+                return {"error": f"{field} scan failed: {r['error']}"}
+        for n in r["nodes"]:
+            status_name = (n.get("status") or {}).get("name", "")
+            if _norm_status(status_name) not in tracked_norms:
+                continue
+            oid = str(n.get("id"))
+            if oid in seen:
+                continue
+            seen.add(oid)
+            contact = n.get("contact") or {}
+            company = ((contact.get("customer") or {}).get("companyName")
+                       or contact.get("fullName") or "—")
+            orders.append({
+                "id": oid,
+                "visualId": n.get("visualId"),
+                "nickname": n.get("nickname") or "",
+                "total": float(n.get("total") or 0),
+                "status": status_name,
+                "company": company,
+                "kind": field,  # "invoices" | "quotes"
+            })
+    return {"orders": orders, "missing_statuses": missing}
+
+
+def _update_snapshot(orders: list, now_utc: datetime):
+    """Persist {id: {status, first_seen, z1_reported}}; reset first_seen on
+    any status change; prune orders no longer in a tracked status."""
+    snap = _load_snapshot()
+    new_snap = {}
+    for o in orders:
+        prev = snap.get(o["id"])
+        if prev and _norm_status(prev.get("status")) == _norm_status(o["status"]):
+            new_snap[o["id"]] = prev
+        else:
+            new_snap[o["id"]] = {"status": o["status"],
+                                 "first_seen": now_utc.isoformat(),
+                                 "z1_reported": False}
+    _save_snapshot(new_snap)
+    return new_snap
+
+
+def _digest_line(o: dict, days: float) -> str:
+    path = "invoices" if o["kind"] == "invoices" else "quotes"
+    url = f"https://www.printavo.com/{path}/{o['id']}"
+    nickname = o["nickname"] or "(no nickname)"
+    return (f"• <{url}|#{o['visualId']}> — {o['company']} — {nickname} — "
+            f"{int(days)}d — ${o['total']:,.2f}")
+
+
+def _build_cx_digest():
+    """Returns (digest_text, z1_ids_to_mark) or (error_text, None)."""
+    now_utc = datetime.now(timezone.utc)
+    now_ct = _central_now()
+
+    fetched = _fetch_tracked_orders()
+    if "error" in fetched:
+        return f"CX DIGEST ERROR: {fetched['error']}", None
+    orders = fetched["orders"]
+    snap = _update_snapshot(orders, now_utc)
+
+    def days_in_status(o):
+        e = snap.get(o["id"]) or {}
+        try:
+            first_seen = datetime.fromisoformat(e["first_seen"])
+        except Exception:
+            return 0.0
+        return (now_utc - first_seen).total_seconds() / 86400.0
+
+    try:
+        date_str = now_ct.strftime("%A, %B %-d")   # "Monday, July 20" (Linux)
+    except ValueError:
+        date_str = now_ct.strftime("%A, %B %d")
+    lines = [
+        f"☕ *CX Daily — {date_str}*",
+        "Four lists, one pass, before the phones start. "
+        "Links go straight to the invoice.",
+    ]
+    z1_ids = []
+    for z, header, intro, section_keys, min_days in DIGEST_SECTIONS:
+        norms = {_norm_status(STATUS_NAMES[k]) for k in section_keys}
+        if min_days is None:
+            # Z1: entered Quote Approved since the previous business day's run.
+            # Snapshot-based: anything newly seen in this status that hasn't
+            # been reported yet (Fri/Sat/Sun approvals roll into Monday's run
+            # automatically, since no runs happen on weekends).
+            hits = [o for o in orders
+                    if _norm_status(o["status"]) in norms
+                    and not (snap.get(o["id"]) or {}).get("z1_reported")]
+            z1_ids = [o["id"] for o in hits]
+        else:
+            hits = [o for o in orders
+                    if _norm_status(o["status"]) in norms
+                    and days_in_status(o) > min_days]
+        hits.sort(key=days_in_status, reverse=True)
+        lines.append(f"\n*{header}* — _{intro}_")
+        if hits:
+            for o in hits:
+                lines.append(_digest_line(o, days_in_status(o)))
+        else:
+            lines.append("— none —")
+
+    if fetched["missing_statuses"]:
+        lines.append("\n⚠️ Status names in STATUS_NAMES not found in Printavo "
+                     f"(renamed?): {fetched['missing_statuses']}")
+    return "\n".join(lines), z1_ids
+
+
+def _post_to_slack(text: str, webhook_url: str):
+    """Post to whichever channel's webhook it is handed. The CX digest hands
+    this CX_SLACK_WEBHOOK_URL and NEVER SLACK_WEBHOOK_URL (production channel)."""
+    if not webhook_url:
+        return "Error: target Slack webhook env var not set."
+    resp = httpx.post(webhook_url, json={"text": text}, timeout=15)
+    if resp.status_code == 200:
+        return None
+    return f"Slack error: HTTP {resp.status_code} — {resp.text[:200]}"
+
+
+def _mark_z1_reported(ids: list):
+    if not ids:
+        return
+    snap = _load_snapshot()
+    for oid in ids:
+        if oid in snap:
+            snap[oid]["z1_reported"] = True
+    _save_snapshot(snap)
+
+
+def _run_cx_digest_impl(force_dry_run: bool = False) -> str:
+    text, z1_ids = _build_cx_digest()
+    if z1_ids is None:
+        return text  # error
+    if force_dry_run or _dry_run():
+        print(f"[CX DIGEST — DRY RUN]\n{text}", flush=True)
+        return f"[DRY RUN — not posted to Slack]\n\n{text}"
+    if not CX_SLACK_WEBHOOK_URL:
+        # Hard rule: CX content NEVER goes to SLACK_WEBHOOK_URL. No fallback.
+        print(f"[CX DIGEST] CX_SLACK_WEBHOOK_URL not set — NOT posting.\n{text}",
+              flush=True)
+        return ("Error: CX_SLACK_WEBHOOK_URL not set. CX digest does not fall "
+                f"back to the production webhook.\n\n{text}")
+    err = _post_to_slack(text, CX_SLACK_WEBHOOK_URL)
+    if err:
+        return f"{err}\n\nDigest that failed to post:\n{text}"
+    _mark_z1_reported(z1_ids)
+    return f"Posted to #cx-daily ✓\n\n{text}"
+
+
+@mcp.tool()
+def run_cx_digest(dry_run: bool = False) -> str:
+    """
+    Build and post the daily CX digest (Z1 wellness calls, Z2 lingering
+    pickups, Z3 approval/mock-up chase, Z4 blocked) right now, without
+    waiting for the 8 AM schedule. dry_run=True (or env DRY_RUN=true)
+    returns the digest text instead of posting to Slack.
+    """
+    return _run_cx_digest_impl(force_dry_run=dry_run)
+
+
+@mcp.tool()
+def printavo_health_check(full_invoice_walk: bool = False) -> str:
+    """
+    Prove the 25-record cap is beaten: walks the complete status list and
+    reports true status + invoice counts (API totalNodes vs records actually
+    retrieved). full_invoice_walk=True walks every invoice page (slow).
+    """
+    s = fetch_all_statuses()
+    if "error" in s:
+        return f"Health check FAILED on statuses: {s['error']}"
+    inv_q = """
+    query($first: Int, $after: String) {
+        invoices(first: $first, after: $after) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes { id }
+        }
+    }
+    """
+    inv = paginate(inv_q, max_records=None if full_invoice_walk else 60)
+    if "error" in inv:
+        return f"Health check FAILED on invoices: {inv['error']}"
+    cap_beaten = len(s["nodes"]) > 25 or len(inv["nodes"]) > 25
+    return "\n".join([
+        "PRINTAVO PAGINATOR HEALTH CHECK",
+        f"  Statuses: {len(s['nodes'])} retrieved / {s.get('totalNodes')} total "
+        f"(pages: {s['pages']}, throttle retries: {s['throttled']})",
+        f"  Invoices: {len(inv['nodes'])} retrieved / {inv.get('totalNodes')} total "
+        f"(pages: {inv['pages']}, throttle retries: {inv['throttled']}"
+        f"{'' if full_invoice_walk else ', capped at 60 for speed — pass full_invoice_walk=true for the full walk'})",
+        f"  Snapshot store: {_snapshot_path()} "
+        f"({len(_load_snapshot())} orders tracked)",
+        f"  DRY_RUN: {_dry_run()}",
+        f"  25-cap beaten: {'YES ✓' if cap_beaten else 'NOT PROVEN — fewer than 26 records exist or walk failed'}",
+    ])
+
+
+_last_digest_date = None
+
+def run_cx_digest_scheduler():
+    """Background thread: post the CX digest at 8:00 AM America/Chicago,
+    weekdays, skipping federal holidays. DST-correct via zoneinfo."""
+    global _last_digest_date
+    while True:
+        try:
+            now_ct = _central_now()
+            if (now_ct.weekday() < 5
+                    and not _is_us_federal_holiday(now_ct)
+                    and now_ct.hour == 8 and now_ct.minute < 10
+                    and _last_digest_date != now_ct.date().isoformat()):
+                _last_digest_date = now_ct.date().isoformat()
+                _run_cx_digest_impl()
+        except Exception as e:
+            print(f"[CX DIGEST] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
 # ── DAILY SLACK SCHEDULER ─────────────────────────────────────────────────────
 
 def _is_us_federal_holiday(dt: datetime) -> bool:
@@ -1622,6 +2105,9 @@ def run_daily_scheduler():
 
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
 scheduler_thread.start()
+
+cx_digest_thread = threading.Thread(target=run_cx_digest_scheduler, daemon=True)
+cx_digest_thread.start()
 
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))

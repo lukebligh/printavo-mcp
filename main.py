@@ -38,7 +38,6 @@ STATUS_NAMES = {
     # CX digest Z4 — blocked
     "CONTRACT_WAITING_ARTWORK": "CONTRACT - WAITING ON ARTWORK",
     "CONTRACT_WAITING_GOODS":   "CONTRACT - WAITING ON GOODS",
-    "EMB_DIGITIZING":           "EMB - Digitizing",  # NOT in Printavo yet (2026-07-19) — digest warns until added
     "PROMO_ON_ORDER":           "PROMO - ORDER",
     # Lifecycle statuses used by the Cowork skills
     "SHIPPED":                  "SHIPPED",
@@ -1756,10 +1755,10 @@ DIGEST_SECTIONS = [
      "One friendly bump usually shakes these loose.",
      ["QUOTE_APPROVAL_SENT", "ART_APPROVAL_SENT", "MOCKUP_REQUESTED"], 3),
     ("Z4", "🚧 Blocked",
-     "stuck 5+ days waiting on artwork, goods, digitizing, or promo stock. "
+     "stuck 5+ days waiting on artwork, goods, or promo stock. "
      "These don't fix themselves — each one needs a chase or a decision today.",
      ["CONTRACT_WAITING_ARTWORK", "CONTRACT_WAITING_GOODS",
-      "EMB_DIGITIZING", "PROMO_ON_ORDER"], 5),
+      "PROMO_ON_ORDER"], 5),
 ]
 
 
@@ -2088,19 +2087,155 @@ def _is_us_federal_holiday(dt: datetime) -> bool:
     return False
 
 
+def _build_daily_production_message() -> str:
+    """TODAY's production schedule for #all-est-merch, grouped by decoration
+    type (Screen Print / Embroidery / DTF). Uses the fetch-all paginator."""
+    now_ct = _central_now()
+    day_str = now_ct.strftime("%Y-%m-%d")
+    q_list = """
+    query($prodAfter: ISO8601DateTime, $prodBefore: ISO8601DateTime, $first: Int, $after: String) {
+        invoices(inProductionAfter: $prodAfter, inProductionBefore: $prodBefore, first: $first, after: $after) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes {
+                id visualId nickname totalQuantity
+                status { name }
+                contact { fullName customer { companyName } }
+            }
+        }
+    }
+    """
+    result = paginate(q_list, {
+        "prodAfter": f"{day_str}T00:00:00Z",
+        "prodBefore": f"{day_str}T23:59:59Z",
+    })
+    try:
+        date_str = now_ct.strftime("%A, %B %-d")
+    except ValueError:
+        date_str = now_ct.strftime("%A, %B %d")
+    header = f"🏭 *Production Today — {date_str}*"
+    if "error" in result:
+        return f"{header}\n⚠️ Could not pull the schedule: {result['error']}"
+    nodes = result.get("nodes", [])
+    if not nodes:
+        return f"{header}\nNothing on the production schedule today."
+
+    ids = [n["id"] for n in nodes if n.get("id")]
+    imprint_map = _fetch_imprints_batch(ids)
+    null_ids = [i for i, v in imprint_map.items() if v is None]
+    if null_ids:
+        imprint_map.update(_fetch_imprints_quote_batch(null_ids))
+    zero_ids = [n["id"] for n in nodes
+                if n.get("id") and int(n.get("totalQuantity") or 0) == 0]
+    qty_map = _fetch_qty_batch(zero_ids) if zero_ids else {}
+
+    sections = {"Screen Print": [], "Embroidery": [], "DTF": []}
+    totals = {t: {"orders": 0, "pcs": 0, "imprints": 0, "screens": 0, "minutes": 0}
+              for t in sections}
+
+    for n in nodes:
+        iid = n.get("id")
+        qty = int(n.get("totalQuantity") or 0) or qty_map.get(iid, 0)
+        status = (n.get("status") or {}).get("name", "?")
+        contact = n.get("contact") or {}
+        company = ((contact.get("customer") or {}).get("companyName")
+                   or contact.get("fullName") or "—")
+        nickname = n.get("nickname") or "(no nickname)"
+        imprints = imprint_map.get(iid) or []
+
+        if not imprints:
+            sections["Screen Print"].append(
+                f"• #{n.get('visualId')} — {company} — {nickname} — {qty} pcs — "
+                f"⚠️ no imprints entered — {status}")
+            totals["Screen Print"]["orders"] += 1
+            totals["Screen Print"]["pcs"] += qty
+            continue
+
+        by_type = defaultdict(lambda: {"locs": 0, "screens": 0})
+        for imp in imprints:
+            g = by_type[imp["type"]]
+            g["locs"] += 1
+            g["screens"] += imp["colors"]
+
+        for deco, g in by_type.items():
+            sections.setdefault(deco, [])
+            totals.setdefault(deco, {"orders": 0, "pcs": 0, "imprints": 0,
+                                     "screens": 0, "minutes": 0})
+            type_imprints = qty * g["locs"]
+            if deco == "Screen Print":
+                rate = _sp_run_rate(qty)
+                minutes = g["screens"] * 8 + (int(type_imprints / rate * 60)
+                                              if type_imprints else 0)
+            else:
+                minutes = g["locs"] * 15
+            scr = (f" | {g['screens']} screen{'s' if g['screens'] != 1 else ''}"
+                   if deco == "Screen Print" and g["screens"] else "")
+            sections[deco].append(
+                f"• #{n.get('visualId')} — {company} — {nickname} — "
+                f"{qty} pcs × {g['locs']} loc = {type_imprints} imprints{scr} — {status}")
+            t = totals[deco]
+            t["orders"] += 1
+            t["pcs"] += qty
+            t["imprints"] += type_imprints
+            t["screens"] += g["screens"]
+            t["minutes"] += minutes
+
+    lines = [header]
+    for deco, order_lines in sections.items():
+        if not order_lines:
+            lines.append(f"\n*{deco}*\n— none —")
+            continue
+        t = totals[deco]
+        hdr = (f"\n*{deco}* — {t['orders']} order{'s' if t['orders'] != 1 else ''} | "
+               f"{t['pcs']} pcs | {t['imprints']} imprints")
+        if deco == "Screen Print" and t["screens"]:
+            hdr += f" | {t['screens']} screens"
+        if t["minutes"]:
+            hdr += f" | est {_format_est_time(t['minutes'])}"
+        lines.append(hdr)
+        lines.extend(order_lines)
+    return "\n".join(lines)
+
+
+def _run_production_push_impl(force_dry_run: bool = False) -> str:
+    text = _build_daily_production_message()
+    if force_dry_run or _dry_run():
+        print(f"[PROD PUSH — DRY RUN]\n{text}", flush=True)
+        return f"[DRY RUN — not posted to Slack]\n\n{text}"
+    err = _post_to_slack(text, SLACK_WEBHOOK_URL)
+    if err:
+        return f"{err}\n\nMessage that failed to post:\n{text}"
+    return f"Posted to #all-est-merch ✓\n\n{text}"
+
+
+@mcp.tool()
+def run_production_push(dry_run: bool = False) -> str:
+    """
+    Build and post TODAY's production schedule (grouped by decoration type)
+    to #all-est-merch right now, without waiting for the 7 AM schedule.
+    dry_run=True (or env DRY_RUN=true) returns the text instead of posting.
+    """
+    return _run_production_push_impl(force_dry_run=dry_run)
+
+
+_last_prod_push_date = None
+
 def run_daily_scheduler():
-    """Background thread: post production schedule to Slack at 6am CST weekdays."""
-    CST_OFFSET = timedelta(hours=-6)
+    """Background thread: post TODAY's production schedule to #all-est-merch
+    at 7:00 AM America/Chicago, weekdays, skipping federal holidays."""
+    global _last_prod_push_date
     while True:
-        now_cst = datetime.now(timezone.utc) + CST_OFFSET
-        if now_cst.weekday() < 5 and not _is_us_federal_holiday(now_cst):
-            target = now_cst.replace(hour=6, minute=0, second=0, microsecond=0)
-            if now_cst >= target and now_cst < target + timedelta(minutes=5):
-                try:
-                    send_schedule_to_slack(days_ahead=7)
-                except Exception:
-                    pass
-        time.sleep(300)
+        try:
+            now_ct = _central_now()
+            if (now_ct.weekday() < 5
+                    and not _is_us_federal_holiday(now_ct)
+                    and now_ct.hour == 7 and now_ct.minute < 10
+                    and _last_prod_push_date != now_ct.date().isoformat()):
+                _last_prod_push_date = now_ct.date().isoformat()
+                _run_production_push_impl()
+        except Exception as e:
+            print(f"[PROD PUSH] scheduler error: {e}", flush=True)
+        time.sleep(120)
 
 
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)

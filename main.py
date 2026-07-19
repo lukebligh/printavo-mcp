@@ -30,7 +30,7 @@ STATUS_NAMES = {
     # CX digest Z1 — wellness calls
     "QUOTE_APPROVED":           "QUOTE APPROVED",
     # CX digest Z2 — lingering pickups
-    "READY_FOR_PICKUP":         "Ready for Pickup",
+    "READY_FOR_PICKUP":         "READY FOR PICK UP",
     # CX digest Z3 — approval / mock-up chase
     "QUOTE_APPROVAL_SENT":      "QUOTE APPROVAL SENT",
     "ART_APPROVAL_SENT":        "ART APPROVAL SENT",
@@ -38,8 +38,8 @@ STATUS_NAMES = {
     # CX digest Z4 — blocked
     "CONTRACT_WAITING_ARTWORK": "CONTRACT - WAITING ON ARTWORK",
     "CONTRACT_WAITING_GOODS":   "CONTRACT - WAITING ON GOODS",
-    "EMB_DIGITIZING":           "EMB - Digitizing",
-    "PROMO_ON_ORDER":           "Promo - On Order",
+    "EMB_DIGITIZING":           "EMB - Digitizing",  # NOT in Printavo yet (2026-07-19) — digest warns until added
+    "PROMO_ON_ORDER":           "PROMO - ORDER",
     # Lifecycle statuses used by the Cowork skills
     "SHIPPED":                  "SHIPPED",
     "INVOICED":                 "INVOICED",  # formerly "ORDER SHIPPED & INVOICED"

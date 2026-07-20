@@ -55,6 +55,17 @@ def _status_matches(live_name: str, key: str) -> bool:
     """Case-insensitive: does a live Printavo status name equal STATUS_NAMES[key]?"""
     return _norm_status(live_name) == _norm_status(STATUS_NAMES[key])
 
+
+def _parse_iso(ts):
+    """Parse an ISO8601 string ('...Z' or offset) to an aware UTC datetime, or None."""
+    try:
+        dt = datetime.fromisoformat((ts or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 # ── CORE HELPER ───────────────────────────────────────────────────────────────
 def query_printavo(query: str, variables: dict = None, allow_partial: bool = False):
     payload = {"query": query}
@@ -394,7 +405,7 @@ def get_recent_orders(limit: int = 10) -> str:
     """Get the most recent Printavo orders."""
     q = """
     query($first: Int, $after: String) {
-        invoices(first: $first, after: $after) {
+        invoices(first: $first, after: $after, sortDescending: true) {
             totalNodes
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -1834,6 +1845,7 @@ def _fetch_tracked_orders() -> dict:
             nodes {
                 id visualId nickname total
                 status { name }
+                timestamps { updatedAt }
                 contact { fullName customer { companyName } }
             }
     """
@@ -1874,24 +1886,49 @@ def _fetch_tracked_orders() -> dict:
                 "total": float(n.get("total") or 0),
                 "status": status_name,
                 "company": company,
+                "updatedAt": (n.get("timestamps") or {}).get("updatedAt"),
                 "kind": field,  # "invoices" | "quotes"
             })
     return {"orders": orders, "missing_statuses": missing}
 
 
 def _update_snapshot(orders: list, now_utc: datetime):
-    """Persist {id: {status, first_seen, z1_reported}}; reset first_seen on
-    any status change; prune orders no longer in a tracked status."""
+    """Persist {id: {status, first_seen}}; reset first_seen on any status
+    change; prune orders no longer in a tracked status. The reserved "_z1"
+    key (reported quote approvals) is preserved across prunes.
+
+    AGE SEEDING: when an order is seen for the FIRST time, first_seen is
+    seeded from the order's timestamps.updatedAt instead of "now" — orders
+    that were already stuck in a status before the snapshot store existed get
+    a realistic age immediately instead of starting at 0. (updatedAt bumps on
+    any edit, so this is a conservative LOWER bound on true status age.)"""
     snap = _load_snapshot()
     new_snap = {}
+    if isinstance(snap.get("_z1"), dict):
+        # Keep only recent Z1-reported markers (14 days)
+        cutoff = (now_utc - timedelta(days=14)).isoformat()
+        new_snap["_z1"] = {k: v for k, v in snap["_z1"].items()
+                           if str(v) >= cutoff}
     for o in orders:
         prev = snap.get(o["id"])
+        upd = _parse_iso(o.get("updatedAt"))
         if prev and _norm_status(prev.get("status")) == _norm_status(o["status"]):
-            new_snap[o["id"]] = prev
+            entry = dict(prev)
+            # One-time backdate for entries created during the cold start
+            # (before seeding existed): pull first_seen back to updatedAt.
+            if not entry.get("seeded"):
+                fs = _parse_iso(entry.get("first_seen"))
+                if upd and fs and upd < fs:
+                    entry["first_seen"] = upd.isoformat()
+                entry["seeded"] = True
         else:
-            new_snap[o["id"]] = {"status": o["status"],
-                                 "first_seen": now_utc.isoformat(),
-                                 "z1_reported": False}
+            if prev is None and upd and upd < now_utc:
+                first_seen = upd.isoformat()   # first sighting → seed from updatedAt
+            else:
+                first_seen = now_utc.isoformat()  # observed status CHANGE → now
+            entry = {"status": o["status"], "first_seen": first_seen,
+                     "seeded": True}
+        new_snap[o["id"]] = entry
     _save_snapshot(new_snap)
     return new_snap
 
@@ -1904,8 +1941,110 @@ def _digest_line(o: dict, days: float) -> str:
             f"{int(days)}d — ${o['total']:,.2f}")
 
 
+# Z1 QUOTE-APPROVAL DETECTION
+# "Quote Approved" is a transient status — the team moves orders into a lane
+# minutes after approval, so a status snapshot at 8 AM misses nearly all of
+# them. Instead, Z1 reads the DURABLE record: ApprovalRequest.response.
+# respondedAt survives any status change.
+Z1_APPROVAL_NAME_MATCH = "quote"  # case-insensitive filter on ApprovalRequest.name
+                                  # (excludes art approvals); unnamed requests are
+                                  # included. Calibrate with inspect_approvals().
+
+
+def _z1_window_start(now_ct):
+    """Start of the previous business day, 00:00 America/Chicago, as UTC.
+    Monday's window starts Friday 00:00 → Fri/Sat/Sun roll into Monday."""
+    prev = now_ct.date() - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    return datetime(prev.year, prev.month, prev.day,
+                    tzinfo=now_ct.tzinfo).astimezone(timezone.utc)
+
+
+_APPROVAL_FRAG = """
+        totalNodes
+        pageInfo { hasNextPage endCursor }
+        nodes {
+            id visualId nickname total
+            status { name }
+            contact { fullName customer { companyName } }
+            approvalRequests(first: 5) {
+                nodes { name status response { name respondedAt } }
+            }
+        }
+"""
+
+
+def _scan_recent_approvals(window_start_utc, now_utc, max_scan=150):
+    """
+    Find orders whose QUOTE approval response landed inside the window,
+    regardless of what status they've been moved to since. Scans two
+    complementary slices per connection and unions them:
+      A) newest-first (sortDescending) — catches brand-new orders
+      B) production date >= 14 days ago — catches anything scheduled
+    Returns {"hits": [...], "errors": [...]}.
+    """
+    slices = []
+    for field in ("invoices", "quotes"):
+        slices.append((field, f"""
+        query($first: Int, $after: String) {{
+            {field}(first: $first, after: $after, sortDescending: true) {{ {_APPROVAL_FRAG} }}
+        }}
+        """, None))
+    prod_after = (now_utc - timedelta(days=14)).strftime("%Y-%m-%dT00:00:00Z")
+    for field in ("invoices", "quotes"):
+        slices.append((field, f"""
+        query($first: Int, $after: String, $prodAfter: ISO8601DateTime) {{
+            {field}(first: $first, after: $after, inProductionAfter: $prodAfter) {{ {_APPROVAL_FRAG} }}
+        }}
+        """, {"prodAfter": prod_after}))
+
+    hits, errors = {}, []
+    for field, q, extra_vars in slices:
+        r = paginate(q, extra_vars, connection_path=(field,), max_records=max_scan)
+        if "error" in r:
+            errors.append(f"{field}: {str(r['error'])[:150]}")
+            continue
+        for n in r["nodes"]:
+            best = None
+            for ar in ((n.get("approvalRequests") or {}).get("nodes") or []):
+                name = (ar.get("name") or "").lower()
+                st = str(ar.get("status") or "").lower()
+                resp = ar.get("response") or {}
+                r_at = _parse_iso(resp.get("respondedAt"))
+                if r_at is None:
+                    continue                      # never responded
+                if name and Z1_APPROVAL_NAME_MATCH not in name:
+                    continue                      # e.g. art approval
+                if "declin" in st or "retract" in st or "cancel" in st:
+                    continue
+                if window_start_utc <= r_at <= now_utc:
+                    if best is None or r_at > best[0]:
+                        best = (r_at, resp.get("name") or "")
+            if best is None:
+                continue
+            oid = str(n.get("id"))
+            if oid in hits:
+                continue
+            contact = n.get("contact") or {}
+            company = ((contact.get("customer") or {}).get("companyName")
+                       or contact.get("fullName") or "—")
+            hits[oid] = {
+                "id": oid,
+                "visualId": n.get("visualId"),
+                "nickname": n.get("nickname") or "",
+                "total": float(n.get("total") or 0),
+                "status": (n.get("status") or {}).get("name", "?"),
+                "company": company,
+                "kind": field,
+                "approved_by": best[1],
+                "responded_at": best[0].isoformat(),
+            }
+    return {"hits": list(hits.values()), "errors": errors}
+
+
 def _build_cx_digest():
-    """Returns (digest_text, z1_ids_to_mark) or (error_text, None)."""
+    """Returns (digest_text, z1_marks_dict) or (error_text, None)."""
     now_utc = datetime.now(timezone.utc)
     now_ct = _central_now()
 
@@ -1914,12 +2053,12 @@ def _build_cx_digest():
         return f"CX DIGEST ERROR: {fetched['error']}", None
     orders = fetched["orders"]
     snap = _update_snapshot(orders, now_utc)
+    approvals = _scan_recent_approvals(_z1_window_start(now_ct), now_utc)
 
     def days_in_status(o):
         e = snap.get(o["id"]) or {}
-        try:
-            first_seen = datetime.fromisoformat(e["first_seen"])
-        except Exception:
+        first_seen = _parse_iso(e.get("first_seen"))
+        if first_seen is None:
             return 0.0
         return (now_utc - first_seen).total_seconds() / 86400.0
 
@@ -1932,34 +2071,44 @@ def _build_cx_digest():
         "Four lists, one pass, before the phones start. "
         "Links go straight to the invoice.",
     ]
-    z1_ids = []
+    z1_marks = {}
     for z, header, intro, section_keys, min_days in DIGEST_SECTIONS:
-        norms = {_norm_status(STATUS_NAMES[k]) for k in section_keys}
+        lines.append(f"\n*{header}* — _{intro}_")
         if min_days is None:
-            # Z1: entered Quote Approved since the previous business day's run.
-            # Snapshot-based: anything newly seen in this status that hasn't
-            # been reported yet (Fri/Sat/Sun approvals roll into Monday's run
-            # automatically, since no runs happen on weekends).
-            hits = [o for o in orders
-                    if _norm_status(o["status"]) in norms
-                    and not (snap.get(o["id"]) or {}).get("z1_reported")]
-            z1_ids = [o["id"] for o in hits]
+            # Z1: quote approvals RESPONDED in the window (durable signal),
+            # deduped against previously reported approvals in snap["_z1"].
+            reported = snap.get("_z1") if isinstance(snap.get("_z1"), dict) else {}
+            hits = [h for h in approvals["hits"]
+                    if str(reported.get(h["id"], "")) < h["responded_at"]]
+            z1_marks = {h["id"]: h["responded_at"] for h in hits}
+            hits.sort(key=lambda x: x["responded_at"], reverse=True)
+            if hits:
+                for h in hits:
+                    days = (now_utc - _parse_iso(h["responded_at"])).total_seconds() / 86400.0
+                    line = _digest_line(h, days) + f" — now {h['status']}"
+                    if h["approved_by"]:
+                        line += f" (approved by {h['approved_by']})"
+                    lines.append(line)
+            else:
+                lines.append("— none —")
+            if approvals["errors"]:
+                lines.append(f"⚠️ approval scan partial: {approvals['errors']}")
         else:
+            norms = {_norm_status(STATUS_NAMES[k]) for k in section_keys}
             hits = [o for o in orders
                     if _norm_status(o["status"]) in norms
                     and days_in_status(o) > min_days]
-        hits.sort(key=days_in_status, reverse=True)
-        lines.append(f"\n*{header}* — _{intro}_")
-        if hits:
-            for o in hits:
-                lines.append(_digest_line(o, days_in_status(o)))
-        else:
-            lines.append("— none —")
+            hits.sort(key=days_in_status, reverse=True)
+            if hits:
+                for o in hits:
+                    lines.append(_digest_line(o, days_in_status(o)))
+            else:
+                lines.append("— none —")
 
     if fetched["missing_statuses"]:
         lines.append("\n⚠️ Status names in STATUS_NAMES not found in Printavo "
                      f"(renamed?): {fetched['missing_statuses']}")
-    return "\n".join(lines), z1_ids
+    return "\n".join(lines), z1_marks
 
 
 def _post_to_slack(text: str, webhook_url: str):
@@ -1973,13 +2122,16 @@ def _post_to_slack(text: str, webhook_url: str):
     return f"Slack error: HTTP {resp.status_code} — {resp.text[:200]}"
 
 
-def _mark_z1_reported(ids: list):
-    if not ids:
+def _mark_z1_reported(marks: dict):
+    """Record which quote approvals have been reported: {order_id: responded_at}."""
+    if not marks:
         return
     snap = _load_snapshot()
-    for oid in ids:
-        if oid in snap:
-            snap[oid]["z1_reported"] = True
+    z1 = snap.get("_z1")
+    if not isinstance(z1, dict):
+        z1 = {}
+    z1.update(marks)
+    snap["_z1"] = z1
     _save_snapshot(snap)
 
 
@@ -2012,6 +2164,51 @@ def run_cx_digest(dry_run: bool = False) -> str:
     returns the digest text instead of posting to Slack.
     """
     return _run_cx_digest_impl(force_dry_run=dry_run)
+
+
+@mcp.tool()
+def inspect_approvals(visual_id: str) -> str:
+    """
+    Show the raw approval requests + responses on an order — used to verify
+    and calibrate the CX digest's Z1 quote-approval detection
+    (Z1_APPROVAL_NAME_MATCH filter).
+    """
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return err
+    q = f"""
+    query($id: ID!) {{
+        {order_type}(id: $id) {{
+            visualId
+            status {{ name }}
+            approvalRequests(first: 20) {{
+                nodes {{
+                    id name status
+                    timestamps {{ createdAt updatedAt }}
+                    response {{ name email respondedAt reason }}
+                }}
+            }}
+        }}
+    }}
+    """
+    r = query_printavo(q, {"id": internal_id})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    obj = r.get(order_type) or {}
+    ars = (obj.get("approvalRequests") or {}).get("nodes", [])
+    lines = [f"APPROVAL REQUESTS — Order #{obj.get('visualId')} "
+             f"(status: {(obj.get('status') or {}).get('name', '?')}): {len(ars)}"]
+    for ar in ars:
+        resp = ar.get("response") or {}
+        ts = ar.get("timestamps") or {}
+        lines.append(
+            f"  • name={ar.get('name')!r} | status={ar.get('status')!r} | "
+            f"created={ts.get('createdAt')} | responded={resp.get('respondedAt')} | "
+            f"by={resp.get('name')} <{resp.get('email', '')}> | "
+            f"reason={resp.get('reason')!r}")
+    if not ars:
+        lines.append("  (none)")
+    return "\n".join(lines)
 
 
 @mcp.tool()

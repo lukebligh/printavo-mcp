@@ -193,8 +193,10 @@ _MATRIX_TYPE_MAP = {
     "transfers":         "DTF",
 }
 
-def _decoration_type(imprint_node: dict) -> str:
-    """Determine decoration type from an imprint node."""
+def _decoration_type(imprint_node: dict, default: str = "Screen Print") -> str:
+    """Determine decoration type from an imprint node.
+    default: used only when the imprint carries no signal (no typeOfWork and
+    no matching pricing matrix) — callers can pass a status-derived fallback."""
     tow = (imprint_node.get("typeOfWork") or {}).get("name", "")
     if tow:
         t = tow.lower()
@@ -212,7 +214,18 @@ def _decoration_type(imprint_node: dict) -> str:
     for key, deco in _MATRIX_TYPE_MAP.items():
         if key in matrix_name:
             return deco
-    return "Screen Print"  # safe default
+    return default  # no signal on the imprint itself
+
+
+def _status_deco_fallback(status_name: str) -> str:
+    """Infer decoration type from an order's status name (e.g. 'EMB - PRE-PRO')
+    for imprints that carry no typeOfWork / pricing-matrix signal."""
+    s = (status_name or "").upper()
+    if "EMB" in s:
+        return "Embroidery"
+    if "DTF" in s:
+        return "DTF"
+    return "Screen Print"
 
 
 def _color_count(imprint_node: dict) -> int:
@@ -268,9 +281,58 @@ _QTY_FRAG = """
     }
 """
 
+# Combined per-group fragment: imprints AND quantities per line-item group.
+# Needed for correct imprint math on multi-group orders
+# (imprints = Σ group_qty × group_imprint_count, NOT total_qty × total_locations).
+_GROUPS_FRAG = """
+    lineItemGroups {
+        nodes {
+            imprints {
+                nodes {
+                    typeOfWork { name }
+                    pricingMatrixColumn { columnName matrix { name } }
+                }
+            }
+            lineItems {
+                nodes { sizes { size count } }
+            }
+        }
+    }
+"""
+
+
+def _parse_obj_groups(obj: dict, deco_default: str = "Screen Print") -> list:
+    """Parse per-group qty + imprints from a lineItemGroups-bearing object.
+    Returns list of {"qty": int, "imprints": [{"type","colors"}]}."""
+    out = []
+    for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
+        qty = 0
+        for item in (g.get("lineItems") or {}).get("nodes", []):
+            qty += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
+        imps = [{
+            "type":   _decoration_type(imp, default=deco_default),
+            "colors": _color_count(imp),
+        } for imp in (g.get("imprints") or {}).get("nodes", [])]
+        out.append({"qty": qty, "imprints": imps})
+    return out
+
+
+def _fetch_groups_batch(id_list: list) -> dict:
+    """Fetch per-group qty + imprint data for a list of orders.
+    Combined fragment is ~2x the complexity of _IMPRINT_FRAG, so chunk at 3
+    (3 × ~7,600 = ~22,800 < 25,000). Returns dict: internal_id → raw obj
+    (parse with _parse_obj_groups so the caller can pass a status-based
+    decoration fallback). None values should be retried as quotes."""
+    raw = _batch_query(id_list, "inv", "invoice", _GROUPS_FRAG, chunk_size=3)
+    null_ids = [iid for iid, v in raw.items() if v is None]
+    if null_ids:
+        raw.update(_batch_query(null_ids, "qt", "quote", _GROUPS_FRAG,
+                                allow_partial=True, chunk_size=3))
+    return raw
+
 
 def _batch_query(id_list: list, prefix: str, field: str, frag: str,
-                 allow_partial: bool = False) -> dict:
+                 allow_partial: bool = False, chunk_size: int = 5) -> dict:
     """
     Run aliased GraphQL queries for a list of IDs, chunked to stay under the
     25k complexity limit. Each invoice(id) with lineItemGroups costs ~3,800
@@ -281,7 +343,7 @@ def _batch_query(id_list: list, prefix: str, field: str, frag: str,
     frag:   field selection body
     Returns dict: id → raw GraphQL object (or None if not found / error).
     """
-    CHUNK = 5
+    CHUNK = chunk_size
     out = {}
     for chunk_start in range(0, len(id_list), CHUNK):
         chunk = id_list[chunk_start:chunk_start + CHUNK]
@@ -2318,13 +2380,7 @@ def _build_daily_production_message() -> str:
         return f"{header}\nNothing on the production schedule today."
 
     ids = [n["id"] for n in nodes if n.get("id")]
-    imprint_map = _fetch_imprints_batch(ids)
-    null_ids = [i for i, v in imprint_map.items() if v is None]
-    if null_ids:
-        imprint_map.update(_fetch_imprints_quote_batch(null_ids))
-    zero_ids = [n["id"] for n in nodes
-                if n.get("id") and int(n.get("totalQuantity") or 0) == 0]
-    qty_map = _fetch_qty_batch(zero_ids) if zero_ids else {}
+    groups_raw = _fetch_groups_batch(ids)
 
     sections = {"Screen Print": [], "Embroidery": [], "DTF": []}
     totals = {t: {"orders": 0, "pcs": 0, "imprints": 0, "screens": 0, "minutes": 0}
@@ -2332,47 +2388,69 @@ def _build_daily_production_message() -> str:
 
     for n in nodes:
         iid = n.get("id")
-        qty = int(n.get("totalQuantity") or 0) or qty_map.get(iid, 0)
         status = (n.get("status") or {}).get("name", "?")
+        deco_fallback = _status_deco_fallback(status)
         contact = n.get("contact") or {}
         company = ((contact.get("customer") or {}).get("companyName")
                    or contact.get("fullName") or "—")
         nickname = n.get("nickname") or "(no nickname)"
-        imprints = imprint_map.get(iid) or []
 
-        if not imprints:
-            sections["Screen Print"].append(
-                f"• #{n.get('visualId')} — {company} — {nickname} — {qty} pcs — "
+        obj = groups_raw.get(iid)
+        groups = _parse_obj_groups(obj, deco_default=deco_fallback) if obj else []
+        order_qty = (int(n.get("totalQuantity") or 0)
+                     or sum(g["qty"] for g in groups))
+
+        if not any(g["imprints"] for g in groups):
+            sections.setdefault(deco_fallback, [])
+            totals.setdefault(deco_fallback, {"orders": 0, "pcs": 0, "imprints": 0,
+                                              "screens": 0, "minutes": 0})
+            sections[deco_fallback].append(
+                f"• #{n.get('visualId')} — {company} — {nickname} — {order_qty} pcs — "
                 f"⚠️ no imprints entered — {status}")
-            totals["Screen Print"]["orders"] += 1
-            totals["Screen Print"]["pcs"] += qty
+            totals[deco_fallback]["orders"] += 1
+            totals[deco_fallback]["pcs"] += order_qty
             continue
 
-        by_type = defaultdict(lambda: {"locs": 0, "screens": 0})
-        for imp in imprints:
-            g = by_type[imp["type"]]
-            g["locs"] += 1
-            g["screens"] += imp["colors"]
+        # Per-type accumulation: imprints = Σ over groups (group_qty × group locs)
+        by_type = defaultdict(lambda: {"locs": 0, "screens": 0,
+                                       "imprints": 0, "pcs": 0})
+        for g in groups:
+            gqty = g["qty"]
+            types_in_group = set()
+            for imp in g["imprints"]:
+                t = by_type[imp["type"]]
+                t["locs"] += 1
+                t["screens"] += imp["colors"]
+                t["imprints"] += gqty
+                types_in_group.add(imp["type"])
+            for deco in types_in_group:
+                by_type[deco]["pcs"] += gqty
 
         for deco, g in by_type.items():
             sections.setdefault(deco, [])
             totals.setdefault(deco, {"orders": 0, "pcs": 0, "imprints": 0,
                                      "screens": 0, "minutes": 0})
-            type_imprints = qty * g["locs"]
+            type_imprints = g["imprints"]
+            type_pcs = g["pcs"]
             if deco == "Screen Print":
-                rate = _sp_run_rate(qty)
+                rate = _sp_run_rate(type_pcs)
                 minutes = g["screens"] * 8 + (int(type_imprints / rate * 60)
                                               if type_imprints else 0)
             else:
                 minutes = g["locs"] * 15
             scr = (f" | {g['screens']} screen{'s' if g['screens'] != 1 else ''}"
                    if deco == "Screen Print" and g["screens"] else "")
+            if type_pcs * g["locs"] == type_imprints:
+                math_str = f"{type_pcs} pcs × {g['locs']} loc = {type_imprints} imprints"
+            else:
+                math_str = (f"{type_pcs} pcs / {g['locs']} loc "
+                            f"= {type_imprints} imprints")
             sections[deco].append(
                 f"• #{n.get('visualId')} — {company} — {nickname} — "
-                f"{qty} pcs × {g['locs']} loc = {type_imprints} imprints{scr} — {status}")
+                f"{math_str}{scr} — {status}")
             t = totals[deco]
             t["orders"] += 1
-            t["pcs"] += qty
+            t["pcs"] += type_pcs
             t["imprints"] += type_imprints
             t["screens"] += g["screens"]
             t["minutes"] += minutes

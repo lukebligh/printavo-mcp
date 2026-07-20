@@ -1814,6 +1814,12 @@ def list_available_mutations() -> str:
 
 # (zid, header, intro line, STATUS_NAMES keys, min days-in-status or None for Z1)
 # Copy approved by Luke 2026-07-19 — edit wording here only.
+# Z2–Z4 line-item age cap (days). Orders older than this are NOT listed
+# individually — they're rolled into a one-line count per section, keeping the
+# digest actionable and under Slack's message length limit. Z1 is unaffected
+# (it's window-based). Override with env CX_MAX_AGE_DAYS.
+CX_MAX_AGE_DAYS = float(os.environ.get("CX_MAX_AGE_DAYS", "14"))
+
 DIGEST_SECTIONS = [
     ("Z1", "📞 Wellness Calls",
      "these customers approved their quote yesterday. A 2-minute \"got it, "
@@ -2160,12 +2166,24 @@ def _build_cx_digest():
             hits = [o for o in orders
                     if _norm_status(o["status"]) in norms
                     and days_in_status(o) > min_days]
-            hits.sort(key=days_in_status, reverse=True)
-            if hits:
-                for o in hits:
+            # Age cap: list only orders <= CX_MAX_AGE_DAYS; roll the rest
+            # into a one-line count so the backlog stays visible without
+            # flooding the digest (and blowing Slack's message limit).
+            fresh = [o for o in hits if days_in_status(o) <= CX_MAX_AGE_DAYS]
+            stale = [o for o in hits if days_in_status(o) > CX_MAX_AGE_DAYS]
+            fresh.sort(key=days_in_status, reverse=True)
+            if fresh:
+                for o in fresh:
                     lines.append(_digest_line(o, days_in_status(o)))
-            else:
+            elif not stale:
                 lines.append("— none —")
+            if stale:
+                oldest = max(days_in_status(o) for o in stale)
+                total_val = sum(float(o.get("total") or 0) for o in stale)
+                lines.append(
+                    f"…plus *{len(stale)}* older than {int(CX_MAX_AGE_DAYS)}d "
+                    f"(oldest {int(oldest)}d, ${total_val:,.0f} quoted) — "
+                    f"backlog to work in Printavo, not today's list.")
 
     if fetched["missing_statuses"]:
         lines.append("\n⚠️ Status names in STATUS_NAMES not found in Printavo "

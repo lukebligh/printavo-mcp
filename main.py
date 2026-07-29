@@ -15,6 +15,11 @@ EMAIL            = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN            = os.environ.get("PRINTAVO_TOKEN", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")      # production briefing → #all-est-merch
 CX_SLACK_WEBHOOK_URL = os.environ.get("CX_SLACK_WEBHOOK_URL", "") # CX digest → #cx-daily ONLY
+# Luke's private backlog block (old pickups + old/flipped quotes) goes here —
+# NOT the #cx-daily channel. Point this at a webhook for a channel only Luke
+# sees (or his DM). If unset, the backlog only appears in the tool's return
+# text (visible when Luke runs run_cx_digest manually) and never in #cx-daily.
+CX_BACKLOG_SLACK_WEBHOOK_URL = os.environ.get("CX_BACKLOG_SLACK_WEBHOOK_URL", "")
 API_URL          = "https://www.printavo.com/api/v2"
 
 def _dry_run() -> bool:
@@ -31,10 +36,16 @@ STATUS_NAMES = {
     "QUOTE_APPROVED":           "QUOTE APPROVED",
     # CX digest Z2 — lingering pickups
     "READY_FOR_PICKUP":         "READY FOR PICK UP",
-    # CX digest Z3 — approval / mock-up chase
+    # CX digest Z3 — quote follow-ups
     "QUOTE_APPROVAL_SENT":      "QUOTE APPROVAL SENT",
+    # CX digest Z5 — art follow-ups (art / proof / mock-up / digitizing / sew-out)
     "ART_APPROVAL_SENT":        "ART APPROVAL SENT",
     "MOCKUP_REQUESTED":         "MOCK-UP REQUESTED",
+    "PROOF_REQUESTED":          "PROOF REQUESTED",
+    "EMB_SEW_OUT_APPROVAL_SENT":"EMB - SEW OUT APPROVAL SENT",
+    "PROMO_ART_APPROVAL_SENT":  "PROMO - ART APPROVAL SENT",
+    "EMB_ORDER_DIGITIZING":     "EMB - ORDER DIGITIZING",
+    "DTF_ORDER_TRANSFER":       "DTF - ORDER TRANSFER",
     # CX digest Z4 — blocked
     "CONTRACT_WAITING_ARTWORK": "CONTRACT - WAITING ON ARTWORK",
     "CONTRACT_WAITING_GOODS":   "CONTRACT - WAITING ON GOODS",
@@ -404,6 +415,50 @@ def _fetch_qty_batch(id_list: list) -> dict:
         iid: (_parse_obj_qty(obj) if obj is not None else 0)
         for iid, obj in raw.items()
     }
+
+
+_CATEGORY_FRAG = """
+    lineItemGroups {
+        nodes {
+            lineItems {
+                nodes { category { name } }
+            }
+        }
+    }
+"""
+
+
+def _parse_obj_categories(obj: dict) -> set:
+    """Return the set of lowercased line-item category names on an order."""
+    cats = set()
+    for g in (obj.get("lineItemGroups") or {}).get("nodes", []):
+        for item in (g.get("lineItems") or {}).get("nodes", []):
+            name = ((item.get("category") or {}).get("name") or "").strip().lower()
+            if name:
+                cats.add(name)
+    return cats
+
+
+def _fetch_categories_batch(id_list: list) -> dict:
+    """Batch-fetch line-item categories. Returns id → set(lowercased names).
+    Kept small on purpose: only ever called on the handful of Z1 hits, so the
+    nested lineItemGroups fetch never touches the big paginated scans."""
+    if not id_list:
+        return {}
+    raw = _batch_query(id_list, "inv", "invoice", _CATEGORY_FRAG)
+    null_ids = [iid for iid, v in raw.items() if v is None]
+    if null_ids:
+        raw.update(_batch_query(null_ids, "qt", "quote", _CATEGORY_FRAG,
+                                allow_partial=True))
+    return {
+        iid: (_parse_obj_categories(obj) if obj is not None else set())
+        for iid, obj in raw.items()
+    }
+
+
+def _order_is_contract(cats: set) -> bool:
+    """True if any line-item category contains 'contract' (Contract SP/EMB/DTF)."""
+    return any("contract" in c for c in (cats or set()))
 
 
 def _fetch_qty_from_line_items(internal_id: str) -> int:
@@ -1797,11 +1852,16 @@ def list_available_mutations() -> str:
 
 
 # ── DAILY CX DIGEST ───────────────────────────────────────────────────────────
-# Weekday 8:00 AM America/Chicago Slack digest with four sections:
+# Weekday 8:00 AM America/Chicago Slack digest with five sections:
 #   Z1 WELLNESS CALLS   — entered "Quote Approved" the previous business day
+#                         (contract orders excluded — no wellness call)
 #   Z2 LINGERING PICKUPS — in "Ready for Pickup" > 2 days
-#   Z3 APPROVAL/MOCK-UP CHASE — approval/mock-up statuses > 3 days
-#   Z4 BLOCKED          — waiting statuses > 5 days
+#   Z3 QUOTE FOLLOW-UPS  — QUOTE APPROVAL SENT > 3 days (idle >45d auto-flipped
+#                          back to Quote so dead quotes stop triggering)
+#   Z5 ART FOLLOW-UPS    — art/proof/mock-up/sew-out/digitizing statuses > 3 days
+#   Z4 BLOCKED           — waiting-on-goods/artwork/promo statuses > 5 days
+# The >14d backlog for pickups (Z2) and quotes (Z3) is pulled OUT of #cx-daily
+# into Luke's private backlog block (CX_BACKLOG_SLACK_WEBHOOK_URL).
 #
 # STATUS-AGE SOURCE: the schema has NO status-change timestamp on Invoice
 # (Invoice.timestamps is only createdAt/updatedAt, and updatedAt bumps on ANY
@@ -1820,24 +1880,55 @@ def list_available_mutations() -> str:
 # (it's window-based). Override with env CX_MAX_AGE_DAYS.
 CX_MAX_AGE_DAYS = float(os.environ.get("CX_MAX_AGE_DAYS", "14"))
 
+# QUOTE APPROVAL SENT quotes older than this (days) are auto-flipped back to
+# "Quote" so dead quotes stop triggering follow-ups. 0 disables the flip.
+# Age is a conservative LOWER bound (see _update_snapshot seeding), so a quote
+# is only flipped when it is genuinely older than this. Override with env.
+CX_QUOTE_STALE_FLIP_DAYS = float(os.environ.get("CX_QUOTE_STALE_FLIP_DAYS", "45"))
+# Safety cap on how many quotes a single run will auto-flip.
+CX_MAX_FLIPS_PER_RUN = int(os.environ.get("CX_MAX_FLIPS_PER_RUN", "100"))
+# Master on-switch for the actual flip mutation. Default OFF so the candidate
+# list shows up in Luke's backlog block first (nothing is mutated). Set
+# CX_FLIP_ENABLED=true on Railway once he's reviewed the list and is ready.
+CX_FLIP_ENABLED = os.environ.get("CX_FLIP_ENABLED", "").strip().lower() in (
+    "1", "true", "yes")
+
+# Each section is (zid, header, intro, STATUS_NAMES keys, min days-in-status
+# or None for Z1, opts). opts controls how the >CX_MAX_AGE_DAYS backlog is
+# handled and Z1 filtering:
+#   "stale": "slack"  → roll older items into a one-line count in the CX post
+#            "backlog" → pull older items OUT of the CX post into Luke's
+#                        itemized backlog block (not the CX channel)
+#   "drop_contract": True → omit orders whose line-item category contains
+#                           "contract" (Z1 only)
+#   "flip_stale_quotes": True → auto-flip QUOTE APPROVAL SENT older than
+#                               CX_QUOTE_STALE_FLIP_DAYS back to "Quote"
+# Copy approved by Luke 2026-07-19; section split approved 2026-07-29.
 DIGEST_SECTIONS = [
     ("Z1", "📞 Wellness Calls",
      "these customers approved their quote yesterday. A 2-minute \"got it, "
      "here's what happens next\" call today buys a lot of goodwill later.",
-     ["QUOTE_APPROVED"], None),
+     ["QUOTE_APPROVED"], None, {"drop_contract": True}),
     ("Z2", "📦 Lingering Pickups",
      "ready and waiting on the shelf more than 2 days. Nudge them — done work "
      "sitting here is cash we haven't collected and space we don't have.",
-     ["READY_FOR_PICKUP"], 2),
-    ("Z3", "✏️ Approval / Mock-Up Chase",
-     "waiting on the customer to approve a quote, art, or mock-up for 3+ days. "
+     ["READY_FOR_PICKUP"], 2, {"stale": "backlog"}),
+    ("Z3", "✏️ Quote Follow-Ups",
+     "quote approval sent, waiting on the customer to say yes for 3+ days. "
      "One friendly bump usually shakes these loose.",
-     ["QUOTE_APPROVAL_SENT", "ART_APPROVAL_SENT", "MOCKUP_REQUESTED"], 3),
+     ["QUOTE_APPROVAL_SENT"], 3,
+     {"stale": "backlog", "flip_stale_quotes": True}),
+    ("Z5", "🎨 Art Follow-Ups",
+     "waiting on the customer to approve art, a proof, a mock-up, or a sew-out "
+     "for 3+ days — plus jobs sitting in digitizing/transfer. Nudge or move them.",
+     ["ART_APPROVAL_SENT", "MOCKUP_REQUESTED", "MOCKUP_READY",
+      "PROOF_REQUESTED", "EMB_SEW_OUT_APPROVAL_SENT", "PROMO_ART_APPROVAL_SENT",
+      "EMB_ORDER_DIGITIZING", "DTF_ORDER_TRANSFER"], 3, {"stale": "slack"}),
     ("Z4", "🚧 Blocked",
      "stuck 5+ days waiting on artwork, goods, or promo stock. "
      "These don't fix themselves — each one needs a chase or a decision today.",
      ["CONTRACT_WAITING_ARTWORK", "CONTRACT_WAITING_GOODS",
-      "PROMO_ON_ORDER"], 5),
+      "PROMO_ON_ORDER"], 5, {"stale": "slack"}),
 ]
 
 
@@ -1881,7 +1972,7 @@ def _save_snapshot(snap: dict):
 
 def _tracked_status_keys() -> list:
     keys = []
-    for _z, _header, _intro, section_keys, _days in DIGEST_SECTIONS:
+    for _z, _header, _intro, section_keys, _days, _opts in DIGEST_SECTIONS:
         keys.extend(section_keys)
     return keys
 
@@ -2111,14 +2202,39 @@ def _scan_recent_approvals(window_start_utc, now_utc, max_scan=150):
     return {"hits": list(hits.values()), "errors": errors}
 
 
-def _build_cx_digest():
-    """Returns (digest_text, z1_marks_dict) or (error_text, None)."""
+def _flip_order_to_quote(internal_id: str, quote_status_id: str) -> bool:
+    """Flip one order back to 'Quote'. Returns True on success."""
+    mutation = """
+    mutation($parentId: ID!, $statusId: ID!) {
+        statusUpdate(parentId: $parentId, statusId: $statusId) {
+            ... on Quote   { id visualId status { name } }
+            ... on Invoice { id visualId status { name } }
+        }
+    }
+    """
+    result = query_printavo(mutation,
+                            {"parentId": internal_id, "statusId": quote_status_id})
+    if "error" in result:
+        return False
+    new_status = ((result.get("statusUpdate") or {}).get("status") or {}).get("name", "")
+    return _norm_status(new_status) == _norm_status(STATUS_NAMES.get("QUOTE", "Quote"))
+
+
+def _build_cx_digest(dry_run: bool = False):
+    """Build the CX digest.
+    Returns (slack_text, z1_marks_dict, backlog_text) or (error_text, None, "").
+
+    slack_text  → the #cx-daily post.
+    backlog_text→ Luke's private block (old pickups, old/flipped quotes); goes
+                  to CX_BACKLOG_SLACK_WEBHOOK_URL, never #cx-daily.
+    When dry_run is True, stale quotes are LISTED as flip candidates but NOT
+    actually flipped."""
     now_utc = datetime.now(timezone.utc)
     now_ct = _central_now()
 
     fetched = _fetch_tracked_orders()
     if "error" in fetched:
-        return f"CX DIGEST ERROR: {fetched['error']}", None
+        return f"CX DIGEST ERROR: {fetched['error']}", None, ""
     orders = fetched["orders"]
     snap = _update_snapshot(orders, now_utc)
     approvals = _scan_recent_approvals(_z1_window_start(now_ct), now_utc)
@@ -2136,11 +2252,12 @@ def _build_cx_digest():
         date_str = now_ct.strftime("%A, %B %d")
     lines = [
         f"☕ *CX Daily — {date_str}*",
-        "Four lists, one pass, before the phones start. "
+        "Five lists, one pass, before the phones start. "
         "Links go straight to the invoice.",
     ]
+    backlog = []          # Luke's private block, assembled per-section
     z1_marks = {}
-    for z, header, intro, section_keys, min_days in DIGEST_SECTIONS:
+    for z, header, intro, section_keys, min_days, opts in DIGEST_SECTIONS:
         lines.append(f"\n*{header}* — _{intro}_")
         if min_days is None:
             # Z1: quote approvals RESPONDED in the window (durable signal),
@@ -2148,6 +2265,12 @@ def _build_cx_digest():
             reported = snap.get("_z1") if isinstance(snap.get("_z1"), dict) else {}
             hits = [h for h in approvals["hits"]
                     if str(reported.get(h["id"], "")) < h["responded_at"]]
+            # Drop contract orders (Contract SP/EMB/DTF) — they don't get a
+            # wellness call. Only the few Z1 hits are category-checked.
+            if opts.get("drop_contract") and hits:
+                cats = _fetch_categories_batch([h["id"] for h in hits])
+                hits = [h for h in hits
+                        if not _order_is_contract(cats.get(h["id"]))]
             z1_marks = {h["id"]: h["responded_at"] for h in hits}
             hits.sort(key=lambda x: x["responded_at"], reverse=True)
             if hits:
@@ -2161,34 +2284,104 @@ def _build_cx_digest():
                 lines.append("— none —")
             if approvals["errors"]:
                 lines.append(f"⚠️ approval scan partial: {approvals['errors']}")
-        else:
-            norms = {_norm_status(STATUS_NAMES[k]) for k in section_keys}
-            hits = [o for o in orders
-                    if _norm_status(o["status"]) in norms
-                    and days_in_status(o) > min_days]
-            # Age cap: list only orders <= CX_MAX_AGE_DAYS; roll the rest
-            # into a one-line count so the backlog stays visible without
-            # flooding the digest (and blowing Slack's message limit).
-            fresh = [o for o in hits if days_in_status(o) <= CX_MAX_AGE_DAYS]
-            stale = [o for o in hits if days_in_status(o) > CX_MAX_AGE_DAYS]
-            fresh.sort(key=days_in_status, reverse=True)
-            if fresh:
-                for o in fresh:
-                    lines.append(_digest_line(o, days_in_status(o)))
-            elif not stale:
-                lines.append("— none —")
-            if stale:
-                oldest = max(days_in_status(o) for o in stale)
-                total_val = sum(float(o.get("total") or 0) for o in stale)
-                lines.append(
-                    f"…plus *{len(stale)}* older than {int(CX_MAX_AGE_DAYS)}d "
-                    f"(oldest {int(oldest)}d, ${total_val:,.0f} quoted) — "
-                    f"backlog to work in Printavo, not today's list.")
+            continue
+
+        norms = {_norm_status(STATUS_NAMES[k]) for k in section_keys}
+        hits = [o for o in orders
+                if _norm_status(o["status"]) in norms
+                and days_in_status(o) > min_days]
+
+        # Auto-flip stale QUOTE APPROVAL SENT quotes back to "Quote" so dead
+        # quotes stop triggering. Age is a conservative lower bound, so a quote
+        # is only flipped when it is genuinely older than the cutoff. Candidates
+        # are pulled out of the section entirely (flipped or not) so they don't
+        # double-list in the quote worklist below.
+        flipped, flip_pending = [], []
+        if opts.get("flip_stale_quotes") and CX_QUOTE_STALE_FLIP_DAYS > 0:
+            candidates = sorted(
+                (o for o in hits if days_in_status(o) > CX_QUOTE_STALE_FLIP_DAYS),
+                key=days_in_status, reverse=True)[:CX_MAX_FLIPS_PER_RUN]
+            cand_ids = {o["id"] for o in candidates}
+            hits = [o for o in hits if o["id"] not in cand_ids]
+            if candidates and not dry_run and CX_FLIP_ENABLED:
+                qid, _qerr = _get_status_id_by_name(STATUS_NAMES.get("QUOTE", "Quote"))
+                for o in candidates:
+                    if qid and _flip_order_to_quote(o["id"], qid):
+                        flipped.append(o)
+                fids = {o["id"] for o in flipped}
+                flip_pending = [o for o in candidates if o["id"] not in fids]
+            else:
+                # dry run OR flip switch off: list candidates, mutate nothing.
+                flip_pending = candidates
+
+        # Age cap: list only orders <= CX_MAX_AGE_DAYS individually.
+        fresh = [o for o in hits if days_in_status(o) <= CX_MAX_AGE_DAYS]
+        stale = [o for o in hits if days_in_status(o) > CX_MAX_AGE_DAYS]
+        fresh.sort(key=days_in_status, reverse=True)
+        if fresh:
+            for o in fresh:
+                lines.append(_digest_line(o, days_in_status(o)))
+        elif not stale:
+            lines.append("— none —")
+
+        stale_mode = opts.get("stale", "slack")
+        if stale and stale_mode == "slack":
+            # Roll older items into a one-line count in the #cx-daily post.
+            oldest = max(days_in_status(o) for o in stale)
+            total_val = sum(float(o.get("total") or 0) for o in stale)
+            lines.append(
+                f"…plus *{len(stale)}* older than {int(CX_MAX_AGE_DAYS)}d "
+                f"(oldest {int(oldest)}d, ${total_val:,.0f} quoted) — "
+                f"backlog to work in Printavo, not today's list.")
+        elif stale and stale_mode == "backlog":
+            # Pull older items OUT of #cx-daily into Luke's private block,
+            # itemized so he can restatus them and they fall off the pull.
+            if not fresh:
+                lines.append(f"…plus *{len(stale)}* older than "
+                             f"{int(CX_MAX_AGE_DAYS)}d — see your backlog DM.")
+            else:
+                lines.append(f"…plus *{len(stale)}* older than "
+                             f"{int(CX_MAX_AGE_DAYS)}d in your backlog DM.")
+            stale.sort(key=days_in_status, reverse=True)
+            total_val = sum(float(o.get("total") or 0) for o in stale)
+            backlog.append(
+                f"\n*{header} — backlog ({len(stale)}, ${total_val:,.0f})* "
+                f"— older than {int(CX_MAX_AGE_DAYS)}d; restatus these so they "
+                f"drop off tomorrow's pull:")
+            for o in stale:
+                backlog.append(_digest_line(o, days_in_status(o)))
+
+        if flipped:
+            flipped.sort(key=days_in_status, reverse=True)
+            fval = sum(float(o.get("total") or 0) for o in flipped)
+            backlog.append(
+                f"\n*{header} — auto-flipped back to Quote "
+                f"({len(flipped)}, ${fval:,.0f})* — were idle "
+                f">{int(CX_QUOTE_STALE_FLIP_DAYS)}d in QUOTE APPROVAL SENT; "
+                f"no longer triggering follow-ups:")
+            for o in flipped:
+                backlog.append(_digest_line(o, days_in_status(o)))
+        if flip_pending:
+            flip_pending.sort(key=days_in_status, reverse=True)
+            pval = sum(float(o.get("total") or 0) for o in flip_pending)
+            note = ("would flip (dry run)" if dry_run
+                    else "flip PENDING — set CX_FLIP_ENABLED=true to auto-flip")
+            backlog.append(
+                f"\n*{header} — stale ≥{int(CX_QUOTE_STALE_FLIP_DAYS)}d, "
+                f"{note} ({len(flip_pending)}, ${pval:,.0f})* — idle in QUOTE "
+                f"APPROVAL SENT; flip to Quote so they stop triggering:")
+            for o in flip_pending:
+                backlog.append(_digest_line(o, days_in_status(o)))
 
     if fetched["missing_statuses"]:
         lines.append("\n⚠️ Status names in STATUS_NAMES not found in Printavo "
                      f"(renamed?): {fetched['missing_statuses']}")
-    return "\n".join(lines), z1_marks
+
+    backlog_text = ""
+    if backlog:
+        head = (f"📋 *CX Backlog — {date_str}* (just for you — not in #cx-daily)")
+        backlog_text = head + "\n" + "\n".join(backlog)
+    return "\n".join(lines), z1_marks, backlog_text
 
 
 def _post_to_slack(text: str, webhook_url: str):
@@ -2216,32 +2409,48 @@ def _mark_z1_reported(marks: dict):
 
 
 def _run_cx_digest_impl(force_dry_run: bool = False) -> str:
-    text, z1_ids = _build_cx_digest()
+    is_dry = force_dry_run or _dry_run()
+    text, z1_ids, backlog = _build_cx_digest(dry_run=is_dry)
     if z1_ids is None:
         return text  # error
-    if force_dry_run or _dry_run():
-        print(f"[CX DIGEST — DRY RUN]\n{text}", flush=True)
-        return f"[DRY RUN — not posted to Slack]\n\n{text}"
+    backlog_block = f"\n\n{backlog}" if backlog else ""
+    if is_dry:
+        print(f"[CX DIGEST — DRY RUN]\n{text}\n{backlog}", flush=True)
+        return f"[DRY RUN — not posted to Slack]\n\n{text}{backlog_block}"
     if not CX_SLACK_WEBHOOK_URL:
         # Hard rule: CX content NEVER goes to SLACK_WEBHOOK_URL. No fallback.
         print(f"[CX DIGEST] CX_SLACK_WEBHOOK_URL not set — NOT posting.\n{text}",
               flush=True)
         return ("Error: CX_SLACK_WEBHOOK_URL not set. CX digest does not fall "
-                f"back to the production webhook.\n\n{text}")
+                f"back to the production webhook.\n\n{text}{backlog_block}")
     err = _post_to_slack(text, CX_SLACK_WEBHOOK_URL)
     if err:
-        return f"{err}\n\nDigest that failed to post:\n{text}"
+        return f"{err}\n\nDigest that failed to post:\n{text}{backlog_block}"
     _mark_z1_reported(z1_ids)
-    return f"Posted to #cx-daily ✓\n\n{text}"
+    # Luke's backlog block → private webhook only. Never #cx-daily. If the
+    # webhook isn't configured it still comes back in this return text.
+    backlog_status = ""
+    if backlog:
+        if CX_BACKLOG_SLACK_WEBHOOK_URL:
+            berr = _post_to_slack(backlog, CX_BACKLOG_SLACK_WEBHOOK_URL)
+            backlog_status = ("\n(backlog block sent to your private channel ✓)"
+                              if not berr else f"\n(backlog post failed: {berr})")
+        else:
+            backlog_status = ("\n(CX_BACKLOG_SLACK_WEBHOOK_URL not set — backlog "
+                              "block shown below only, not sent anywhere)")
+    return f"Posted to #cx-daily ✓{backlog_status}\n\n{text}{backlog_block}"
 
 
 @mcp.tool()
 def run_cx_digest(dry_run: bool = False) -> str:
     """
-    Build and post the daily CX digest (Z1 wellness calls, Z2 lingering
-    pickups, Z3 approval/mock-up chase, Z4 blocked) right now, without
-    waiting for the 8 AM schedule. dry_run=True (or env DRY_RUN=true)
-    returns the digest text instead of posting to Slack.
+    Build and post the daily CX digest right now, without waiting for the 8 AM
+    schedule. Five sections: Wellness Calls (contract orders excluded),
+    Lingering Pickups, Quote Follow-Ups, Art Follow-Ups, Blocked. Old pickups
+    and old quotes go to Luke's private backlog block (not #cx-daily); quotes
+    idle >45d in QUOTE APPROVAL SENT are auto-flipped back to Quote.
+    dry_run=True (or env DRY_RUN=true) returns the text and only LISTS the
+    flip candidates instead of posting to Slack or flipping anything.
     """
     return _run_cx_digest_impl(force_dry_run=dry_run)
 

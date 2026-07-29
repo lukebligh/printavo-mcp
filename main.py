@@ -1887,10 +1887,10 @@ CX_MAX_AGE_DAYS = float(os.environ.get("CX_MAX_AGE_DAYS", "14"))
 CX_QUOTE_STALE_FLIP_DAYS = float(os.environ.get("CX_QUOTE_STALE_FLIP_DAYS", "45"))
 # Safety cap on how many quotes a single run will auto-flip.
 CX_MAX_FLIPS_PER_RUN = int(os.environ.get("CX_MAX_FLIPS_PER_RUN", "100"))
-# Master on-switch for the actual flip mutation. Default OFF so the candidate
-# list shows up in Luke's backlog block first (nothing is mutated). Set
-# CX_FLIP_ENABLED=true on Railway once he's reviewed the list and is ready.
-CX_FLIP_ENABLED = os.environ.get("CX_FLIP_ENABLED", "").strip().lower() in (
+# Master on-switch for the actual flip mutation. Luke reviewed the candidate
+# list (all 700-1,800-day-old dead quotes) and approved the flip 2026-07-29,
+# so this defaults ON. Set CX_FLIP_ENABLED=false to pause it.
+CX_FLIP_ENABLED = os.environ.get("CX_FLIP_ENABLED", "true").strip().lower() in (
     "1", "true", "yes")
 
 # Each section is (zid, header, intro, STATUS_NAMES keys, min days-in-status
@@ -2338,10 +2338,10 @@ def _build_cx_digest(dry_run: bool = False):
             # itemized so he can restatus them and they fall off the pull.
             if not fresh:
                 lines.append(f"…plus *{len(stale)}* older than "
-                             f"{int(CX_MAX_AGE_DAYS)}d — see your backlog DM.")
+                             f"{int(CX_MAX_AGE_DAYS)}d — on Luke's backlog list.")
             else:
                 lines.append(f"…plus *{len(stale)}* older than "
-                             f"{int(CX_MAX_AGE_DAYS)}d in your backlog DM.")
+                             f"{int(CX_MAX_AGE_DAYS)}d on Luke's backlog list.")
             stale.sort(key=days_in_status, reverse=True)
             total_val = sum(float(o.get("total") or 0) for o in stale)
             backlog.append(

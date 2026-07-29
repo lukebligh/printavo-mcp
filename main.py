@@ -1926,14 +1926,14 @@ DIGEST_SECTIONS = [
      "quote approval sent, waiting on the customer to say yes since at least "
      "yesterday. One friendly bump usually shakes these loose.",
      ["QUOTE_APPROVAL_SENT"], 1,
-     {"stale": "backlog", "flip_stale_quotes": True}),
+     {"stale": "keep"}),
     ("Z5", "🎨 Art Follow-Ups",
      "waiting on the customer to approve art, a proof, a mock-up, or a sew-out "
      "since at least yesterday — plus jobs sitting in digitizing/transfer. "
      "Nudge or move them.",
      ["ART_APPROVAL_SENT", "MOCKUP_REQUESTED", "MOCKUP_READY",
       "PROOF_REQUESTED", "EMB_SEW_OUT_APPROVAL_SENT", "PROMO_ART_APPROVAL_SENT",
-      "EMB_ORDER_DIGITIZING", "DTF_ORDER_TRANSFER"], 1, {"stale": "slack"}),
+      "EMB_ORDER_DIGITIZING", "DTF_ORDER_TRANSFER"], 1, {"stale": "keep"}),
     ("Z4", "🚧 Blocked",
      "stuck 5+ days waiting on artwork, goods, or promo stock. "
      "These don't fix themselves — each one needs a chase or a decision today.",
@@ -2436,17 +2436,21 @@ def _build_cx_digest(dry_run: bool = False):
                 # dry run OR flip switch off: list candidates, mutate nothing.
                 flip_pending = candidates
 
-        # Age cap: list only orders <= CX_MAX_AGE_DAYS individually.
-        fresh = [o for o in hits if days_in_status(o) <= CX_MAX_AGE_DAYS]
-        stale = [o for o in hits if days_in_status(o) > CX_MAX_AGE_DAYS]
+        # Age cap: list only orders <= CX_MAX_AGE_DAYS individually — unless the
+        # section is "keep", in which case every hit is listed in full for as
+        # long as it stays in the status (no roll-off, no backlog, no flip).
+        stale_mode = opts.get("stale", "slack")
+        if stale_mode == "keep":
+            fresh, stale = hits, []
+        else:
+            fresh = [o for o in hits if days_in_status(o) <= CX_MAX_AGE_DAYS]
+            stale = [o for o in hits if days_in_status(o) > CX_MAX_AGE_DAYS]
         fresh.sort(key=days_in_status, reverse=True)
         if fresh:
             for o in fresh:
                 lines.append(_digest_line(o, days_in_status(o)))
         elif not stale:
             lines.append("— none —")
-
-        stale_mode = opts.get("stale", "slack")
         if stale and stale_mode == "slack":
             # Roll older items into a one-line count in the #cx-daily post.
             oldest = max(days_in_status(o) for o in stale)

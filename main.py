@@ -1923,16 +1923,17 @@ DIGEST_SECTIONS = [
      "sitting here is cash we haven't collected and space we don't have.",
      ["READY_FOR_PICKUP"], 2, {"stale": "backlog"}),
     ("Z3", "✏️ Quote Follow-Ups",
-     "quote approval sent, waiting on the customer to say yes for 3+ days. "
-     "One friendly bump usually shakes these loose.",
-     ["QUOTE_APPROVAL_SENT"], 3,
+     "quote approval sent, waiting on the customer to say yes since at least "
+     "yesterday. One friendly bump usually shakes these loose.",
+     ["QUOTE_APPROVAL_SENT"], 1,
      {"stale": "backlog", "flip_stale_quotes": True}),
     ("Z5", "🎨 Art Follow-Ups",
      "waiting on the customer to approve art, a proof, a mock-up, or a sew-out "
-     "for 3+ days — plus jobs sitting in digitizing/transfer. Nudge or move them.",
+     "since at least yesterday — plus jobs sitting in digitizing/transfer. "
+     "Nudge or move them.",
      ["ART_APPROVAL_SENT", "MOCKUP_REQUESTED", "MOCKUP_READY",
       "PROOF_REQUESTED", "EMB_SEW_OUT_APPROVAL_SENT", "PROMO_ART_APPROVAL_SENT",
-      "EMB_ORDER_DIGITIZING", "DTF_ORDER_TRANSFER"], 3, {"stale": "slack"}),
+      "EMB_ORDER_DIGITIZING", "DTF_ORDER_TRANSFER"], 1, {"stale": "slack"}),
     ("Z4", "🚧 Blocked",
      "stuck 5+ days waiting on artwork, goods, or promo stock. "
      "These don't fix themselves — each one needs a chase or a decision today.",

@@ -1887,6 +1887,15 @@ CX_MAX_AGE_DAYS = float(os.environ.get("CX_MAX_AGE_DAYS", "14"))
 CX_QUOTE_STALE_FLIP_DAYS = float(os.environ.get("CX_QUOTE_STALE_FLIP_DAYS", "45"))
 # Safety cap on how many quotes a single run will auto-flip.
 CX_MAX_FLIPS_PER_RUN = int(os.environ.get("CX_MAX_FLIPS_PER_RUN", "100"))
+# RECEIVABLES section: orders in INVOICED with an unpaid balance, pinged once
+# they are overdue by more than the grace period. Due date is derived per
+# invoice from its own payment terms (paymentTerm.days) — Net30 accounts pop at
+# ~day 33, Due-on-Receipt / Pre-Pay (0 or blank terms) at ~day 3 — so no
+# customer names are hardcoded and it stays correct as terms change.
+CX_RECEIVABLES_GRACE_DAYS = float(os.environ.get("CX_RECEIVABLES_GRACE_DAYS", "3"))
+# Most-overdue-first; show this many individually, roll the rest into a count.
+CX_RECEIVABLES_MAX_LINES = int(os.environ.get("CX_RECEIVABLES_MAX_LINES", "12"))
+
 # Master on-switch for the actual flip mutation. Luke reviewed the candidate
 # list (all 700-1,800-day-old dead quotes) and approved the flip 2026-07-29,
 # so this defaults ON. Set CX_FLIP_ENABLED=false to pause it.
@@ -2202,6 +2211,118 @@ def _scan_recent_approvals(window_start_utc, now_utc, max_scan=150):
     return {"hits": list(hits.values()), "errors": errors}
 
 
+def _fetch_receivables() -> dict:
+    """Full paginated scan of invoices in INVOICED, with balance + terms.
+    Returns {"orders": [...]} or {"error": ...}. Only invoices carry a
+    balance/terms, so quotes are not scanned."""
+    sres = fetch_all_statuses()
+    if "error" in sres:
+        return {"error": f"Could not fetch statuses: {sres['error']}"}
+    live_by_norm = {_norm_status(s["name"]): s["id"] for s in sres["nodes"]}
+    inv_norm = _norm_status(STATUS_NAMES["INVOICED"])
+    status_id = live_by_norm.get(inv_norm)
+
+    frag = """
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes {
+                id visualId nickname total amountOutstanding paidInFull
+                invoiceAt createdAt
+                paymentTerm { days name }
+                status { name }
+                contact { fullName customer { companyName } }
+            }
+    """
+    q_filtered = f"""
+    query($first: Int, $after: String, $statusIds: [ID!]) {{
+        invoices(first: $first, after: $after, statusIds: $statusIds) {{ {frag} }}
+    }}
+    """
+    r = paginate(q_filtered, {"statusIds": [status_id] if status_id else []},
+                 connection_path=("invoices",))
+    if "error" in r:
+        q_all = f"""
+        query($first: Int, $after: String) {{
+            invoices(first: $first, after: $after) {{ {frag} }}
+        }}
+        """
+        r = paginate(q_all, connection_path=("invoices",))
+        if "error" in r:
+            return {"error": f"receivables scan failed: {r['error']}"}
+
+    orders = []
+    for n in r["nodes"]:
+        if _norm_status((n.get("status") or {}).get("name", "")) != inv_norm:
+            continue
+        outstanding = float(n.get("amountOutstanding") or 0)
+        if n.get("paidInFull") or outstanding <= 0.005:
+            continue
+        contact = n.get("contact") or {}
+        company = ((contact.get("customer") or {}).get("companyName")
+                   or contact.get("fullName") or "—")
+        term = n.get("paymentTerm") or {}
+        orders.append({
+            "id": str(n.get("id")),
+            "visualId": n.get("visualId"),
+            "nickname": n.get("nickname") or "",
+            "outstanding": outstanding,
+            "invoiceAt": n.get("invoiceAt") or n.get("createdAt"),
+            "term_days": int(term.get("days") or 0),
+            "term_name": term.get("name") or "Pre-Pay",
+            "company": company,
+        })
+    return {"orders": orders}
+
+
+def _receivables_lines(now_utc: datetime) -> list:
+    """Build the Receivables section: INVOICED + unpaid, past due by more than
+    the grace period, most-overdue-first, capped with an overflow roll-up."""
+    header = "💵 Receivables"
+    intro = ("invoiced and still unpaid, past due on the customer's own terms "
+             "(Net 30 accounts show at ~day 33; Pre-Pay / Due-on-Receipt at "
+             "~day 3). Chase the money.")
+    out = [f"\n*{header}* — _{intro}_"]
+
+    fetched = _fetch_receivables()
+    if "error" in fetched:
+        out.append(f"⚠️ receivables scan failed: {fetched['error']}")
+        return out
+
+    def overdue_days(o):
+        inv = _parse_iso(o.get("invoiceAt"))
+        if inv is None:
+            return 0.0
+        due = inv + timedelta(days=o["term_days"])
+        return (now_utc - due).total_seconds() / 86400.0
+
+    due = [o for o in fetched["orders"]
+           if overdue_days(o) > CX_RECEIVABLES_GRACE_DAYS]
+    due.sort(key=overdue_days, reverse=True)
+
+    if not due:
+        out.append("— none —")
+        return out
+
+    shown = due[:CX_RECEIVABLES_MAX_LINES]
+    hidden = due[CX_RECEIVABLES_MAX_LINES:]
+    for o in shown:
+        url = f"https://www.printavo.com/invoices/{o['id']}"
+        nickname = o["nickname"] or "(no nickname)"
+        out.append(
+            f"• <{url}|#{o['visualId']}> — {o['company']} — {nickname} — "
+            f"{int(overdue_days(o))}d overdue — ${o['outstanding']:,.2f} owed "
+            f"({o['term_name']})")
+    total_all = sum(o["outstanding"] for o in due)
+    if hidden:
+        hidden_val = sum(o["outstanding"] for o in hidden)
+        out.append(f"…plus *{len(hidden)}* more unpaid (${hidden_val:,.0f}) — "
+                   f"${total_all:,.0f} owed across all {len(due)}.")
+    else:
+        out.append(f"_Total outstanding: ${total_all:,.2f} across "
+                   f"{len(due)} invoice(s)._")
+    return out
+
+
 def _flip_order_to_quote(internal_id: str, quote_status_id: str) -> bool:
     """Flip one order back to 'Quote'. Returns True on success."""
     mutation = """
@@ -2252,7 +2373,7 @@ def _build_cx_digest(dry_run: bool = False):
         date_str = now_ct.strftime("%A, %B %d")
     lines = [
         f"☕ *CX Daily — {date_str}*",
-        "Five lists, one pass, before the phones start. "
+        "Six lists, one pass, before the phones start. "
         "Links go straight to the invoice.",
     ]
     backlog = []          # Luke's private block, assembled per-section
@@ -2372,6 +2493,10 @@ def _build_cx_digest(dry_run: bool = False):
                 f"APPROVAL SENT; flip to Quote so they stop triggering:")
             for o in flip_pending:
                 backlog.append(_digest_line(o, days_in_status(o)))
+
+    # Receivables — INVOICED + unpaid, past due on each invoice's own terms.
+    # Always in the #cx-daily post (team collections work), never the backlog.
+    lines.extend(_receivables_lines(now_utc))
 
     if fetched["missing_statuses"]:
         lines.append("\n⚠️ Status names in STATUS_NAMES not found in Printavo "

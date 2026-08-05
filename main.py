@@ -20,6 +20,22 @@ CX_SLACK_WEBHOOK_URL = os.environ.get("CX_SLACK_WEBHOOK_URL", "") # CX digest �
 # sees (or his DM). If unset, the backlog only appears in the tool's return
 # text (visible when Luke runs run_cx_digest manually) and never in #cx-daily.
 CX_BACKLOG_SLACK_WEBHOOK_URL = os.environ.get("CX_BACKLOG_SLACK_WEBHOOK_URL", "")
+
+# ── ART QUEUE DIGEST → Richie ──────────────────────────────────────────────────
+# Weekday 8 AM DM to Richie: every order in the five art-queue statuses, with an
+# hours-in-status clock and a 24h SLA flag. Delivery is a true DM via a Slack
+# bot token (chat.postMessage to the user), with an optional channel webhook
+# fallback. NEITHER is needed for a dry run — dry runs only build/return text.
+# HARD GATE: the scheduler never posts unless ART_DIGEST_ENABLED is true, so the
+# code can be deployed and dry-run-previewed without messaging anyone.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")            # xoxb-… with chat:write
+ART_DM_USER_ID  = os.environ.get("ART_DM_USER_ID", "U080NBG912L") # Richie T.
+ART_SLACK_WEBHOOK_URL = os.environ.get("ART_SLACK_WEBHOOK_URL", "")# optional channel fallback
+ART_DIGEST_ENABLED = os.environ.get("ART_DIGEST_ENABLED", "").strip().lower() in (
+    "1", "true", "yes")
+ART_SLA_HOURS = float(os.environ.get("ART_SLA_HOURS", "24"))
+ART_SNAPSHOT_PATH = os.environ.get("ART_SNAPSHOT_PATH", "")
+
 API_URL          = "https://www.printavo.com/api/v2"
 
 def _dry_run() -> bool:
@@ -46,6 +62,8 @@ STATUS_NAMES = {
     "PROMO_ART_APPROVAL_SENT":  "PROMO - ART APPROVAL SENT",
     "EMB_ORDER_DIGITIZING":     "EMB - ORDER DIGITIZING",
     "DTF_ORDER_TRANSFER":       "DTF - ORDER TRANSFER",
+    # Art queue digest (Richie)
+    "ARTWORK_DECLINED":         "ARTWORK DECLINED",
     # CX digest Z4 — blocked
     "CONTRACT_WAITING_ARTWORK": "CONTRACT - WAITING ON ARTWORK",
     "CONTRACT_WAITING_GOODS":   "CONTRACT - WAITING ON GOODS",
@@ -2687,6 +2705,292 @@ def run_cx_digest_scheduler():
         time.sleep(120)
 
 
+# ── ART QUEUE DIGEST (Richie) ──────────────────────────────────────────────────
+# A Richie-facing twin of the CX digest, scoped to the five art-queue statuses.
+# Reports HOURS in status (not days) against a 24h SLA. Uses its OWN snapshot
+# store so its clocks are independent of the CX digest's daily prune.
+#
+# STATUS-AGE SOURCE: same constraint as the CX digest — Printavo exposes no
+# status-change timestamp, so hours-in-status come from a snapshot seeded from
+# updatedAt on first sighting (a conservative lower bound) and reset to "now" the
+# moment an order changes status. Exact from the run after first deploy.
+
+# Fixed section order. Each is (header_label, [STATUS_NAMES keys]).
+ART_SECTIONS = [
+    ("PROOF REQUESTED",        ["PROOF_REQUESTED"]),
+    ("MOCK-UP REQUESTED",      ["MOCKUP_REQUESTED"]),
+    ("ARTWORK DECLINED",       ["ARTWORK_DECLINED"]),
+    ("EMB – ORDER DIGITIZING", ["EMB_ORDER_DIGITIZING"]),
+    ("DTF – ORDER TRANSFER",   ["DTF_ORDER_TRANSFER"]),
+]
+
+
+def _art_status_keys() -> list:
+    keys = []
+    for _label, section_keys in ART_SECTIONS:
+        keys.extend(section_keys)
+    return keys
+
+
+def _art_snapshot_path() -> str:
+    if ART_SNAPSHOT_PATH:
+        return ART_SNAPSHOT_PATH
+    if os.path.isdir("/data"):  # Railway volume default mount
+        return "/data/art_status_snapshot.json"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "art_status_snapshot.json")
+
+
+def _load_art_snapshot() -> dict:
+    try:
+        with open(_art_snapshot_path(), "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_art_snapshot(snap: dict):
+    path = _art_snapshot_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(snap, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass  # best-effort; never kill a digest run
+
+
+def _fetch_art_orders() -> dict:
+    """Full paginated scan of every invoice AND quote currently in one of the
+    five art-queue statuses. Tries the server-side statusIds filter first, falls
+    back to an unfiltered walk with client-side filtering. Mirrors
+    _fetch_tracked_orders. Returns {"orders": [...], "missing_statuses": [...]}
+    or {"error": ...}."""
+    sres = fetch_all_statuses()
+    if "error" in sres:
+        return {"error": f"Could not fetch statuses: {sres['error']}"}
+    live_by_norm = {_norm_status(s["name"]): s["id"] for s in sres["nodes"]}
+
+    tracked_norms, status_ids, missing = set(), [], []
+    for key in _art_status_keys():
+        norm = _norm_status(STATUS_NAMES[key])
+        tracked_norms.add(norm)
+        if norm in live_by_norm:
+            status_ids.append(live_by_norm[norm])
+        else:
+            missing.append(STATUS_NAMES[key])
+
+    frag = """
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes {
+                id visualId nickname
+                status { name }
+                timestamps { updatedAt }
+                contact { fullName customer { companyName } }
+            }
+    """
+    orders, seen = [], set()
+    for field in ("invoices", "quotes"):
+        q_filtered = f"""
+        query($first: Int, $after: String, $statusIds: [ID!]) {{
+            {field}(first: $first, after: $after, statusIds: $statusIds) {{ {frag} }}
+        }}
+        """
+        r = paginate(q_filtered, {"statusIds": status_ids},
+                     connection_path=(field,))
+        if "error" in r:
+            q_all = f"""
+            query($first: Int, $after: String) {{
+                {field}(first: $first, after: $after) {{ {frag} }}
+            }}
+            """
+            r = paginate(q_all, connection_path=(field,))
+            if "error" in r:
+                return {"error": f"{field} scan failed: {r['error']}"}
+        for n in r["nodes"]:
+            status_name = (n.get("status") or {}).get("name", "")
+            if _norm_status(status_name) not in tracked_norms:
+                continue
+            oid = str(n.get("id"))
+            if oid in seen:
+                continue
+            seen.add(oid)
+            contact = n.get("contact") or {}
+            company = ((contact.get("customer") or {}).get("companyName")
+                       or contact.get("fullName") or "—")
+            orders.append({
+                "id": oid,
+                "visualId": n.get("visualId"),
+                "nickname": n.get("nickname") or "",
+                "status": status_name,
+                "company": company,
+                "updatedAt": (n.get("timestamps") or {}).get("updatedAt"),
+                "kind": field,
+            })
+    return {"orders": orders, "missing_statuses": missing}
+
+
+def _update_art_snapshot(orders: list, now_utc: datetime) -> dict:
+    """Persist {id: {status, first_seen}} for the art queue; reset first_seen on
+    a status change; prune orders no longer in an art status. first_seen is
+    seeded from updatedAt on first sighting (lower bound) so existing orders show
+    a realistic age on day one instead of 0h."""
+    snap = _load_art_snapshot()
+    new_snap = {}
+    for o in orders:
+        prev = snap.get(o["id"])
+        upd = _parse_iso(o.get("updatedAt"))
+        if prev and _norm_status(prev.get("status")) == _norm_status(o["status"]):
+            entry = dict(prev)
+        else:
+            if prev is None and upd and upd < now_utc:
+                first_seen = upd.isoformat()      # first sighting → seed from updatedAt
+            else:
+                first_seen = now_utc.isoformat()  # observed status CHANGE → now
+            entry = {"status": o["status"], "first_seen": first_seen}
+        new_snap[o["id"]] = entry
+    _save_art_snapshot(new_snap)
+    return new_snap
+
+
+def _fmt_hours(hours: float) -> str:
+    if hours < 1:
+        return "<1h"
+    return f"{int(hours)}h"
+
+
+def _build_art_digest():
+    """Build the art-queue digest text. Returns (text, ok) — ok False on error.
+    Always updates the art snapshot (starts/continues the hour clocks)."""
+    now_utc = datetime.now(timezone.utc)
+    now_ct = _central_now()
+    fetched = _fetch_art_orders()
+    if "error" in fetched:
+        return f"ART QUEUE ERROR: {fetched['error']}", False
+    orders = fetched["orders"]
+    snap = _update_art_snapshot(orders, now_utc)
+
+    def hours_in_status(o):
+        e = snap.get(o["id"]) or {}
+        fs = _parse_iso(e.get("first_seen"))
+        if fs is None:
+            return 0.0
+        return (now_utc - fs).total_seconds() / 3600.0
+
+    try:
+        date_str = now_ct.strftime("%A, %B %-d")
+    except ValueError:
+        date_str = now_ct.strftime("%A, %B %d")
+
+    lines = [
+        f"\U0001F3A8 *Art Queue — {date_str}*",
+        f"Everything here targets a {int(ART_SLA_HOURS)}h turnaround. "
+        f"\U0001F534 = past {int(ART_SLA_HOURS)}h.",
+    ]
+    total, past_sla = 0, 0
+    for label, section_keys in ART_SECTIONS:
+        norms = {_norm_status(STATUS_NAMES[k]) for k in section_keys}
+        hits = [o for o in orders if _norm_status(o["status"]) in norms]
+        hits.sort(key=hours_in_status, reverse=True)
+        lines.append(f"\n*{label}* ({len(hits)})")
+        for o in hits:
+            hrs = hours_in_status(o)
+            total += 1
+            flag = ""
+            if hrs > ART_SLA_HOURS:
+                past_sla += 1
+                flag = "\U0001F534 "
+            path = "invoices" if o["kind"] == "invoices" else "quotes"
+            url = f"https://www.printavo.com/{path}/{o['id']}"
+            nickname = o["nickname"] or "(no nickname)"
+            lines.append(f"{flag}<{url}|#{o['visualId']}> — {nickname} — "
+                         f"{o['company']} — {_fmt_hours(hrs)}")
+
+    lines.append(f"\n_Total in queue: {total}   ·   Past {int(ART_SLA_HOURS)}h "
+                 f"SLA: {past_sla}_")
+    if fetched["missing_statuses"]:
+        lines.append("\n⚠️ Art status names not found in Printavo "
+                     f"(renamed?): {fetched['missing_statuses']}")
+    return "\n".join(lines), True
+
+
+def _post_art_digest(text: str):
+    """Deliver the art digest. Prefers a true DM via bot token; falls back to a
+    channel webhook. Returns None on success, or an error string."""
+    if SLACK_BOT_TOKEN:
+        resp = httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            json={"channel": ART_DM_USER_ID, "text": text,
+                  "unfurl_links": False, "unfurl_media": False},
+            timeout=15)
+        if resp.status_code != 200:
+            return f"Slack API HTTP {resp.status_code} — {resp.text[:200]}"
+        body = resp.json()
+        if not body.get("ok"):
+            return f"Slack API error: {body.get('error')}"
+        return None
+    if ART_SLACK_WEBHOOK_URL:
+        return _post_to_slack(text, ART_SLACK_WEBHOOK_URL)
+    return ("Error: no art-digest delivery configured (set SLACK_BOT_TOKEN for a "
+            "DM to Richie, or ART_SLACK_WEBHOOK_URL for a channel).")
+
+
+def _run_art_digest_impl(force_dry_run: bool = False) -> str:
+    is_dry = force_dry_run or _dry_run()
+    text, ok = _build_art_digest()
+    if not ok:
+        return text  # error
+    if is_dry:
+        print(f"[ART QUEUE — DRY RUN]\n{text}", flush=True)
+        return f"[DRY RUN — not posted]\n\n{text}"
+    if not ART_DIGEST_ENABLED:
+        print("[ART QUEUE] ART_DIGEST_ENABLED not set — built but NOT posting.",
+              flush=True)
+        return f"[NOT POSTED — ART_DIGEST_ENABLED is off]\n\n{text}"
+    err = _post_art_digest(text)
+    if err:
+        return f"{err}\n\nDigest that failed to post:\n{text}"
+    dest = f"DM to {ART_DM_USER_ID}" if SLACK_BOT_TOKEN else "art channel"
+    return f"Posted to {dest} ✓\n\n{text}"
+
+
+@mcp.tool()
+def run_art_digest(dry_run: bool = False) -> str:
+    """
+    Build and (if enabled) DM Richie the daily Art Queue digest right now,
+    without waiting for the 8 AM schedule. Five sections in fixed order: PROOF
+    REQUESTED, MOCK-UP REQUESTED, ARTWORK DECLINED, EMB - ORDER DIGITIZING, DTF -
+    ORDER TRANSFER. Each order shows hours-in-status with a red flag past the 24h
+    SLA. dry_run=True (or env DRY_RUN=true) returns the text without posting.
+    Even when not dry-run, nothing posts unless ART_DIGEST_ENABLED is true.
+    """
+    return _run_art_digest_impl(force_dry_run=dry_run)
+
+
+_last_art_digest_date = None
+
+def run_art_digest_scheduler():
+    """Background thread: DM Richie the art queue at 8:00 AM America/Chicago,
+    weekdays, skipping federal holidays. No-op until ART_DIGEST_ENABLED is set."""
+    global _last_art_digest_date
+    while True:
+        try:
+            now_ct = _central_now()
+            if (ART_DIGEST_ENABLED
+                    and now_ct.weekday() < 5
+                    and not _is_us_federal_holiday(now_ct)
+                    and now_ct.hour == 8 and now_ct.minute < 10
+                    and _last_art_digest_date != now_ct.date().isoformat()):
+                _last_art_digest_date = now_ct.date().isoformat()
+                _run_art_digest_impl()
+        except Exception as e:
+            print(f"[ART QUEUE] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
 # ── DAILY SLACK SCHEDULER ─────────────────────────────────────────────────────
 
 def _is_us_federal_holiday(dt: datetime) -> bool:
@@ -2875,6 +3179,9 @@ scheduler_thread.start()
 
 cx_digest_thread = threading.Thread(target=run_cx_digest_scheduler, daemon=True)
 cx_digest_thread.start()
+
+art_digest_thread = threading.Thread(target=run_art_digest_scheduler, daemon=True)
+art_digest_thread.start()
 
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))

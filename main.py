@@ -29,7 +29,7 @@ CX_BACKLOG_SLACK_WEBHOOK_URL = os.environ.get("CX_BACKLOG_SLACK_WEBHOOK_URL", ""
 # HARD GATE: the scheduler never posts unless ART_DIGEST_ENABLED is true, so the
 # code can be deployed and dry-run-previewed without messaging anyone.
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")            # xoxb-… with chat:write
-ART_DM_USER_ID  = os.environ.get("ART_DM_USER_ID", "U080NBG912L") # Richie T.
+ART_DM_USER_ID  = os.environ.get("ART_DM_USER_ID", "U080NBG912L,U0504FSDYB0") # Richie T., Luke (comma-separated)
 ART_SLACK_WEBHOOK_URL = os.environ.get("ART_SLACK_WEBHOOK_URL", "")# optional channel fallback
 ART_DIGEST_ENABLED = os.environ.get("ART_DIGEST_ENABLED", "").strip().lower() in (
     "1", "true", "yes")
@@ -2517,9 +2517,6 @@ def _build_cx_digest(dry_run: bool = False):
             for o in flip_pending:
                 backlog.append(_digest_line(o, days_in_status(o)))
 
-    # Receivables — INVOICED + unpaid, past due on each invoice's own terms.
-    # Always in the #cx-daily post (team collections work), never the backlog.
-    lines.extend(_receivables_lines(now_utc))
 
     if fetched["missing_statuses"]:
         lines.append("\n⚠️ Status names in STATUS_NAMES not found in Printavo "
@@ -2696,7 +2693,7 @@ def run_cx_digest_scheduler():
             now_ct = _central_now()
             if (now_ct.weekday() < 5
                     and not _is_us_federal_holiday(now_ct)
-                    and now_ct.hour == 8 and now_ct.minute < 10
+                    and now_ct.hour == 7 and 40 <= now_ct.minute < 50
                     and _last_digest_date != now_ct.date().isoformat()):
                 _last_digest_date = now_ct.date().isoformat()
                 _run_cx_digest_impl()
@@ -2919,19 +2916,23 @@ def _post_art_digest(text: str):
     """Deliver the art digest. Prefers a true DM via bot token; falls back to a
     channel webhook. Returns None on success, or an error string."""
     if SLACK_BOT_TOKEN:
-        resp = httpx.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-                     "Content-Type": "application/json; charset=utf-8"},
-            json={"channel": ART_DM_USER_ID, "text": text,
-                  "unfurl_links": False, "unfurl_media": False},
-            timeout=15)
-        if resp.status_code != 200:
-            return f"Slack API HTTP {resp.status_code} — {resp.text[:200]}"
-        body = resp.json()
-        if not body.get("ok"):
-            return f"Slack API error: {body.get('error')}"
-        return None
+        recipients = [r.strip() for r in ART_DM_USER_ID.split(",") if r.strip()]
+        errors = []
+        for uid in recipients:
+            resp = httpx.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                json={"channel": uid, "text": text,
+                      "unfurl_links": False, "unfurl_media": False},
+                timeout=15)
+            if resp.status_code != 200:
+                errors.append(f"{uid}: HTTP {resp.status_code} — {resp.text[:150]}")
+                continue
+            body = resp.json()
+            if not body.get("ok"):
+                errors.append(f"{uid}: {body.get('error')}")
+        return None if not errors else "; ".join(errors)
     if ART_SLACK_WEBHOOK_URL:
         return _post_to_slack(text, ART_SLACK_WEBHOOK_URL)
     return ("Error: no art-digest delivery configured (set SLACK_BOT_TOKEN for a "

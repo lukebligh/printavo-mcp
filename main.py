@@ -3175,6 +3175,172 @@ def run_daily_scheduler():
         time.sleep(120)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  BALLPARK ESTIMATOR  —  SanMar/S&S net cost × pricing matrix → rough quote
+#  Data lives in ./pricing/ (sanmar_prices.json + matrices/*.csv).
+#  BALLPARK only — Printavo is the final lever.
+# ══════════════════════════════════════════════════════════════════════════════
+import csv as _csv
+
+_EST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing")
+_EST_MARKUP_MODE = "plus"   # "plus" -> cost*(1+m/100)  |  "times" -> cost*(m/100)
+
+_EST_MATRICES = {
+    "direct": "direct.csv", "wholesale": "wholesale.csv", "contract_sp": "contract_sp.csv",
+    "brrm": "brrm.csv", "contract_emb": "contract_emb.csv", "emb_direct": "emb_direct.csv",
+    "transfers_direct": "transfers_direct.csv", "transfers_contract": "transfers_contract.csv",
+}
+_EST_SANMAR = None          # lazy-loaded style->cost lookup
+_EST_MATRIX_CACHE = {}
+
+
+def _est_cogs_discount(cost):
+    # tiered high-COGs reducer: $8-11 -10% | $11-20 -15% | >$20 -20%
+    if cost is None or cost < 8:  return 0.0
+    if cost < 11:                 return 0.10
+    if cost <= 20:                return 0.15
+    return 0.20
+
+
+def _est_load_sanmar():
+    global _EST_SANMAR
+    if _EST_SANMAR is None:
+        with open(os.path.join(_EST_DIR, "sanmar_prices.json")) as f:
+            _EST_SANMAR = json.load(f)
+    return _EST_SANMAR
+
+
+def _est_ss_case_price(style):
+    acct = os.environ.get("SSACTIVEWEAR_ACCOUNT"); key = os.environ.get("SSACTIVEWEAR_APIKEY")
+    if not acct or not key:
+        return None
+    try:
+        r = httpx.get(f"https://api.ssactivewear.com/v2/products/?style={style}",
+                      auth=(acct, key), headers={"Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        items = r.json()
+    except Exception:
+        return None
+    prices = []
+    for it in (items or []):
+        for fld in ("customerPrice", "casePrice", "salePrice", "piecePrice", "mapPrice"):
+            v = it.get(fld)
+            if isinstance(v, (int, float)) and v > 0:
+                prices.append(float(v)); break
+    return min(prices) if prices else None
+
+
+def _est_cost(style, size="(X)S-(X)L"):
+    data = _est_load_sanmar()
+    d = data.get(style.strip().upper()) or data.get(style.strip())
+    if d:
+        sizes = d.get("sizes", {})
+        row = sizes.get(size) or sizes.get("(X)S-(X)L") or (next(iter(sizes.values()), {}))
+        c = row.get("case")
+        if c is not None:
+            return c, {"source": "sanmar", "desc": d.get("desc"), "size": size}
+    ss = _est_ss_case_price(style)
+    if ss is not None:
+        return ss, {"source": "ss", "desc": None, "size": size}
+    return None, {"source": None, "desc": d.get("desc") if d else None, "size": size}
+
+
+def _est_load_matrix(name):
+    if name not in _EST_MATRIX_CACHE:
+        with open(os.path.join(_EST_DIR, "matrices", _EST_MATRICES[name])) as f:
+            rows = list(_csv.reader(f))
+        header = rows[0]
+        markup_idx = len(header) - 1
+        cols = {header[i].strip(): i for i in range(1, markup_idx)}
+        tiers = [r for r in rows[1:] if r and r[0].strip()]
+        _EST_MATRIX_CACHE[name] = (cols, markup_idx, tiers)
+    return _EST_MATRIX_CACHE[name]
+
+
+def _est_pick_tier(tiers, qty):
+    chosen = tiers[0]
+    for r in tiers:
+        if int(float(r[0])) <= qty:
+            chosen = r
+        else:
+            break
+    return chosen
+
+
+def _est_resolve_col(cols, complexity):
+    if str(complexity) in cols:
+        return str(complexity), cols[str(complexity)]
+    try:
+        n = int(complexity)
+        for label in cols:
+            if label.lower().startswith(f"{n} color"):
+                return label, cols[label]
+        for label, idx in cols.items():
+            nums = []
+            for p in label.replace("–", "-").split("-"):
+                digits = "".join(ch for ch in p if ch.isdigit())
+                if digits:
+                    nums.append(int(digits))
+            if len(nums) == 2 and nums[0] <= n <= nums[1]:
+                return label, idx
+            if len(nums) == 1 and n <= nums[0]:
+                return label, idx
+    except (ValueError, TypeError):
+        pass
+    for label in cols:
+        if str(complexity).lower() in label.lower():
+            return label, cols[label]
+    raise ValueError(f"Could not match '{complexity}' to columns {list(cols)}")
+
+
+@mcp.tool()
+def estimate_price(style: str, qty: int, matrix: str, complexity: str,
+                   size: str = "(X)S-(X)L") -> str:
+    """Ballpark price estimate for a decorated garment. NOT final — Printavo is the final lever.
+
+    style      : garment style number (e.g. PC55, ST350, K500). SanMar first, S&S fallback.
+    qty        : order quantity.
+    matrix     : one of direct | wholesale | contract_sp | brrm | contract_emb | emb_direct
+                 | transfers_direct | transfers_contract
+    complexity : # of ink colors (screen print), stitch count (embroidery),
+                 or transfer size label (DTF: LC | A5 | A4 | SQ | A3).
+    size       : SanMar size band for upcharges (default (X)S-(X)L; e.g. 2XL, 3XL).
+
+    Method: garment = blank net cost x (1 + matrix markup%); + decoration charge from the
+    matrix at (qty tier x complexity); then a tiered high-COGs reducer
+    ($8-11 -10% | $11-20 -15% | >$20 -20%).
+    """
+    if matrix not in _EST_MATRICES:
+        return f"Unknown matrix '{matrix}'. Choose one of: {', '.join(_EST_MATRICES)}"
+    cost, meta = _est_cost(style, size)
+    try:
+        cols, markup_idx, tiers = _est_load_matrix(matrix)
+        tier = _est_pick_tier(tiers, qty)
+        markup = float(tier[markup_idx])
+        label, cidx = _est_resolve_col(cols, complexity)
+        decoration = float(tier[cidx])
+    except Exception as e:
+        return f"Estimate error: {e}"
+    if cost is None:
+        return (f"{style} ({meta.get('desc') or 'unknown'}) — no cost found in SanMar list, "
+                f"and S&S lookup unavailable (set SSACTIVEWEAR_ACCOUNT/APIKEY). Can't estimate.")
+    garment = cost * (1 + markup / 100) if _EST_MARKUP_MODE == "plus" else cost * (markup / 100)
+    per_pc = garment + decoration
+    disc = _est_cogs_discount(cost)
+    if disc:
+        per_pc *= (1 - disc)
+    red = f"  (COGs reducer -{int(disc*100)}%)" if disc else ""
+    total = per_pc * qty
+    return (
+        f"{style} ({meta.get('desc') or ''}) x{qty} @ {meta.get('size')}\n"
+        f"  matrix: {matrix} | tier {int(float(tier[0]))} | {label} | markup {markup}% "
+        f"(cost src: {meta.get('source')})\n"
+        f"  blank cost ${cost:.2f} -> garment ${garment:.2f} + decoration ${decoration:.2f}{red}\n"
+        f"  = ${per_pc:.2f}/pc  |  TOTAL ${total:.2f}\n"
+        f"  (BALLPARK — verify/finalize in Printavo)"
+    )
+
+
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
 scheduler_thread.start()
 

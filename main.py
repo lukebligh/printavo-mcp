@@ -3183,7 +3183,7 @@ def run_daily_scheduler():
 import csv as _csv
 
 _EST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing")
-_EST_MARKUP_MODE = "plus"   # "plus" -> cost*(1+m/100)  |  "times" -> cost*(m/100)
+_EST_MARKUP_MODE = "times"  # garment = cost * (markup%/100)  e.g. $6.75 * 1.65 = $11.14
 
 _EST_MATRICES = {
     "direct": "direct.csv", "wholesale": "wholesale.csv", "contract_sp": "contract_sp.csv",

@@ -1848,12 +1848,14 @@ def set_line_item_category(line_item_id: str, category_name: str = "Misc") -> st
     cat_id = _find_category_id(category_name)
     if not cat_id:
         return f"Category '{category_name}' not found on this account."
+    fr = query_printavo("query($id: ID!){ lineItem(id: $id){ position } }", {"id": line_item_id})
+    pos = ((fr.get("lineItem") or {}).get("position")) or 1
     m = """
-    mutation($id: ID!, $catId: ID!) {
-        lineItemUpdate(id: $id, input: { category: { id: $catId } }) { id category { id name } }
+    mutation($id: ID!, $catId: ID!, $pos: Int!) {
+        lineItemUpdate(id: $id, input: { position: $pos, category: { id: $catId } }) { id category { id name } }
     }
     """
-    r = query_printavo(m, {"id": line_item_id, "catId": cat_id})
+    r = query_printavo(m, {"id": line_item_id, "catId": cat_id, "pos": pos})
     if "error" in r:
         return f"API Error: {r['error']}"
     li = r.get("lineItemUpdate") or {}

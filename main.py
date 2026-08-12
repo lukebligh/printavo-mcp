@@ -3622,8 +3622,11 @@ def sage_product_detail(spc: str = "", prod_eid: str = "", image_res: int = 300)
         return f"No SAGE detail found for SPC {spc}."
     name = p.get("prName") or p.get("name") or "(no name)"
     lines = [f"{name} — SPC {spc} | item# {p.get('itemNum','')}"]
-    if p.get("category"): lines.append(f"  category: {p['category']}")
-    if p.get("colors"):   lines.append(f"  colors: {p['colors']}")
+    if p.get("category"):   lines.append(f"  category: {p['category']}")
+    if p.get("colors"):     lines.append(f"  colors: {p['colors']}")
+    if p.get("dimensions"): lines.append(f"  dimensions: {p['dimensions']}")
+    supp = p.get("supplier") or resp.get("supplier") or {}
+    if supp.get("url"):     lines.append(f"  product url: {supp['url']}")
     imp, imploc = p.get("imprintArea", ""), p.get("imprintLoc", "")
     if imp or imploc:     lines.append(f"  imprint: {imp}{(' @ ' + imploc) if imploc else ''}")
     desc = (p.get("description") or "").strip()

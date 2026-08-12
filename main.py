@@ -1765,7 +1765,7 @@ def add_line_item(line_item_group_id: str, item_number: str, description: str = 
     mutation($groupId: ID!, $itemNumber: String, $color: String, $description: String, $price: Float, $count: Int) {
         lineItemCreate(lineItemGroupId: $groupId, input: {
             itemNumber: $itemNumber, color: $color, description: $description,
-            price: $price, position: 1, sizes: [{ size: size_os, count: $count }]
+            price: $price, position: 1, sizes: [{ size: size_other, count: $count }]
         }) { id price items itemNumber color }
     }
     """

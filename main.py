@@ -3341,6 +3341,85 @@ def estimate_price(style: str, qty: int, matrix: str, complexity: str,
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SAGE CONNECT  —  promotional-product lookups (Product Search, service 103)
+#  Auth via env: SAGE_ACCT_ID (default 253658), SAGE_LOGIN_ID, SAGE_AUTH_KEY.
+#  POST JSON to the promoplace ConnectAPI endpoint.
+# ══════════════════════════════════════════════════════════════════════════════
+SAGE_ENDPOINT = "https://www.promoplace.com/ws/ws.dll/ConnectAPI"
+SAGE_API_VER  = 130
+SAGE_ACCT_ID  = os.environ.get("SAGE_ACCT_ID", "253658")
+SAGE_LOGIN_ID = os.environ.get("SAGE_LOGIN_ID", "")
+SAGE_AUTH_KEY = os.environ.get("SAGE_AUTH_KEY", "")
+
+
+def _sage_call(service_id, body):
+    if not SAGE_AUTH_KEY:
+        return {"ok": False, "errMsg": "SAGE_AUTH_KEY not set — add it in Railway env vars."}
+    payload = {
+        "serviceId": service_id,
+        "apiVer": SAGE_API_VER,
+        "auth": {"acctId": SAGE_ACCT_ID, "loginId": SAGE_LOGIN_ID, "key": SAGE_AUTH_KEY},
+    }
+    payload.update(body)
+    try:
+        r = httpx.post(SAGE_ENDPOINT, json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "errMsg": f"SAGE request failed: {e}"}
+
+
+@mcp.tool()
+def sage_product_search(query: str = "", category: str = "", price_low: float = 0,
+                        price_high: float = 0, qty: int = 0, limit: int = 10,
+                        sort: str = "BESTMATCH") -> str:
+    """Search SAGE for promotional products (tchotchkes: drinkware, bags, pens, awards, etc.).
+
+    query      : quick-search text — a category ("koozies"), keyword, or SPC (smart-matched).
+    category   : optional explicit SAGE category name or number (comma-separated ok).
+    price_low  : optional minimum price (USD).
+    price_high : optional maximum price / budget cap (USD).
+    qty        : optional quantity (affects pricing tiers).
+    limit      : max products to return (default 10 — the "top X").
+    sort       : BESTMATCH (default) | PRICE (low→high, budget) | PRICEHIGHLOW | POPULARITY.
+    Returns name, SAGE Product Code (SPC), price, supplier, production time, and image link.
+    """
+    search = {}
+    if query:      search["quickSearch"] = query
+    if category:   search["categories"] = category
+    if price_low:  search["priceLow"] = price_low
+    if price_high: search["priceHigh"] = price_high
+    if qty:        search["qty"] = qty
+    search["sort"] = sort
+    search["maxRecs"] = int(limit)
+    search["maxTotalItems"] = max(int(limit), 50)
+    search["extraReturnFields"] = "SUPPLIER,DESCRIPTION,PRODTIME"
+    if not search.get("quickSearch") and not search.get("categories"):
+        return "Provide a query (e.g. 'koozies') or a category to search SAGE."
+    resp = _sage_call(103, {"search": search})
+    if not resp.get("ok", False):
+        return f"SAGE search error: {resp.get('errMsg') or resp.get('errNum') or resp}"
+    prods = resp.get("products", []) or []
+    total = resp.get("totalFound", len(prods))
+    if not prods:
+        return f"No SAGE products found for '{query or category}'."
+    budget = f", ${price_low:g}-${price_high:g}" if (price_low or price_high) else ""
+    lines = [f"SAGE — {total} match(es) for '{query or category}'{budget} (top {min(limit, len(prods))}):"]
+    for p in prods[:limit]:
+        name = p.get("name") or p.get("prName") or "(no name)"
+        supplier = p.get("supplier") or ""
+        prc = p.get("prc") or ""
+        spc = p.get("spc") or ""
+        pt = p.get("prodTime")
+        extra = []
+        if supplier: extra.append(str(supplier))
+        if pt:       extra.append(f"{pt}day")
+        tail = f" | {' · '.join(extra)}" if extra else ""
+        lines.append(f"  • {name} — ${prc} | SPC {spc}{tail}")
+    return "\n".join(lines)
+
+
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
 scheduler_thread.start()
 

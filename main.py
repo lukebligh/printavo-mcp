@@ -3424,6 +3424,53 @@ def sage_product_search(query: str = "", category: str = "", price_low: float = 
     return "\n".join(lines)
 
 
+@mcp.tool()
+def sage_product_detail(spc: str, image_res: int = 300) -> str:
+    """Full detail for one SAGE product by SPC (SAGE Connect service 105).
+
+    Returns supplier item number, name, description, category, colors, imprint area/location,
+    price-by-quantity tiers (list price + net cost), and product image URLs.
+    Use after sage_product_search to build a Printavo line item and attach a mockup.
+    spc : the SAGE Product Code from a search result (e.g. "CXYXK-EBTHV").
+    """
+    if not spc:
+        return "Provide a SAGE Product Code (SPC) — get one from sage_product_search."
+    resp = _sage_call(105, {"spc": spc, "includeSuppInfo": 1})
+    if resp.get("errNum") or resp.get("ok") is False:
+        return f"SAGE detail error: {resp.get('errMsg') or resp.get('errNum') or resp}"
+    p = resp.get("product") or {}
+    if not p:
+        return f"No SAGE detail found for SPC {spc}."
+    name = p.get("prName") or p.get("name") or "(no name)"
+    lines = [f"{name} — SPC {spc} | item# {p.get('itemNum','')}"]
+    if p.get("category"): lines.append(f"  category: {p['category']}")
+    if p.get("colors"):   lines.append(f"  colors: {p['colors']}")
+    imp, imploc = p.get("imprintArea", ""), p.get("imprintLoc", "")
+    if imp or imploc:     lines.append(f"  imprint: {imp}{(' @ ' + imploc) if imploc else ''}")
+    desc = (p.get("description") or "").strip()
+    if desc:              lines.append(f"  description: {desc[:500]}")
+    qtys = p.get("qty") or []; prc = p.get("prc") or []; net = p.get("net") or []
+    tiers = []
+    for i, q in enumerate(qtys):
+        if not q or str(q) == "0":
+            continue
+        lp = prc[i] if i < len(prc) else ""
+        np = net[i] if i < len(net) else ""
+        tiers.append(f"{q}:${lp}" + (f" (net ${np})" if np else ""))
+    if tiers:             lines.append("  price tiers — list (net cost): " + " | ".join(tiers))
+    pics = p.get("pics") or []
+    if pics:
+        lines.append("  images:")
+        for pic in pics[:6]:
+            url = pic.get("url") or ""
+            if not url:
+                continue
+            cap = f"  ({pic['caption']})" if pic.get("caption") else ""
+            logo = " [logo-sample]" if pic.get("hasLogo") in (1, "1", True) else ""
+            lines.append(f"    - {url}{cap}{logo}")
+    return "\n".join(lines)
+
+
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
 scheduler_thread.start()
 

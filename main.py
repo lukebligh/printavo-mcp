@@ -1724,6 +1724,87 @@ def add_imprint(line_item_group_id: str, color_count: int) -> str:
 
 
 @mcp.tool()
+def add_line_item_group(visual_id: str) -> str:
+    """Create a new empty line item group on a quote/invoice (returns the group ID).
+    Use before add_line_item. One group per distinct product for promo quotes.
+    visual_id: order number shown in Printavo."""
+    internal_id, err = _find_invoice_internal_id(visual_id)
+    if err:
+        return err
+    mutation = """
+    mutation($parentId: ID!) {
+        lineItemGroupCreate(parentId: $parentId, input: {}) { id }
+    }
+    """
+    result = query_printavo(mutation, {"parentId": internal_id})
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    g = result.get("lineItemGroupCreate") or {}
+    if not g.get("id"):
+        return f"Unexpected response — no group id. Raw: {result}"
+    return f"Line item group created. Group ID: {g['id']}"
+
+
+@mcp.tool()
+def add_line_item(line_item_group_id: str, item_number: str, description: str = "",
+                  color: str = "TBD", quantity: int = 0, price: float = 0.0) -> str:
+    """Add a promo / quantity-only line item to a group. Sets the item number, color,
+    description, a single 'One Size' quantity (no size breakdown), and the unit list price.
+    line_item_group_id: from add_line_item_group. quantity: total units. price: unit list price."""
+    mutation = """
+    mutation($groupId: ID!, $itemNumber: String, $color: String, $description: String, $price: Float, $count: Int) {
+        lineItemCreate(lineItemGroupId: $groupId, input: {
+            itemNumber: $itemNumber, color: $color, description: $description,
+            price: $price, sizes: [{ size: size_os, count: $count }]
+        }) { id price items itemNumber color }
+    }
+    """
+    result = query_printavo(mutation, {
+        "groupId": line_item_group_id,
+        "itemNumber": item_number,
+        "color": color or "TBD",
+        "description": description or "",
+        "price": float(price or 0),
+        "count": int(quantity or 0),
+    })
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    it = result.get("lineItemCreate") or {}
+    if not it.get("id"):
+        return f"Unexpected response — no line item id. Raw: {result}"
+    return (f"Line item added! ID: {it['id']}\n"
+            f"  #{it.get('itemNumber')} | {it.get('color')} | qty {it.get('items')} | ${it.get('price')}")
+
+
+@mcp.tool()
+def remove_credit_card_fee(visual_id: str) -> str:
+    """Find and delete the auto-added Credit Card Fee on a quote/invoice (leaves other fees alone)."""
+    internal_id, err = _find_invoice_internal_id(visual_id)
+    if err:
+        return err
+    q = """
+    query($id: ID!) {
+        invoice(id: $id) { fees { nodes { id description amount } } }
+        quote(id: $id)   { fees { nodes { id description amount } } }
+    }
+    """
+    res = query_printavo(q, {"id": internal_id}, allow_partial=True)
+    if "error" in res:
+        return f"API Error: {res['error']}"
+    node = res.get("invoice") or res.get("quote") or {}
+    fees = (node.get("fees") or {}).get("nodes", [])
+    cc = [f for f in fees if "credit card" in (f.get("description") or "").lower()]
+    if not cc:
+        return "No credit-card fee found — nothing to remove."
+    deleted = 0
+    for f in cc:
+        r = query_printavo("mutation($id: ID!){ feeDelete(id: $id){ id } }", {"id": f["id"]})
+        if "error" not in r:
+            deleted += 1
+    return f"Removed {deleted} credit-card fee(s)."
+
+
+@mcp.tool()
 def refresh_invoice_pricing(visual_id: str) -> str:
     """
     Verify current pricing on an order.

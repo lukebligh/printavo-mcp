@@ -1814,6 +1814,75 @@ def remove_credit_card_fee(visual_id: str) -> str:
     return f"Removed {deleted} credit-card fee(s)."
 
 
+def _find_category_id(name):
+    r = query_printavo("query { account { categories { nodes { id name } } } }")
+    if "error" in r:
+        return None
+    nodes = (((r.get("account") or {}).get("categories") or {}).get("nodes")) or []
+    for n in nodes:
+        if (n.get("name") or "").strip().lower() == name.strip().lower():
+            return n.get("id")
+    for n in nodes:
+        if name.strip().lower() in (n.get("name") or "").lower():
+            return n.get("id")
+    return None
+
+
+def _find_delivery_method_id(name):
+    r = query_printavo("query { account { deliveryMethods { nodes { id name } } } }")
+    if "error" in r:
+        return None
+    nodes = (((r.get("account") or {}).get("deliveryMethods") or {}).get("nodes")) or []
+    for n in nodes:
+        if (n.get("name") or "").strip().lower() == name.strip().lower():
+            return n.get("id")
+    for n in nodes:
+        if name.strip().lower() in (n.get("name") or "").lower():
+            return n.get("id")
+    return None
+
+
+@mcp.tool()
+def set_line_item_category(line_item_id: str, category_name: str = "Misc") -> str:
+    """Set a line item's category (default 'Misc' — used for promo items)."""
+    cat_id = _find_category_id(category_name)
+    if not cat_id:
+        return f"Category '{category_name}' not found on this account."
+    m = """
+    mutation($id: ID!, $catId: ID!) {
+        lineItemUpdate(id: $id, input: { category: { id: $catId } }) { id category { id name } }
+    }
+    """
+    r = query_printavo(m, {"id": line_item_id, "catId": cat_id})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    li = r.get("lineItemUpdate") or {}
+    return f"Category set to {((li.get('category') or {}).get('name'))} on line item {line_item_id}."
+
+
+@mcp.tool()
+def set_delivery_method(visual_id: str, method_name: str = "UPS Ground") -> str:
+    """Set the order's delivery method (default 'UPS Ground')."""
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return err
+    dm_id = _find_delivery_method_id(method_name)
+    if not dm_id:
+        return f"Delivery method '{method_name}' not found on this account."
+    m = f"""
+    mutation($id: ID!, $dmId: ID!) {{
+        {order_type}Update(id: $id, input: {{ deliveryMethod: {{ id: $dmId }} }}) {{
+            id deliveryMethod {{ id name }}
+        }}
+    }}
+    """
+    r = query_printavo(m, {"id": internal_id, "dmId": dm_id})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    node = r.get(f"{order_type}Update") or {}
+    return f"Delivery method set to {((node.get('deliveryMethod') or {}).get('name'))} on #{visual_id}."
+
+
 @mcp.tool()
 def refresh_invoice_pricing(visual_id: str) -> str:
     """
@@ -1898,34 +1967,36 @@ def upload_production_file(visual_id: str, file_path: str) -> str:
 
 
 @mcp.tool()
-def attach_mockup_to_order(visual_id: str, file_path: str) -> str:
+def attach_mockup_to_order(visual_id: str, file_path: str, line_item_id: str = "") -> str:
     """
-    Attach a PDF spec sheet as a mockup to the first line item of an order.
+    Attach an image (or PDF) mockup to a line item by public URL — Printavo fetches it server-side.
     visual_id: order number shown in Printavo UI
-    file_path: https:// URL to the PDF
+    file_path: https:// URL to the image/PDF (e.g. a SAGE product image)
+    line_item_id: optional — attach to THIS specific line item; if omitted, uses the first line item.
     """
     internal_id, order_type, err = _find_order(visual_id)
     if err:
         return err
     if not file_path.startswith("http"):
         return "file_path must be an https:// URL."
-    q = f"""
-    query($id: ID!) {{
-        {order_type}(id: $id) {{
-            lineItemGroups {{ nodes {{ lineItems {{ nodes {{ id }} }} }} }}
+    if not line_item_id:
+        q = f"""
+        query($id: ID!) {{
+            {order_type}(id: $id) {{
+                lineItemGroups {{ nodes {{ lineItems {{ nodes {{ id }} }} }} }}
+            }}
         }}
-    }}
-    """
-    result = query_printavo(q, {"id": internal_id})
-    if "error" in result:
-        return f"API Error: {result['error']}"
-    groups = (result.get(order_type) or {}).get("lineItemGroups", {}).get("nodes", [])
-    if not groups:
-        return f"No line item groups found on order #{visual_id}."
-    items = (groups[0].get("lineItems") or {}).get("nodes", [])
-    if not items:
-        return f"No line items found in first group of order #{visual_id}."
-    line_item_id = items[0]["id"]
+        """
+        result = query_printavo(q, {"id": internal_id})
+        if "error" in result:
+            return f"API Error: {result['error']}"
+        groups = (result.get(order_type) or {}).get("lineItemGroups", {}).get("nodes", [])
+        if not groups:
+            return f"No line item groups found on order #{visual_id}."
+        items = (groups[0].get("lineItems") or {}).get("nodes", [])
+        if not items:
+            return f"No line items found in first group of order #{visual_id}."
+        line_item_id = items[0]["id"]
     mutation = """
     mutation($lineItemId: ID!, $url: String!) {
         lineItemMockupCreate(lineItemId: $lineItemId, publicImageUrl: $url) {

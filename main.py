@@ -775,25 +775,26 @@ def create_quote(customer_email: str, order_name: str, due_date: str) -> str:
         return f"No customer found with email '{customer_email}'."
     contact_id = contacts[0]["id"]
     mutation = """
-    mutation($contactId: ID!, $nickname: String, $dueAt: ISO8601DateTime) {
-        quoteCreate(input: { contactId: $contactId, nickname: $nickname, dueAt: $dueAt }) {
-            quote { id visualId nickname dueAt }
-            errors { message }
+    mutation($contactId: ID!, $nickname: String, $dueAt: ISO8601DateTime!, $customerDueAt: ISO8601Date!) {
+        quoteCreate(input: {
+            contact: { id: $contactId },
+            nickname: $nickname,
+            dueAt: $dueAt,
+            customerDueAt: $customerDueAt
+        }) {
+            id visualId nickname dueAt
         }
     }
     """
     result = query_printavo(mutation, {
-        "contactId": contact_id,
-        "nickname":  order_name,
-        "dueAt":     f"{due_date}T12:00:00Z",
+        "contactId":     contact_id,
+        "nickname":      order_name,
+        "dueAt":         f"{due_date}T12:00:00Z",
+        "customerDueAt": due_date,
     })
     if "error" in result:
         return f"Error: {result['error']}"
-    qc = result.get("quoteCreate", {})
-    errors = qc.get("errors", [])
-    if errors:
-        return f"Printavo error: {[e.get('message') for e in errors]}"
-    quote = qc.get("quote", {})
+    quote = result.get("quoteCreate", {}) or {}
     return (
         f"Quote created!\n"
         f"  Order #: {quote.get('visualId')}\n"

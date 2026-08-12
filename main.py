@@ -3373,7 +3373,7 @@ def _sage_call(service_id, body):
 @mcp.tool()
 def sage_product_search(query: str = "", category: str = "", price_low: float = 0,
                         price_high: float = 0, qty: int = 0, limit: int = 10,
-                        sort: str = "BESTMATCH") -> str:
+                        sort: str = "BESTMATCH", image_res: int = 300) -> str:
     """Search SAGE for promotional products (tchotchkes: drinkware, bags, pens, awards, etc.).
 
     query      : quick-search text — a category ("koozies"), keyword, or SPC (smart-matched).
@@ -3383,7 +3383,8 @@ def sage_product_search(query: str = "", category: str = "", price_low: float = 
     qty        : optional quantity (affects pricing tiers).
     limit      : max products to return (default 10 — the "top X").
     sort       : BESTMATCH (default) | PRICE (low→high, budget) | PRICEHIGHLOW | POPULARITY.
-    Returns name, SAGE Product Code (SPC), price, supplier, production time, and image link.
+    image_res  : product image resolution in px — 100, 150, 200, 300, or 1800 (default 300).
+    Returns name, SAGE Product Code (SPC), price, supplier, production time, and an image URL.
     """
     search = {}
     if query:      search["quickSearch"] = query
@@ -3394,6 +3395,7 @@ def sage_product_search(query: str = "", category: str = "", price_low: float = 
     search["sort"] = sort
     search["maxRecs"] = int(limit)
     search["maxTotalItems"] = max(int(limit), 50)
+    search["thumbPicRes"] = int(image_res)
     search["extraReturnFields"] = "SUPPLIER,DESCRIPTION,PRODTIME"
     if not search.get("quickSearch") and not search.get("categories"):
         return "Provide a query (e.g. 'koozies') or a category to search SAGE."
@@ -3412,11 +3414,13 @@ def sage_product_search(query: str = "", category: str = "", price_low: float = 
         prc = p.get("prc") or ""
         spc = p.get("spc") or ""
         pt = p.get("prodTime")
+        img = p.get("thumbPic") or ""
         extra = []
         if supplier: extra.append(str(supplier))
-        if pt:       extra.append(f"{pt}day")
+        if pt:       extra.append(str(pt))
         tail = f" | {' · '.join(extra)}" if extra else ""
         lines.append(f"  • {name} — ${prc} | SPC {spc}{tail}")
+        if img:      lines.append(f"      image: {img}")
     return "\n".join(lines)
 
 

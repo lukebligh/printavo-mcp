@@ -3396,7 +3396,7 @@ def sage_product_search(query: str = "", category: str = "", price_low: float = 
     search["maxRecs"] = int(limit)
     search["maxTotalItems"] = max(int(limit), 50)
     search["thumbPicRes"] = int(image_res)
-    search["extraReturnFields"] = "SUPPLIER,DESCRIPTION,PRODTIME"
+    search["extraReturnFields"] = "SUPPLIER,DESCRIPTION,PRODTIME,ITEMNUM"
     if not search.get("quickSearch") and not search.get("categories"):
         return "Provide a query (e.g. 'koozies') or a category to search SAGE."
     resp = _sage_call(103, {"search": search})
@@ -3413,29 +3413,43 @@ def sage_product_search(query: str = "", category: str = "", price_low: float = 
         supplier = p.get("supplier") or ""
         prc = p.get("prc") or ""
         spc = p.get("spc") or ""
+        itemnum = p.get("itemNum") or ""
+        eid = p.get("prodEId") or ""
         pt = p.get("prodTime")
         img = p.get("thumbPic") or ""
         extra = []
         if supplier: extra.append(str(supplier))
         if pt:       extra.append(str(pt))
         tail = f" | {' · '.join(extra)}" if extra else ""
-        lines.append(f"  • {name} — ${prc} | SPC {spc}{tail}")
-        if img:      lines.append(f"      image: {img}")
+        headline = f"  • {name} — ${prc} | SPC {spc}"
+        if itemnum: headline += f" | item# {itemnum}"
+        lines.append(headline + tail)
+        idbits = []
+        if eid: idbits.append(f"id {eid}")
+        if img: idbits.append(f"image {img}")
+        if idbits: lines.append("      " + " | ".join(idbits))
     return "\n".join(lines)
 
 
 @mcp.tool()
-def sage_product_detail(spc: str, image_res: int = 300) -> str:
-    """Full detail for one SAGE product by SPC (SAGE Connect service 105).
+def sage_product_detail(spc: str = "", prod_eid: str = "", image_res: int = 300) -> str:
+    """Full detail for one SAGE product (SAGE Connect service 105).
 
     Returns supplier item number, name, description, category, colors, imprint area/location,
     price-by-quantity tiers (list price + net cost), and product image URLs.
     Use after sage_product_search to build a Printavo line item and attach a mockup.
-    spc : the SAGE Product Code from a search result (e.g. "CXYXK-EBTHV").
+    Look up by EITHER:
+      prod_eid : the numeric product id (most reliable — it's the P= value in a search image URL), OR
+      spc      : the SAGE Product Code (account-specific; may not resolve on the Public/test login).
     """
-    if not spc:
-        return "Provide a SAGE Product Code (SPC) — get one from sage_product_search."
-    resp = _sage_call(105, {"spc": spc, "includeSuppInfo": 1})
+    if not spc and not prod_eid:
+        return "Provide prod_eid (preferred) or spc — from sage_product_search."
+    body = {"includeSuppInfo": 1}
+    if prod_eid:
+        body["prodEId"] = str(prod_eid)
+    else:
+        body["spc"] = spc
+    resp = _sage_call(105, body)
     if resp.get("errNum") or resp.get("ok") is False:
         return f"SAGE detail error: {resp.get('errMsg') or resp.get('errNum') or resp}"
     p = resp.get("product") or {}

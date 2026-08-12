@@ -1731,10 +1731,20 @@ def add_line_item_group(visual_id: str) -> str:
     internal_id, err = _find_invoice_internal_id(visual_id)
     if err:
         return err
-    mutation = """
-    mutation($parentId: ID!) {
-        lineItemGroupCreate(parentId: $parentId, input: {}) { id }
+    # position = next slot after existing groups
+    cq = """
+    query($id: ID!) {
+        invoice(id: $id) { lineItemGroups { nodes { id } } }
+        quote(id: $id)   { lineItemGroups { nodes { id } } }
     }
+    """
+    cres = query_printavo(cq, {"id": internal_id}, allow_partial=True)
+    node = cres.get("invoice") or cres.get("quote") or {}
+    pos = len((node.get("lineItemGroups") or {}).get("nodes", [])) + 1
+    mutation = f"""
+    mutation($parentId: ID!) {{
+        lineItemGroupCreate(parentId: $parentId, input: {{ position: {pos} }}) {{ id }}
+    }}
     """
     result = query_printavo(mutation, {"parentId": internal_id})
     if "error" in result:
@@ -1742,7 +1752,7 @@ def add_line_item_group(visual_id: str) -> str:
     g = result.get("lineItemGroupCreate") or {}
     if not g.get("id"):
         return f"Unexpected response — no group id. Raw: {result}"
-    return f"Line item group created. Group ID: {g['id']}"
+    return f"Line item group created (position {pos}). Group ID: {g['id']}"
 
 
 @mcp.tool()
@@ -1755,7 +1765,7 @@ def add_line_item(line_item_group_id: str, item_number: str, description: str = 
     mutation($groupId: ID!, $itemNumber: String, $color: String, $description: String, $price: Float, $count: Int) {
         lineItemCreate(lineItemGroupId: $groupId, input: {
             itemNumber: $itemNumber, color: $color, description: $description,
-            price: $price, sizes: [{ size: size_os, count: $count }]
+            price: $price, position: 1, sizes: [{ size: size_os, count: $count }]
         }) { id price items itemNumber color }
     }
     """

@@ -1496,6 +1496,156 @@ def get_invoice_structure(visual_id: str) -> str:
     return "\n".join(lines)
 
 
+# ── PROOF / MOCKUP READ TOOLS ─────────────────────────────────────────────────
+# Printavo attaches customer-facing proofs as MOCKUPS on the IMPRINT, which sits
+# under a lineItemGroup ("line item level" in the UI). Mockup nodes expose
+# fullImageUrl (the real file — often a PDF proof), mimeType and thumbnailUrl.
+# Nothing else in this codebase reads them, so these two tools are read-only
+# accessors: one for a single order, one for a whole customer's history.
+
+_MOCKUP_FRAGMENT = """
+    visualId nickname invoiceAt dueAt createdAt
+    contact { fullName email }
+    lineItemGroups {
+        nodes {
+            id
+            lineItems { nodes { id itemNumber color } }
+            imprints {
+                nodes {
+                    id
+                    details
+                    typeOfWork { name }
+                    mockups { nodes { id fullImageUrl thumbnailUrl mimeType } }
+                }
+            }
+        }
+    }
+"""
+
+
+def _collect_mockups(order_node: dict) -> list:
+    """Flatten every mockup on an order into dicts with imprint context."""
+    out = []
+    for g in ((order_node.get("lineItemGroups") or {}).get("nodes") or []):
+        items = (g.get("lineItems") or {}).get("nodes") or []
+        item_label = ""
+        if items:
+            first = items[0] or {}
+            item_label = f"{first.get('itemNumber') or ''} {first.get('color') or ''}".strip()
+        for imp in ((g.get("imprints") or {}).get("nodes") or []):
+            tow = (imp.get("typeOfWork") or {}).get("name") or ""
+            for mk in ((imp.get("mockups") or {}).get("nodes") or []):
+                url = mk.get("fullImageUrl") or ""
+                if not url:
+                    continue
+                out.append({
+                    "mockup_id": mk.get("id"),
+                    "url": url,
+                    "thumbnail": mk.get("thumbnailUrl") or "",
+                    "mime": mk.get("mimeType") or "",
+                    "imprint_id": imp.get("id"),
+                    "type_of_work": tow,
+                    "details": (imp.get("details") or "")[:120],
+                    "item": item_label,
+                })
+    return out
+
+
+@mcp.tool()
+def get_order_mockups(visual_id: str) -> str:
+    """
+    List every MOCKUP (proof) file attached at the line-item/imprint level of an
+    order, with its direct download URL and mime type.
+    visual_id: order number shown in the Printavo UI (e.g. '6053')
+    """
+    internal_id, err = _find_invoice_internal_id(visual_id)
+    if err:
+        return err
+    q = f"""
+    query($id: ID!) {{
+        invoice(id: $id) {{ {_MOCKUP_FRAGMENT} }}
+        quote(id: $id) {{ {_MOCKUP_FRAGMENT} }}
+    }}
+    """
+    result = query_printavo(q, {"id": internal_id}, allow_partial=True)
+    if "error" in result:
+        return f"API Error: {result['error']}"
+    node = result.get("invoice") or result.get("quote") or {}
+    if not node:
+        return f"Order #{visual_id} not found."
+    mocks = _collect_mockups(node)
+    contact = (node.get("contact") or {})
+    lines = [
+        f"MOCKUPS — Order #{node.get('visualId')} | {node.get('nickname','')}",
+        f"  Customer: {contact.get('fullName','?')} | Invoice date: {(node.get('invoiceAt') or '')[:10]}",
+        f"  Mockups found: {len(mocks)}",
+    ]
+    for i, m in enumerate(mocks, 1):
+        lines.append(
+            f"  [{i}] {m['mime'] or 'unknown'} | work={m['type_of_work'] or '?'} | "
+            f"item={m['item'] or '?'} | imprint={m['imprint_id']}"
+        )
+        lines.append(f"      {m['url']}")
+    if not mocks:
+        lines.append("  (none — proofs may not have been attached to this order)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_customer_mockups(customer_query: str, limit: int = 60,
+                          since: str = "", mime_filter: str = "") -> str:
+    """
+    Pull every mockup/proof file across ALL of a customer's orders in one call —
+    built for bulk asset export (e.g. handing a brand library to an agency).
+    customer_query: customer/company search string (e.g. 'De Smet Jesuit High School')
+    limit:          max orders to walk (default 60)
+    since:          optional 'YYYY-MM-DD' — skip orders whose invoice/due date is older
+    mime_filter:    optional substring match on mime type (e.g. 'pdf' for proofs only)
+    """
+    q = f"""
+    query($q: String, $first: Int, $after: String) {{
+        invoices(first: $first, after: $after, query: $q) {{
+            totalNodes
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{ id {_MOCKUP_FRAGMENT} }}
+        }}
+    }}
+    """
+    result = paginate(q, {"q": customer_query}, max_records=limit)
+    if "error" in result:
+        return f"Error: {result['error']}"
+    nodes = result.get("nodes", [])
+    if not nodes:
+        return f"No orders found matching '{customer_query}'."
+    lines = [f"MOCKUP EXPORT for '{customer_query}' — {len(nodes)} orders walked"]
+    total = 0
+    skipped_old = 0
+    for n in nodes:
+        date = (n.get("invoiceAt") or n.get("dueAt") or n.get("createdAt") or "")[:10]
+        if since and date and date < since:
+            skipped_old += 1
+            continue
+        mocks = _collect_mockups(n)
+        if mime_filter:
+            mocks = [m for m in mocks if mime_filter.lower() in (m["mime"] or "").lower()]
+        if not mocks:
+            continue
+        total += len(mocks)
+        lines.append(
+            f"\n#{n.get('visualId')} | {date} | {(n.get('nickname') or '')[:60]} "
+            f"| {len(mocks)} file(s)"
+        )
+        for m in mocks:
+            lines.append(
+                f"  {m['mime'] or 'unknown'} | work={m['type_of_work'] or '?'} | {m['url']}"
+            )
+    lines.insert(1, f"  Files returned: {total}"
+                    + (f" | orders skipped as older than {since}: {skipped_old}" if since else ""))
+    if total == 0:
+        lines.append("  (no mockups found on any matching order)")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def delete_production_files(visual_id: str) -> str:
     """

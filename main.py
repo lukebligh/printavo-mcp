@@ -3828,6 +3828,11 @@ EMB_RATE_TIERS          = ((7000, 32), (15000, 22), (10 ** 9, 12))
 DTF_SETUP_MIN_PER_LOC   = int(os.environ.get("DTF_SETUP_MIN_PER_LOC", "10"))
 DTF_RATE_PER_HR         = int(os.environ.get("DTF_RATE_PER_HR", "75"))
 
+# Orders with no imprint rows still get a placeholder block. A skipped order is
+# INVISIBLE to capacity; a visible 30-minute block is wrong but nags someone to
+# fix the data. Better to be visibly approximate than silently absent.
+NO_IMPRINT_MIN          = int(os.environ.get("NO_IMPRINT_MIN", "30"))
+
 STORE_MIN_PER_LOC       = int(os.environ.get("STORE_MIN_PER_LOC", "5"))
 STORE_MIN_FLOOR         = int(os.environ.get("STORE_MIN_FLOOR", "10"))
 
@@ -4119,7 +4124,7 @@ def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
                 if n.get("id") and int(n.get("totalQuantity") or 0) == 0]
     qty_map = _fetch_qty_batch(zero_ids) if zero_ids else {}
 
-    changed, held, problems, overflow = [], [], [], []
+    changed, held, problems, overflow, placeholders = [], [], [], [], []
     day_load = defaultdict(lambda: defaultdict(int))
 
     for n in schedulable:
@@ -4137,11 +4142,14 @@ def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
             problems.append(f"  #{vid} — {nick} — could not fetch imprints")
             continue
         qty = int(n.get("totalQuantity") or 0) or qty_map.get(iid, 0)
-        if not imprints:
-            problems.append(f"  #{vid} — {nick} — {qty} pcs, no imprints entered")
-            continue
-
-        minutes, bd = estimate_minutes(qty, imprints, status)
+        if not imprints and _prod_class(status) == "NORMAL":
+            # No imprint detail — place a visible placeholder rather than
+            # dropping the order out of the capacity picture entirely.
+            minutes, bd = NO_IMPRINT_MIN, {"Unscheduled": NO_IMPRINT_MIN}
+            placeholders.append(f"  #{vid} — {nick} — {qty} pcs — "
+                                f"{NO_IMPRINT_MIN}m placeholder, needs imprint detail")
+        else:
+            minutes, bd = estimate_minutes(qty, imprints, status)
         if not minutes:
             continue
         capped = min(minutes, PROD_MAX_BLOCK_MIN)
@@ -4190,6 +4198,9 @@ def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
 
     if overflow:
         lines += ["", f"⚠️ LONGER THAN ONE PRODUCTION DAY ({len(overflow)}):"] + overflow
+
+    if placeholders:
+        lines += ["", f"⚠️ NO IMPRINT DETAIL — placeholder blocks ({len(placeholders)}):"] + placeholders
 
     if problems:
         lines += ["", f"⚠️ NEEDS ATTENTION ({len(problems)}):"] + problems

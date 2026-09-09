@@ -3913,7 +3913,7 @@ def estimate_minutes(total_qty: int, imprint_nodes: list,
         return 0, {"excluded": "PROMO — not produced in house"}
     if cls == "STORE":
         mins = max(STORE_MIN_FLOOR, locs * STORE_MIN_PER_LOC)
-        return mins, {"STORE": mins, "locations": locs}
+        return mins, {"STORE": mins}
     total = 0
     bd = defaultdict(int)
     for imp in (imprint_nodes or []):

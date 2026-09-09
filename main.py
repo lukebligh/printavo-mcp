@@ -3951,9 +3951,22 @@ def _is_auto_placed(start_dt) -> bool:
     return bool(start_dt) and start_dt.hour == PROD_DAY_START_H and start_dt.minute == 0
 
 
+BLOCK_WRITE_DELAY_S = float(os.environ.get("BLOCK_WRITE_DELAY_S", "0.5"))
+BLOCK_WRITE_RETRIES = int(os.environ.get("BLOCK_WRITE_RETRIES", "3"))
+
+
 def _write_block(internal_id: str, start_dt: datetime, minutes: int) -> dict:
-    """Write startAt/dueAt on an invoice. Touches NOTHING else — customerDueAt
-    and invoiceAt are deliberately absent from the mutation."""
+    """Write startAt/dueAt on an invoice, then VERIFY the echo.
+
+    Touches NOTHING else — customerDueAt and invoiceAt are deliberately absent
+    from the mutation.
+
+    Printavo silently drops rapid sequential mutations: the call returns HTTP
+    200 with a normal-looking payload while the record is never updated. A bulk
+    sweep therefore CANNOT trust a non-error response. We compare the echoed
+    startAt/dueAt against what we asked for and retry with backoff, so the tool
+    can never report a write it did not actually make.
+    """
     end_dt = start_dt + timedelta(minutes=max(1, minutes))
     mutation = """
     mutation($id: ID!, $startAt: ISO8601DateTime, $dueAt: ISO8601DateTime) {
@@ -3962,11 +3975,27 @@ def _write_block(internal_id: str, start_dt: datetime, minutes: int) -> dict:
         }
     }
     """
-    return query_printavo(mutation, {
+    variables = {
         "id": internal_id,
         "startAt": start_dt.isoformat(),
         "dueAt": end_dt.isoformat(),
-    })
+    }
+    last = {}
+    for attempt in range(BLOCK_WRITE_RETRIES):
+        if attempt:
+            time.sleep(BLOCK_WRITE_DELAY_S * (2 ** attempt))
+        last = query_printavo(mutation, variables)
+        if "error" in last:
+            continue
+        node = last.get("invoiceUpdate") or {}
+        got_start = _parse_dt(node.get("startAt"))
+        got_end   = _parse_dt(node.get("dueAt"))
+        if got_start == start_dt and got_end == end_dt:
+            return last
+        last = {"error": (f"write not applied — asked {start_dt.isoformat()}"
+                          f"/{end_dt.isoformat()}, got {node.get('startAt')}"
+                          f"/{node.get('dueAt')}")}
+    return last
 
 
 def _norm(s: str) -> str:
@@ -4140,6 +4169,7 @@ def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
             changed.append(line)
             continue
 
+        time.sleep(BLOCK_WRITE_DELAY_S)
         out = _write_block(iid, start_dt, capped)
         if "error" in out:
             problems.append(f"  #{vid} — write failed: {out['error']}")

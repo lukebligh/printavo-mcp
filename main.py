@@ -4076,21 +4076,9 @@ def set_production_block(visual_id: str, start_datetime: str = "",
             f"  Block:    {node.get('startAt')} → {node.get('dueAt')}{note}")
 
 
-@mcp.tool()
-def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
-                            force_place: bool = False) -> str:
-    """
-    Recalculate and write production time blocks for every schedulable order
-    from today through N days out. This is the job that keeps the Printavo
-    calendar honest.
-
-    days_ahead:  how far forward to sweep (default 21)
-    dry_run:     True = report only, write nothing (DEFAULT — always preview first)
-    force_place: True = move every block to its production date at 8 AM, even
-                 ones a human has dragged. Use ONLY for the initial
-                 normalisation run. Normally False, which preserves any
-                 placement a human made and refreshes the block LENGTH only.
-    """
+def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
+                       force_place: bool = False) -> str:
+    """Implementation — called by the MCP tool AND the background scheduler."""
     now = datetime.now(SHOP_TZ)
     end = now + timedelta(days=days_ahead)
     result = paginate("""
@@ -4217,6 +4205,69 @@ def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
 
     return "\n".join(lines)
 
+
+
+@mcp.tool()
+def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
+                            force_place: bool = False) -> str:
+    """
+    Recalculate and write production time blocks for every schedulable order
+    from today through N days out. This is the job that keeps the Printavo
+    calendar honest. Runs every 2 hours on its own; this tool is for running it
+    on demand.
+
+    days_ahead:  how far forward to sweep (default 21)
+    dry_run:     True = report only, write nothing (DEFAULT — always preview first)
+    force_place: True = move every block to its production date at 8 AM, even
+                 ones a human has dragged. Use ONLY for a deliberate
+                 re-normalisation. Normally False, which preserves any
+                 placement a human made and refreshes the block LENGTH only.
+    """
+    return _sweep_blocks_impl(days_ahead=days_ahead, dry_run=dry_run,
+                              force_place=force_place)
+
+
+# ── BLOCK SWEEP SCHEDULER ─────────────────────────────────────────────────────
+# Keeps the Printavo calendar honest without anyone remembering to run it.
+# Every BLOCK_SWEEP_EVERY_H hours between BLOCK_SWEEP_START_H and
+# BLOCK_SWEEP_END_H, SEVEN DAYS A WEEK — jobs get parked on weekends while
+# they're still coming together, and those need blocks too.
+#
+# force_place is ALWAYS False here. The one-time normalisation is done; from
+# now on a block sitting anywhere other than 08:00 was put there by a human and
+# only its length gets refreshed. The scheduler must never move a job.
+BLOCK_SWEEP_ENABLED  = os.environ.get("BLOCK_SWEEP_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+BLOCK_SWEEP_START_H  = int(os.environ.get("BLOCK_SWEEP_START_H", "5"))    # 5 AM
+BLOCK_SWEEP_END_H    = int(os.environ.get("BLOCK_SWEEP_END_H", "19"))     # 7 PM
+BLOCK_SWEEP_EVERY_H  = int(os.environ.get("BLOCK_SWEEP_EVERY_H", "2"))
+BLOCK_SWEEP_DAYS     = int(os.environ.get("BLOCK_SWEEP_DAYS", "21"))
+
+_last_block_sweep_key = None
+
+
+def run_block_sweep_scheduler():
+    global _last_block_sweep_key
+    while True:
+        try:
+            if BLOCK_SWEEP_ENABLED:
+                now_ct = _central_now()
+                key = f"{now_ct.date().isoformat()}-{now_ct.hour}"
+                if (BLOCK_SWEEP_START_H <= now_ct.hour <= BLOCK_SWEEP_END_H
+                        and (now_ct.hour - BLOCK_SWEEP_START_H) % BLOCK_SWEEP_EVERY_H == 0
+                        and now_ct.minute < 10
+                        and _last_block_sweep_key != key):
+                    _last_block_sweep_key = key
+                    out = _sweep_blocks_impl(
+                        days_ahead=BLOCK_SWEEP_DAYS, dry_run=False, force_place=False)
+                    head = out.split("\n")[2] if out.count("\n") > 2 else out[:120]
+                    print(f"[BLOCK SWEEP] {now_ct:%Y-%m-%d %H:%M} {head}", flush=True)
+        except Exception as e:
+            print(f"[BLOCK SWEEP] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
+block_sweep_thread = threading.Thread(target=run_block_sweep_scheduler, daemon=True)
+block_sweep_thread.start()
 
 scheduler_thread = threading.Thread(target=run_daily_scheduler, daemon=True)
 scheduler_thread.start()

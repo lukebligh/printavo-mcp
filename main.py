@@ -1071,21 +1071,8 @@ def get_production_schedule(days_ahead: int = 7) -> str:
             tg["locations"] += 1
             tg["screens"]   += imp["colors"]
 
-        # Estimate time
-        # Setup:   screens × 8 min (burn + press setup per screen)
-        # SP run:  (qty × sp_locations) / tiered_rate × 60
-        # EMB/DTF: 15 min per location (rough)
-        sp_locs    = type_groups.get("Screen Print", {}).get("locations", 0)
-        sp_screens = type_groups.get("Screen Print", {}).get("screens", 0)
-        sp_imprints = total_qty * sp_locs
-        rate        = _sp_run_rate(total_qty)
-        sp_run_min  = int(sp_imprints / rate * 60) if sp_imprints else 0
-        emb_dtf_min = (
-            type_groups.get("Embroidery", {}).get("locations", 0) +
-            type_groups.get("DTF", {}).get("locations", 0)
-        ) * 15
-        setup_min  = sp_screens * 8
-        total_min  = setup_min + sp_run_min + emb_dtf_min
+        # Estimate time — SINGLE SOURCE OF TRUTH (see PRODUCTION TIME MODEL).
+        total_min, _bd = estimate_minutes(total_qty, imprint_nodes, status)
         est_time   = _format_est_time(total_min)
 
         screens_str = str(total_screens) if total_screens > 0 else "N/A"
@@ -1183,18 +1170,12 @@ def get_production_time_estimate(visual_id: str) -> str:
 
     total_prints = len(imprint_info)
 
+    _status_name = (inv.get("status") or {}).get("name", "")
     if total_qty > 0 and imprint_info:
-        sp_info     = [i for i in imprint_info if i["type"] == "Screen Print"]
-        sp_locs     = len(sp_info)
-        sp_screens  = sum(i["colors"] for i in sp_info)
-        sp_imprints = total_qty * sp_locs
-        rate        = _sp_run_rate(total_qty)
-        sp_run_min  = int(sp_imprints / rate * 60) if sp_imprints else 0
-        emb_dtf_min = sum(15 for i in imprint_info if i["type"] in ("Embroidery", "DTF"))
-        setup_min   = sp_screens * 8
-        total_min   = setup_min + sp_run_min + emb_dtf_min
+        total_min, _bd = estimate_minutes(total_qty, imprint_info, _status_name)
     else:
         total_min = 0
+        _bd = {}
 
     lines = [
         f"PRODUCTION TIME ESTIMATE — Order #{inv.get('visualId')} | {inv.get('nickname','')}",
@@ -1202,7 +1183,11 @@ def get_production_time_estimate(visual_id: str) -> str:
         f"  Print Locations: {total_prints}",
         f"  Imprint Details: {imprint_info}",
         f"  TOTAL ESTIMATE:  {_format_est_time(total_min)} ({total_min} min)",
-        f"  Note: Tiered SP rate — ≤72 pcs: 250/hr | 73–300: 400/hr | 301+: 650/hr.",
+        f"  Breakdown:       {_bd}",
+        f"  Model: SP {SP_SETUP_MIN_PER_SCREEN}min/screen + {SP_RUN_RATE_PER_HR}/hr | "
+        f"EMB {EMB_SETUP_MIN_PER_LOC}min/loc + 32/22/12 by stitch | "
+        f"DTF {DTF_SETUP_MIN_PER_LOC}min/loc + {DTF_RATE_PER_HR}/hr | "
+        f"STORE {STORE_MIN_PER_LOC}min/loc.",
     ]
     return "\n".join(lines)
 
@@ -3390,7 +3375,7 @@ def _build_daily_production_message() -> str:
 
         # Per-type accumulation: imprints = Σ over groups (group_qty × group locs)
         by_type = defaultdict(lambda: {"locs": 0, "screens": 0,
-                                       "imprints": 0, "pcs": 0})
+                                       "imprints": 0, "pcs": 0, "minutes": 0})
         for g in groups:
             gqty = g["qty"]
             types_in_group = set()
@@ -3399,6 +3384,8 @@ def _build_daily_production_message() -> str:
                 t["locs"] += 1
                 t["screens"] += imp["colors"]
                 t["imprints"] += gqty
+                t["minutes"] += imprint_minutes(imp["type"], gqty,
+                                                imp["colors"], _stitch_count(imp))
                 types_in_group.add(imp["type"])
             for deco in types_in_group:
                 by_type[deco]["pcs"] += gqty
@@ -3409,12 +3396,13 @@ def _build_daily_production_message() -> str:
                                      "screens": 0, "minutes": 0})
             type_imprints = g["imprints"]
             type_pcs = g["pcs"]
-            if deco == "Screen Print":
-                rate = _sp_run_rate(type_pcs)
-                minutes = g["screens"] * 8 + (int(type_imprints / rate * 60)
-                                              if type_imprints else 0)
+            _cls = _prod_class(status)
+            if _cls == "PROMO":
+                minutes = 0
+            elif _cls == "STORE":
+                minutes = max(STORE_MIN_FLOOR, g["locs"] * STORE_MIN_PER_LOC)
             else:
-                minutes = g["locs"] * 15
+                minutes = g["minutes"]
             scr = (f" | {g['screens']} screen{'s' if g['screens'] != 1 else ''}"
                    if deco == "Screen Print" and g["screens"] else "")
             if type_pcs * g["locs"] == type_imprints:
@@ -3800,6 +3788,392 @@ def sage_product_detail(spc: str = "", prod_eid: str = "", image_res: int = 300)
             cap = f"  ({pic['caption']})" if pic.get("caption") else ""
             logo = " [logo-sample]" if pic.get("hasLogo") in (1, "1", True) else ""
             lines.append(f"    - {url}{cap}{logo}")
+    return "\n".join(lines)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCTION TIME MODEL + CALENDAR BLOCK WRITER
+# ------------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH for "how long does this order take?".
+# get_production_schedule, send_schedule_to_slack, run_production_push and
+# get_production_time_estimate ALL call imprint_minutes()/estimate_minutes()
+# so every surface quotes the same number.
+#
+# Standards set by Luke/Richie (Sept 2026), all overridable by env var:
+#   SP  : 10 min setup per screen + qty/375 per hour  (+10 min per color change)
+#   EMB : 15 min setup per location + tiered by stitch count (32/22/12 per hour)
+#   DTF : 10 min setup per location + qty/75 per hour
+#   STORE: 5 min per location, 10 min floor   (tiny web-store orders)
+#   PROMO: excluded entirely — not produced in house
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from zoneinfo import ZoneInfo
+    SHOP_TZ = ZoneInfo("America/Chicago")
+except Exception:                                    # pragma: no cover
+    SHOP_TZ = timezone(timedelta(hours=-5))
+
+PROD_DAY_START_H   = int(os.environ.get("PROD_DAY_START_H", "8"))     # 8 AM
+PROD_DAY_END_H     = int(os.environ.get("PROD_DAY_END_H", "16"))      # 4 PM
+PROD_MAX_BLOCK_MIN = (PROD_DAY_END_H - PROD_DAY_START_H) * 60         # 480
+
+SP_SETUP_MIN_PER_SCREEN = int(os.environ.get("SP_SETUP_MIN_PER_SCREEN", "10"))
+SP_RUN_RATE_PER_HR      = int(os.environ.get("SP_RUN_RATE_PER_HR", "375"))
+SP_COLOR_CHANGE_MIN     = int(os.environ.get("SP_COLOR_CHANGE_MIN", "10"))
+
+EMB_SETUP_MIN_PER_LOC   = int(os.environ.get("EMB_SETUP_MIN_PER_LOC", "15"))
+EMB_RATE_TIERS          = ((7000, 32), (15000, 22), (10 ** 9, 12))
+
+DTF_SETUP_MIN_PER_LOC   = int(os.environ.get("DTF_SETUP_MIN_PER_LOC", "10"))
+DTF_RATE_PER_HR         = int(os.environ.get("DTF_RATE_PER_HR", "75"))
+
+STORE_MIN_PER_LOC       = int(os.environ.get("STORE_MIN_PER_LOC", "5"))
+STORE_MIN_FLOOR         = int(os.environ.get("STORE_MIN_FLOOR", "10"))
+
+# Statuses the sweep will schedule. Anything not listed is left alone:
+# quotes not yet approved, promo, and everything past production.
+_SWEEP_STATUSES = {
+    "QUOTE APPROVED", "ORDER GOODS",
+    "CONTRACT - WAITING ON ARTWORK", "CONTRACT - WAITING ON GOODS",
+    "PROOF REQUESTED", "ART APPROVAL SENT", "ART APPROVED",
+    "SP - PRE-PRO", "SP - READY", "SP - IN PRODUCTION",
+    "EMB - ORDER DIGITIZING", "EMB - PRE-PRO", "EMB - SEW OUT APPROVAL SENT",
+    "EMB - READY", "EMB - IN PRODUCTION",
+    "DTF - ORDER TRANSFER", "DTF - PRE-PRO", "DTF - READY", "DTF - IN PRODUCTION",
+    "STORE - PRE PRO", "STORE - READY", "STORE - IN PRODUCTION",
+}
+
+
+def _prod_class(status_name: str) -> str:
+    """PROMO / STORE / NORMAL — status wins over imprint data.
+
+    Store orders carry imprint rows that say 'Screen Print' with zero colors,
+    so the imprint data cannot be trusted for them; the STORE status family is
+    the only reliable signal. Promo is decorated by the supplier, so it burns
+    none of our capacity.
+    """
+    s = (status_name or "").upper()
+    if "PROMO" in s:
+        return "PROMO"
+    if "STORE" in s:
+        return "STORE"
+    return "NORMAL"
+
+
+def _stitch_count(imp: dict) -> int:
+    """Upper bound of the stitch band, read off the EMB pricing-matrix column.
+
+    Printavo has no stitch-count field. The embroidery matrices are banded
+    ('0 - 5000 Stitches', '5001 - 6000 Stitches', ...) and that band name is
+    already on the imprint, so we take the top of the band — conservative, and
+    it never under-blocks.
+    """
+    name = (imp.get("col_name") or "")
+    if "stitch" not in name.lower():
+        return 0
+    nums = [int(n.replace(",", "")) for n in re.findall(r"[\d,]+", name) if n.strip(",")]
+    return max(nums) if nums else 0
+
+
+def _emb_rate(stitches: int) -> int:
+    for ceiling, rate in EMB_RATE_TIERS:
+        if stitches <= ceiling:
+            return rate
+    return EMB_RATE_TIERS[-1][1]
+
+
+def imprint_minutes(deco: str, qty: int, colors: int = 0,
+                    stitches: int = 0, color_changes: int = 0) -> int:
+    """Minutes for ONE imprint location running `qty` pieces.
+
+    This is the primitive every other estimate is built from.
+    """
+    qty = max(0, int(qty or 0))
+    if deco == "Embroidery":
+        run = (qty / _emb_rate(stitches) * 60) if qty else 0
+        return int(round(EMB_SETUP_MIN_PER_LOC + run))
+    if deco == "DTF":
+        run = (qty / DTF_RATE_PER_HR * 60) if qty else 0
+        return int(round(DTF_SETUP_MIN_PER_LOC + run))
+    # Screen Print
+    screens = max(0, int(colors or 0))
+    setup   = screens * SP_SETUP_MIN_PER_SCREEN
+    changes = max(0, int(color_changes or 0)) * SP_COLOR_CHANGE_MIN
+    run     = (qty / SP_RUN_RATE_PER_HR * 60) if qty else 0
+    return int(round(setup + changes + run))
+
+
+def estimate_minutes(total_qty: int, imprint_nodes: list,
+                     status_name: str = "") -> tuple:
+    """Total minutes for a whole order. Returns (minutes, breakdown_dict)."""
+    cls  = _prod_class(status_name)
+    locs = len(imprint_nodes or [])
+    if cls == "PROMO":
+        return 0, {"excluded": "PROMO — not produced in house"}
+    if cls == "STORE":
+        mins = max(STORE_MIN_FLOOR, locs * STORE_MIN_PER_LOC)
+        return mins, {"STORE": mins, "locations": locs}
+    total = 0
+    bd = defaultdict(int)
+    for imp in (imprint_nodes or []):
+        m = imprint_minutes(imp.get("type", "Screen Print"), total_qty,
+                            imp.get("colors", 0), _stitch_count(imp))
+        bd[imp.get("type", "Screen Print")] += m
+        total += m
+    return total, dict(bd)
+
+
+# ── BLOCK PLACEMENT ───────────────────────────────────────────────────────────
+
+def _shop_day_start(d) -> datetime:
+    """8 AM shop-local on date `d`."""
+    return datetime(d.year, d.month, d.day, PROD_DAY_START_H, 0, 0, tzinfo=SHOP_TZ)
+
+
+def _parse_dt(s: str):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(SHOP_TZ)
+    except Exception:
+        return None
+
+
+def _is_auto_placed(start_dt) -> bool:
+    """True when the block still sits exactly at the automation's 8:00 slot.
+
+    The automation always places at 8:00 sharp. Anything else means a human
+    dragged it on the calendar, and a human's placement is never overwritten —
+    only the block's LENGTH gets refreshed so it stays honest as the order
+    changes.
+    """
+    return bool(start_dt) and start_dt.hour == PROD_DAY_START_H and start_dt.minute == 0
+
+
+def _write_block(internal_id: str, start_dt: datetime, minutes: int) -> dict:
+    """Write startAt/dueAt on an invoice. Touches NOTHING else — customerDueAt
+    and invoiceAt are deliberately absent from the mutation."""
+    end_dt = start_dt + timedelta(minutes=max(1, minutes))
+    mutation = """
+    mutation($id: ID!, $startAt: ISO8601DateTime, $dueAt: ISO8601DateTime) {
+        invoiceUpdate(id: $id, input: { startAt: $startAt, dueAt: $dueAt }) {
+            id visualId startAt dueAt
+        }
+    }
+    """
+    return query_printavo(mutation, {
+        "id": internal_id,
+        "startAt": start_dt.isoformat(),
+        "dueAt": end_dt.isoformat(),
+    })
+
+
+def _norm(s: str) -> str:
+    return " ".join((s or "").upper().split())
+
+
+@mcp.tool()
+def set_production_block(visual_id: str, start_datetime: str = "",
+                         minutes: int = 0) -> str:
+    """
+    Set the production time block for ONE order on the Printavo calendar.
+    visual_id: order number shown in Printavo UI (e.g. '7184')
+    start_datetime: ISO local start (e.g. '2026-09-10T08:00:00'). Blank = the
+                    order's existing production date at 8 AM.
+    minutes: block length. 0 = calculate it from the order's imprints.
+    Writes startAt/dueAt ONLY — customer due date and invoice date are untouched.
+    """
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return err
+    if order_type == "quote":
+        return (f"#{visual_id} is still a quote. Production blocks are only "
+                f"written on invoices.")
+
+    q = """
+    query($id: ID!) {
+        invoice(id: $id) {
+            id visualId nickname totalQuantity startAt dueAt
+            status { name }
+            %s
+        }
+    }
+    """ % _IMPRINT_FRAG
+    res = query_printavo(q, {"id": internal_id})
+    if "error" in res:
+        return f"API Error: {res['error']}"
+    inv = res.get("invoice") or {}
+    status = (inv.get("status") or {}).get("name", "")
+    imprints = _parse_obj_imprints(inv)
+    qty = int(inv.get("totalQuantity") or 0) or _parse_obj_qty(inv)
+
+    if not minutes:
+        minutes, bd = estimate_minutes(qty, imprints, status)
+        if not minutes:
+            return f"#{visual_id} ({status}) — excluded from scheduling. Nothing written."
+    else:
+        bd = {"manual": minutes}
+
+    capped = min(minutes, PROD_MAX_BLOCK_MIN)
+
+    if start_datetime:
+        start_dt = _parse_dt(start_datetime)
+        if not start_dt:
+            return f"Could not parse start_datetime '{start_datetime}'. Use e.g. 2026-09-10T08:00:00"
+    else:
+        existing = _parse_dt(inv.get("startAt"))
+        if not existing:
+            return f"#{visual_id} has no production date set — nothing to anchor the block to."
+        start_dt = _shop_day_start(existing.date())
+
+    out = _write_block(internal_id, start_dt, capped)
+    if "error" in out:
+        return f"API Error: {out['error']}"
+    node = (out.get("invoiceUpdate") or {})
+    note = ""
+    if capped < minutes:
+        note = (f"\n  ⚠️ True estimate {_format_est_time(minutes)} exceeds the "
+                f"{PROD_MAX_BLOCK_MIN // 60}h production day — block capped. "
+                f"This job needs more than one day.")
+    return (f"#{visual_id} | {inv.get('nickname','')}\n"
+            f"  Status:   {status}\n"
+            f"  Estimate: {_format_est_time(minutes)} ({minutes} min) {dict(bd)}\n"
+            f"  Block:    {node.get('startAt')} → {node.get('dueAt')}{note}")
+
+
+@mcp.tool()
+def sweep_production_blocks(days_ahead: int = 21, dry_run: bool = True,
+                            force_place: bool = False) -> str:
+    """
+    Recalculate and write production time blocks for every schedulable order
+    from today through N days out. This is the job that keeps the Printavo
+    calendar honest.
+
+    days_ahead:  how far forward to sweep (default 21)
+    dry_run:     True = report only, write nothing (DEFAULT — always preview first)
+    force_place: True = move every block to its production date at 8 AM, even
+                 ones a human has dragged. Use ONLY for the initial
+                 normalisation run. Normally False, which preserves any
+                 placement a human made and refreshes the block LENGTH only.
+    """
+    now = datetime.now(SHOP_TZ)
+    end = now + timedelta(days=days_ahead)
+    result = paginate("""
+    query($prodAfter: ISO8601DateTime, $prodBefore: ISO8601DateTime, $first: Int, $after: String) {
+        invoices(inProductionAfter: $prodAfter, inProductionBefore: $prodBefore, first: $first, after: $after) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes {
+                id visualId nickname totalQuantity startAt dueAt
+                status { name }
+                contact { fullName }
+            }
+        }
+    }
+    """, {
+        "prodAfter":  now.strftime("%Y-%m-%d") + "T00:00:00Z",
+        "prodBefore": end.strftime("%Y-%m-%d") + "T23:59:59Z",
+    })
+    if "error" in result:
+        return f"Error: {result['error']}"
+    nodes = result.get("nodes", [])
+    if not nodes:
+        return f"No orders in production window {now:%Y-%m-%d} → {end:%Y-%m-%d}."
+
+    schedulable = [n for n in nodes
+                   if _norm((n.get("status") or {}).get("name")) in _SWEEP_STATUSES]
+    skipped = len(nodes) - len(schedulable)
+
+    imprint_map = _fetch_imprints_batch([n["id"] for n in schedulable if n.get("id")])
+    zero_ids = [n["id"] for n in schedulable
+                if n.get("id") and int(n.get("totalQuantity") or 0) == 0]
+    qty_map = _fetch_qty_batch(zero_ids) if zero_ids else {}
+
+    changed, held, problems, overflow = [], [], [], []
+    day_load = defaultdict(lambda: defaultdict(int))
+
+    for n in schedulable:
+        iid    = n.get("id")
+        vid    = n.get("visualId")
+        status = (n.get("status") or {}).get("name", "")
+        nick   = (n.get("nickname") or "")[:38]
+        existing = _parse_dt(n.get("startAt"))
+        if not existing:
+            problems.append(f"  #{vid} — {nick} — no production date set")
+            continue
+
+        imprints = imprint_map.get(iid)
+        if imprints is None:
+            problems.append(f"  #{vid} — {nick} — could not fetch imprints")
+            continue
+        qty = int(n.get("totalQuantity") or 0) or qty_map.get(iid, 0)
+        if not imprints:
+            problems.append(f"  #{vid} — {nick} — {qty} pcs, no imprints entered")
+            continue
+
+        minutes, bd = estimate_minutes(qty, imprints, status)
+        if not minutes:
+            continue
+        capped = min(minutes, PROD_MAX_BLOCK_MIN)
+        if capped < minutes:
+            overflow.append(f"  #{vid} — {nick} — needs {_format_est_time(minutes)}, "
+                            f"capped at {PROD_MAX_BLOCK_MIN // 60}h")
+
+        human_placed = not _is_auto_placed(existing)
+        if force_place or not human_placed:
+            start_dt = _shop_day_start(existing.date())
+            action   = "place"
+        else:
+            start_dt = existing
+            action   = "resize"
+
+        for deco, m in bd.items():
+            if isinstance(m, int):
+                day_load[start_dt.strftime("%a %m/%d")][deco] += m
+
+        line = (f"  #{vid} — {nick} — {_format_est_time(minutes)} — "
+                f"{start_dt:%a %m/%d %I:%M%p} → "
+                f"{(start_dt + timedelta(minutes=capped)):%I:%M%p}  [{action}]")
+
+        if dry_run:
+            changed.append(line)
+            continue
+
+        out = _write_block(iid, start_dt, capped)
+        if "error" in out:
+            problems.append(f"  #{vid} — write failed: {out['error']}")
+        else:
+            changed.append(line)
+
+    hdr = "DRY RUN — nothing written" if dry_run else "WRITTEN TO PRINTAVO"
+    lines = [
+        f"PRODUCTION BLOCK SWEEP — {hdr}",
+        f"  Window: {now:%Y-%m-%d} → {end:%Y-%m-%d} ({days_ahead} days)",
+        f"  {len(nodes)} orders in window | {len(schedulable)} schedulable | "
+        f"{skipped} skipped (quote/promo/complete)",
+        f"  force_place={force_place}",
+        "",
+        f"BLOCKS ({len(changed)}):",
+    ]
+    lines += changed or ["  none"]
+
+    if overflow:
+        lines += ["", f"⚠️ LONGER THAN ONE PRODUCTION DAY ({len(overflow)}):"] + overflow
+
+    if problems:
+        lines += ["", f"⚠️ NEEDS ATTENTION ({len(problems)}):"] + problems
+
+    if day_load:
+        lines += ["", f"DAILY LOAD vs {PROD_MAX_BLOCK_MIN // 60}h capacity per lane:"]
+        for day in sorted(day_load, key=lambda d: datetime.strptime(d[-5:], "%m/%d")):
+            parts = []
+            for deco, m in sorted(day_load[day].items()):
+                pct = int(m / PROD_MAX_BLOCK_MIN * 100)
+                flag = " 🔴" if pct > 100 else (" 🟡" if pct > 80 else "")
+                parts.append(f"{deco} {_format_est_time(m)} ({pct}%){flag}")
+            lines.append(f"  {day}: " + " | ".join(parts))
+
     return "\n".join(lines)
 
 

@@ -339,8 +339,9 @@ def _parse_obj_groups(obj: dict, deco_default: str = "Screen Print") -> list:
         for item in (g.get("lineItems") or {}).get("nodes", []):
             qty += sum(int(s.get("count") or 0) for s in (item.get("sizes") or []))
         imps = [{
-            "type":   _decoration_type(imp, default=deco_default),
-            "colors": _color_count(imp),
+            "type":     _decoration_type(imp, default=deco_default),
+            "colors":   _color_count(imp),
+            "col_name": (imp.get("pricingMatrixColumn") or {}).get("columnName", ""),
         } for imp in (g.get("imprints") or {}).get("nodes", [])]
         out.append({"qty": qty, "imprints": imps})
     return out
@@ -1000,13 +1001,7 @@ def get_production_schedule(days_ahead: int = 7) -> str:
     # IDs that return null from the invoice batch are retried as quotes.
 
     all_ids = [n["id"] for n in nodes if n.get("id")]
-    imprint_map = _fetch_imprints_batch(all_ids)
-
-    # Quote fallback for IDs where invoice returned null
-    null_ids = [iid for iid, v in imprint_map.items() if v is None]
-    if null_ids:
-        qt_map = _fetch_imprints_quote_batch(null_ids)
-        imprint_map.update(qt_map)
+    groups_raw = _fetch_groups_batch(all_ids)
 
     # Qty fallback batch for orders where Step 1 totalQuantity=0
     zero_qty_ids = [
@@ -1034,7 +1029,11 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         # Header line
         lines.append(f"#{inv.get('visualId')} | {contact} | {inv.get('nickname', '')}")
 
-        imprint_nodes = imprint_map.get(internal_id) if internal_id else None
+        _raw = groups_raw.get(internal_id) if internal_id else None
+        order_groups = (_parse_obj_groups(_raw, deco_default=_status_deco_fallback(status))
+                        if _raw else None)
+        imprint_nodes = ([i for g in order_groups for i in g["imprints"]]
+                         if order_groups is not None else None)
         if imprint_nodes is None:
             lines.append(
                 f"  Status: {status} | Prod: {prod_dt} | Due: {due_dt} | "
@@ -1059,20 +1058,24 @@ def get_production_schedule(days_ahead: int = 7) -> str:
             lines.append("")
             continue
 
-        # ── Calculate totals ─────────────────────────────────────────────────
-        num_locations  = len(imprint_nodes)
-        total_imprints = total_qty * num_locations
-        total_screens  = sum(i["colors"] for i in imprint_nodes)
+        # ── Calculate totals — PER GROUP, never total_qty × locations ────────
+        total_imprints, num_locations, total_screens = group_imprint_totals(order_groups)
+        if total_qty == 0:
+            total_qty = sum(int(g.get("qty") or 0) for g in order_groups)
 
         # Group by decoration type for per-type breakdown
-        type_groups: dict = defaultdict(lambda: {"locations": 0, "screens": 0})
-        for imp in imprint_nodes:
-            tg = type_groups[imp["type"]]
-            tg["locations"] += 1
-            tg["screens"]   += imp["colors"]
+        type_groups: dict = defaultdict(
+            lambda: {"locations": 0, "screens": 0, "imprints": 0})
+        for g in order_groups:
+            gqty = int(g.get("qty") or 0)
+            for imp in g["imprints"]:
+                tg = type_groups[imp["type"]]
+                tg["locations"] += 1
+                tg["screens"]   += imp["colors"]
+                tg["imprints"]  += gqty
 
         # Estimate time — SINGLE SOURCE OF TRUTH (see PRODUCTION TIME MODEL).
-        total_min, _bd = estimate_minutes(total_qty, imprint_nodes, status)
+        total_min, _bd = estimate_minutes_groups(order_groups, status)
         est_time   = _format_est_time(total_min)
 
         screens_str = str(total_screens) if total_screens > 0 else "N/A"
@@ -1085,9 +1088,10 @@ def get_production_schedule(days_ahead: int = 7) -> str:
         # Per-decoration-type breakdown
         for deco_type, tg in type_groups.items():
             locs        = tg["locations"]
-            type_total  = total_qty * locs
+            type_total  = tg["imprints"]
             scr         = tg["screens"]
-            detail = f"  {deco_type} | {total_qty} pcs × {locs} imprint(s) = {type_total} imprints"
+            sep = "×" if total_qty * locs == type_total else "/"
+            detail = f"  {deco_type} | {total_qty} pcs {sep} {locs} imprint(s) = {type_total} imprints"
             if scr > 0:
                 detail += f" | {scr} screens"
             detail += f" | {est_time}"
@@ -1137,19 +1141,11 @@ def get_production_time_estimate(visual_id: str) -> str:
     query($id: ID!) {
         invoice(id: $id) {
             visualId nickname totalQuantity
-            lineItemGroups {
-                nodes {
-                    imprints {
-                        nodes {
-                            typeOfWork { name }
-                            pricingMatrixColumn { columnName matrix { name } }
-                        }
-                    }
-                }
-            }
+            status { name }
+            %s
         }
     }
-    """
+    """ % _GROUPS_FRAG
     result = query_printavo(q_basic, {"id": internal_id})
     if "error" in result:
         return f"Error: {result['error']}"
@@ -1158,21 +1154,15 @@ def get_production_time_estimate(visual_id: str) -> str:
     if not inv:
         return f"Order #{visual_id} not found."
 
-    total_qty = int(inv.get("totalQuantity") or 0)
-    groups = inv.get("lineItemGroups", {}).get("nodes", [])
-    imprint_info = []
-    for g in groups:
-        for imp in g.get("imprints", {}).get("nodes", []):
-            imprint_info.append({
-                "type":   _decoration_type(imp),
-                "colors": _color_count(imp),
-            })
-
+    _status_name = (inv.get("status") or {}).get("name", "")
+    order_groups = _parse_obj_groups(inv, deco_default=_status_deco_fallback(_status_name))
+    imprint_info = [i for g in order_groups for i in g["imprints"]]
+    total_qty = (int(inv.get("totalQuantity") or 0)
+                 or sum(int(g.get("qty") or 0) for g in order_groups))
     total_prints = len(imprint_info)
 
-    _status_name = (inv.get("status") or {}).get("name", "")
     if total_qty > 0 and imprint_info:
-        total_min, _bd = estimate_minutes(total_qty, imprint_info, _status_name)
+        total_min, _bd = estimate_minutes_groups(order_groups, _status_name)
     else:
         total_min = 0
         _bd = {}
@@ -3909,6 +3899,45 @@ def imprint_minutes(deco: str, qty: int, colors: int = 0,
     return int(round(setup + changes + run))
 
 
+def estimate_minutes_groups(groups: list, status_name: str = "") -> tuple:
+    """Total minutes for an order, using PER-GROUP quantities.
+
+    This is the correct estimator. A multi-group order sends different
+    quantities to different locations, so total_qty × total_locations
+    over-counts: order 7156 is 120 pcs across 3 locations but only 180
+    impressions, not 360. Only per-group math gets that right.
+    """
+    cls = _prod_class(status_name)
+    if cls == "PROMO":
+        return 0, {"excluded": "PROMO — not produced in house"}
+    if cls == "STORE":
+        locs = sum(len(g.get("imprints") or []) for g in (groups or []))
+        mins = max(STORE_MIN_FLOOR, locs * STORE_MIN_PER_LOC)
+        return mins, {"STORE": mins}
+    total = 0
+    bd = defaultdict(int)
+    for g in (groups or []):
+        gqty = int(g.get("qty") or 0)
+        for imp in (g.get("imprints") or []):
+            m = imprint_minutes(imp.get("type", "Screen Print"), gqty,
+                                imp.get("colors", 0), _stitch_count(imp))
+            bd[imp.get("type", "Screen Print")] += m
+            total += m
+    return total, dict(bd)
+
+
+def group_imprint_totals(groups: list) -> tuple:
+    """(impressions, locations, screens) using per-group quantities."""
+    imprints = locs = screens = 0
+    for g in (groups or []):
+        gqty = int(g.get("qty") or 0)
+        for imp in (g.get("imprints") or []):
+            imprints += gqty
+            locs     += 1
+            screens  += int(imp.get("colors") or 0)
+    return imprints, locs, screens
+
+
 def estimate_minutes(total_qty: int, imprint_nodes: list,
                      status_name: str = "") -> tuple:
     """Total minutes for a whole order. Returns (minutes, breakdown_dict)."""
@@ -4033,17 +4062,18 @@ def set_production_block(visual_id: str, start_datetime: str = "",
             %s
         }
     }
-    """ % _IMPRINT_FRAG
+    """ % _GROUPS_FRAG
     res = query_printavo(q, {"id": internal_id})
     if "error" in res:
         return f"API Error: {res['error']}"
     inv = res.get("invoice") or {}
     status = (inv.get("status") or {}).get("name", "")
-    imprints = _parse_obj_imprints(inv)
-    qty = int(inv.get("totalQuantity") or 0) or _parse_obj_qty(inv)
+    order_groups = _parse_obj_groups(inv, deco_default=_status_deco_fallback(status))
+    qty = (int(inv.get("totalQuantity") or 0)
+           or sum(int(g.get("qty") or 0) for g in order_groups))
 
     if not minutes:
-        minutes, bd = estimate_minutes(qty, imprints, status)
+        minutes, bd = estimate_minutes_groups(order_groups, status)
         if not minutes:
             return f"#{visual_id} ({status}) — excluded from scheduling. Nothing written."
     else:
@@ -4107,10 +4137,7 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
                    if _norm((n.get("status") or {}).get("name")) in _SWEEP_STATUSES]
     skipped = len(nodes) - len(schedulable)
 
-    imprint_map = _fetch_imprints_batch([n["id"] for n in schedulable if n.get("id")])
-    zero_ids = [n["id"] for n in schedulable
-                if n.get("id") and int(n.get("totalQuantity") or 0) == 0]
-    qty_map = _fetch_qty_batch(zero_ids) if zero_ids else {}
+    groups_raw = _fetch_groups_batch([n["id"] for n in schedulable if n.get("id")])
 
     changed, held, problems, overflow, placeholders = [], [], [], [], []
     day_load = defaultdict(lambda: defaultdict(int))
@@ -4125,11 +4152,14 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
             problems.append(f"  #{vid} — {nick} — no production date set")
             continue
 
-        imprints = imprint_map.get(iid)
-        if imprints is None:
+        _raw = groups_raw.get(iid)
+        if _raw is None:
             problems.append(f"  #{vid} — {nick} — could not fetch imprints")
             continue
-        qty = int(n.get("totalQuantity") or 0) or qty_map.get(iid, 0)
+        order_groups = _parse_obj_groups(_raw, deco_default=_status_deco_fallback(status))
+        imprints = [i for g in order_groups for i in g["imprints"]]
+        qty = (int(n.get("totalQuantity") or 0)
+               or sum(int(g.get("qty") or 0) for g in order_groups))
         if not imprints and _prod_class(status) == "NORMAL":
             # No imprint detail — place a visible placeholder rather than
             # dropping the order out of the capacity picture entirely.
@@ -4137,7 +4167,7 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
             placeholders.append(f"  #{vid} — {nick} — {qty} pcs — "
                                 f"{NO_IMPRINT_MIN}m placeholder, needs imprint detail")
         else:
-            minutes, bd = estimate_minutes(qty, imprints, status)
+            minutes, bd = estimate_minutes_groups(order_groups, status)
         if not minutes:
             continue
         capped = min(minutes, PROD_MAX_BLOCK_MIN)

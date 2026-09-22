@@ -361,6 +361,11 @@ def _fetch_groups_batch(id_list: list) -> dict:
     return raw
 
 
+# Batch chunks hit the same silent Printavo rate limit that paginate() handles.
+BATCH_RETRIES = 4
+BATCH_DELAY_S = 0.4
+
+
 def _batch_query(id_list: list, prefix: str, field: str, frag: str,
                  allow_partial: bool = False, chunk_size: int = 5) -> dict:
     """
@@ -375,6 +380,7 @@ def _batch_query(id_list: list, prefix: str, field: str, frag: str,
     """
     CHUNK = chunk_size
     out = {}
+    first = True
     for chunk_start in range(0, len(id_list), CHUNK):
         chunk = id_list[chunk_start:chunk_start + CHUNK]
         parts = [
@@ -382,9 +388,27 @@ def _batch_query(id_list: list, prefix: str, field: str, frag: str,
             for i, iid in enumerate(chunk)
         ]
         q = "query {\n" + "\n".join(parts) + "\n}"
-        result = query_printavo(q, allow_partial=allow_partial)
-        if "error" in result:
-            # Chunk failed entirely — mark all as None
+
+        # Printavo silently rate-limits rapid sequential calls. paginate()
+        # already sleeps + backs off for this reason; batch chunks never did,
+        # so a busy window (40+ orders = 14+ back-to-back calls) quietly lost
+        # whole chunks and the orders vanished from the calendar.
+        result = None
+        for attempt in range(BATCH_RETRIES):
+            if not first or attempt:
+                time.sleep(BATCH_DELAY_S * (2 ** attempt))
+            first = False
+            result = query_printavo(q, allow_partial=allow_partial)
+            if "error" not in result:
+                break
+            print(f"[BATCH] {field} chunk@{chunk_start} attempt "
+                  f"{attempt + 1}/{BATCH_RETRIES} failed: "
+                  f"{str(result.get('error'))[:180]}", flush=True)
+
+        if result is None or "error" in result:
+            print(f"[BATCH] !! GAVE UP on {field} chunk@{chunk_start} after "
+                  f"{BATCH_RETRIES} attempts — {len(chunk)} orders dropped: "
+                  f"{chunk}", flush=True)
             for iid in chunk:
                 out[iid] = None
         else:
@@ -4203,11 +4227,16 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
             changed.append(line)
 
     hdr = "DRY RUN — nothing written" if dry_run else "WRITTEN TO PRINTAVO"
+    fetch_fail = sum(1 for _p in problems if "could not fetch imprints" in _p)
+    fail_txt = (f"  \u26a0\ufe0f  {fetch_fail} ORDERS HAVE NO TIME ESTIMATE — "
+                f"the capacity numbers below are UNDERSTATED"
+                if fetch_fail else "  0 fetch failures — capacity numbers are complete")
     lines = [
         f"PRODUCTION BLOCK SWEEP — {hdr}",
         f"  Window: {now:%Y-%m-%d} → {end:%Y-%m-%d} ({days_ahead} days)",
         f"  {len(nodes)} orders in window | {len(schedulable)} schedulable | "
         f"{skipped} skipped (quote/promo/complete)",
+        fail_txt,
         f"  force_place={force_place}",
         "",
         f"BLOCKS ({len(changed)}):",
@@ -4289,8 +4318,21 @@ def run_block_sweep_scheduler():
                     _last_block_sweep_key = key
                     out = _sweep_blocks_impl(
                         days_ahead=BLOCK_SWEEP_DAYS, dry_run=False, force_place=False)
-                    head = out.split("\n")[2] if out.count("\n") > 2 else out[:120]
+                    _parts = out.split("\n")
+                    head = _parts[2] if len(_parts) > 2 else out[:120]
+                    fail_line = _parts[3].strip() if len(_parts) > 3 else ""
                     print(f"[BLOCK SWEEP] {now_ct:%Y-%m-%d %H:%M} {head}", flush=True)
+                    if fail_line:
+                        print(f"[BLOCK SWEEP] {fail_line}", flush=True)
+                    # A calendar that is quietly incomplete is worse than no
+                    # calendar — say so out loud, in the channel.
+                    if "NO TIME ESTIMATE" in fail_line and SLACK_WEBHOOK_URL:
+                        try:
+                            httpx.post(SLACK_WEBHOOK_URL, timeout=15, json={
+                                "text": ":rotating_light: *Production calendar is "
+                                        "incomplete* — " + fail_line})
+                        except Exception as _se:
+                            print(f"[BLOCK SWEEP] slack alert failed: {_se}", flush=True)
         except Exception as e:
             print(f"[BLOCK SWEEP] scheduler error: {e}", flush=True)
         time.sleep(120)

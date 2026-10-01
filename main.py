@@ -3413,6 +3413,43 @@ COGS_WINDOW_DAYS    = int(os.environ.get("COGS_WINDOW_DAYS", "60"))   # by order
 COGS_ALERT_SINCE    = os.environ.get("COGS_ALERT_SINCE", "2026-08-01")  # never look before policy era
 COGS_MAX_LIST       = 40
 
+# Contract customers, mirrored from the Scorecard "Customers 2026" tab (Type =
+# Contract) on Oct 1 2026 — the same lookup that sets column R on Daily Sales.
+# Matched case-insensitively on the order's company (or contact name if no
+# company). Add new contract shops here, or extend via env COGS_CONTRACT_EXTRA
+# (comma-separated). Line-item category "contract" is a second safety net.
+_COGS_CONTRACT_COMPANIES = (
+    "Underground Printing", "Good Times Inc.", "Chapman Promotions & Design LLC",
+    "Grasroots", "Jacobyco, LLC", "Brand Co", "Proforma RGP Creative", "StrategicKC",
+    "Need-A-Uniform", "DogFish", "Baked T's", "Creative Entourage", "Cortain, Inc.",
+    "Missouri Pickleball Club", "RMR Marketing", "BIG RIVER RUNNING COMPANY",
+    "Irish Tees", "Kaliber Agency", "Ericson Group Missouri", "Raw Blend Custom",
+    "Monica Widger", "White House Sports and Apparel", "Five Oaks Designs",
+    "Right Non Profit", "Left Hand Promotions", "St. Louis Ultimate Association",
+    "Boutique Physio",
+)
+
+
+def _cogs_norm_co(name: str) -> str:
+    return " ".join(str(name or "").lower().replace("\u2019", "'").split())
+
+
+_COGS_CONTRACT_SET = {_cogs_norm_co(c) for c in _COGS_CONTRACT_COMPANIES} | {
+    _cogs_norm_co(c) for c in os.environ.get("COGS_CONTRACT_EXTRA", "").split(",") if c.strip()}
+
+
+def _cogs_company(n: dict) -> str:
+    contact = n.get("contact") or {}
+    return ((contact.get("customer") or {}).get("companyName")
+            or contact.get("fullName") or "")
+
+
+def _cogs_is_contract_customer(n: dict) -> bool:
+    c = (n.get("contact") or {})
+    names = {_cogs_norm_co((c.get("customer") or {}).get("companyName")),
+             _cogs_norm_co(c.get("fullName"))}
+    return bool(names & _COGS_CONTRACT_SET)
+
 # Statuses where goods are not ordered yet — everything else in the window counts.
 _COGS_PRE_GOODS = {_norm_status(s) for s in (
     "Quote", "MOCK-UP REQUESTED", "MOCK-UP READY", "QUOTE APPROVAL SENT",
@@ -3512,6 +3549,8 @@ def _build_cogs_alert():
             continue
         if ((n.get("expenses") or {}).get("nodes")):
             continue
+        if _cogs_is_contract_customer(n):
+            continue
         (check if ns in _COGS_CHECK else missing).append(n)
     # Direct only: drop orders with any "contract" line-item category.
     hits = missing + check
@@ -3531,7 +3570,9 @@ def _build_cogs_alert():
         nick = n.get("nickname") or "(no nickname)"
         tag = " _(RESET)_" if "reset" in nick.lower() else ""
         status = (n.get("status") or {}).get("name", "")
-        return (f"• <{url}|#{n.get('visualId')}> — {nick}{tag} — {status} — "
+        co = _cogs_company(n)
+        co = f" ({co})" if co else ""
+        return (f"• <{url}|#{n.get('visualId')}> — {nick}{tag}{co} — {status} — "
                 f"${float(n.get('total') or 0):,.0f}")
 
     try:

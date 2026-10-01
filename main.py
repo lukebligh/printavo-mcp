@@ -720,6 +720,65 @@ def get_order_details(visual_id: str) -> str:
 
 
 @mcp.tool()
+def get_invoice_expenses(visual_ids: str) -> str:
+    """
+    Read-only. Return the expenses recorded on one or more Printavo orders,
+    for COGS reporting. Queries ONLY id, visualId and expenses — never the
+    full order object.
+    visual_ids: comma-separated order numbers shown in the Printavo UI
+                (e.g. '7035' or '7035,7036,7040'). Keep to ~25 per call.
+    Returns JSON: {"results": [{visual_id, found, type, internal_id,
+    expense_count, expenses:[{id,name,amount,transactionAt,userGenerated}],
+    expense_sum, cogs, more_expenses_unread, error}]}.
+    cogs = abs(sum of expense amounts) — Printavo stores expenses as negatives.
+    """
+    ids = [v.strip().lstrip("#") for v in str(visual_ids).split(",") if v.strip()]
+    exp_frag = ("id visualId expenses(first: 25) { nodes { id name amount "
+                "transactionAt userGenerated } pageInfo { hasNextPage } }")
+    results = []
+    for n, vid in enumerate(ids):
+        if n:
+            time.sleep(PAGE_DELAY_S)  # Printavo silently rate-limits bursts
+        row = {"visual_id": vid, "found": False}
+        internal_id, otype, err = None, None, None
+        for attempt in range(BATCH_RETRIES):
+            internal_id, otype, err = _find_order(vid)
+            if internal_id or (err and "not found" in err):
+                break
+            time.sleep(BATCH_DELAY_S * (2 ** attempt))
+        if not internal_id:
+            row["error"] = err
+            results.append(row)
+            continue
+        row.update(found=True, type=otype, internal_id=internal_id)
+        obj, qerr = None, None
+        for attempt in range(BATCH_RETRIES):
+            time.sleep(PAGE_DELAY_S * (2 ** attempt))
+            r = query_printavo(
+                f'query {{ o: {otype}(id: "{internal_id}") {{ {exp_frag} }} }}')
+            if "error" not in r and r.get("o"):
+                obj = r["o"]
+                break
+            qerr = r.get("error") or "empty response (rate limit suspected)"
+        if obj is None:
+            row["error"] = f"expense read failed: {str(qerr)[:200]}"
+            results.append(row)
+            continue
+        if str(obj.get("visualId")) != vid:
+            row["error"] = f"id mismatch: got visualId {obj.get('visualId')}"
+            results.append(row)
+            continue
+        conn = obj.get("expenses") or {}
+        exps = conn.get("nodes") or []
+        total = round(sum(float(e.get("amount") or 0) for e in exps), 2)
+        row.update(expense_count=len(exps), expenses=exps, expense_sum=total,
+                   cogs=round(abs(total), 2),
+                   more_expenses_unread=bool((conn.get("pageInfo") or {}).get("hasNextPage")))
+        results.append(row)
+    return json.dumps({"results": results})
+
+
+@mcp.tool()
 def get_statuses() -> str:
     """List ALL available order statuses in Printavo (paginated — complete set)."""
     result = fetch_all_statuses()

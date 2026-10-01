@@ -13,7 +13,7 @@ mcp = FastMCP("Printavo Assistant")
 
 EMAIL            = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN            = os.environ.get("PRINTAVO_TOKEN", "")
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")      # production briefing → #all-est-merch
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")      # #all-est-merch — now only the fallback for the production schedule (see PROD_SLACK_CHANNEL)
 CX_SLACK_WEBHOOK_URL = os.environ.get("CX_SLACK_WEBHOOK_URL", "") # CX digest → #cx-daily ONLY
 # Luke's private backlog block (old pickups + old/flipped quotes) goes here —
 # NOT the #cx-daily channel. Point this at a webhook for a channel only Luke
@@ -1193,16 +1193,9 @@ def get_production_schedule(days_ahead: int = 7) -> str:
 @mcp.tool()
 def send_schedule_to_slack(days_ahead: int = 7) -> str:
     """Post the production schedule to the configured Slack channel."""
-    if not SLACK_WEBHOOK_URL:
-        return "Error: SLACK_WEBHOOK_URL environment variable not set."
     schedule_text = get_production_schedule(days_ahead)
-    payload = {
-        "text": f"*Printavo Production Schedule*\n```{schedule_text}```"
-    }
-    response = httpx.post(SLACK_WEBHOOK_URL, json=payload, timeout=15)
-    if response.status_code == 200:
-        return "Schedule posted to Slack successfully."
-    return f"Slack error: HTTP {response.status_code} — {response.text}"
+    dest, err = _post_production(f"*Printavo Production Schedule*\n```{schedule_text}```")
+    return f"Slack error: {err}" if err else f"Schedule posted to {dest} ✓"
 
 
 # ── FIXED: get_production_time_estimate ───────────────────────────────────────
@@ -3417,8 +3410,8 @@ COGS_WINDOW_DAYS    = int(os.environ.get("COGS_WINDOW_DAYS", "60"))   # by order
 COGS_ALERT_SINCE    = os.environ.get("COGS_ALERT_SINCE", "2026-08-01")  # never look before policy era
 COGS_MAX_LIST       = 40
 
-# Contract customers, mirrored from the Scorecard "Customers 2026" tab (Type =
-# Contract) on Oct 1 2026 — the same lookup that sets column R on Daily Sales.
+# Contract customers. LIVE source is the Scorecard "Customers 2026" tab (see
+# _cogs_contract_set); this snapshot from Oct 1 2026 is only the fallback.
 # Matched case-insensitively on the order's company (or contact name if no
 # company). Add new contract shops here, or extend via env COGS_CONTRACT_EXTRA
 # (comma-separated).
@@ -3448,11 +3441,36 @@ def _cogs_company(n: dict) -> str:
             or contact.get("fullName") or "")
 
 
+_cogs_contract_cache = {"at": 0.0, "set": None, "source": "built-in list"}
+
+
+def _cogs_contract_set() -> set:
+    """Contract customers, read live from the Scorecard 'Customers 2026' tab
+    (column B = 'Contract'), cached 1 hour. Falls back to the built-in list if
+    the sheet can't be read. New contract shops are picked up automatically."""
+    c = _cogs_contract_cache
+    if c["set"] is not None and time.time() - c["at"] < 3600:
+        return c["set"]
+    try:
+        rows = _sheets_get(["'Customers 2026'!A2:B2000"])[0]
+        live = {_cogs_norm_co(r[0]) for r in rows
+                if len(r) > 1 and str(r[1]).strip().lower() == "contract" and str(r[0]).strip()}
+        if live:
+            extra = {_cogs_norm_co(x) for x in os.environ.get("COGS_CONTRACT_EXTRA", "").split(",") if x.strip()}
+            c.update(at=time.time(), set=live | extra, source=f"Customers 2026 tab ({len(live)} contract)")
+            return c["set"]
+        raise RuntimeError("no Contract rows found")
+    except Exception as e:
+        print(f"[COGS] Customers 2026 read failed ({e}) — using built-in contract list", flush=True)
+        c.update(at=time.time(), set=_COGS_CONTRACT_SET, source="built-in list (sheet read failed)")
+        return c["set"]
+
+
 def _cogs_is_contract_customer(n: dict) -> bool:
     c = (n.get("contact") or {})
     names = {_cogs_norm_co((c.get("customer") or {}).get("companyName")),
              _cogs_norm_co(c.get("fullName"))}
-    return bool(names & _COGS_CONTRACT_SET)
+    return bool(names & _cogs_contract_set())
 
 # Statuses where goods are not ordered yet — everything else in the window counts.
 _COGS_PRE_GOODS = {_norm_status(s) for s in (
@@ -4083,15 +4101,56 @@ def _build_daily_production_message() -> str:
     return "\n".join(lines)
 
 
+# Production schedule channel (Oct 1 2026): #daily-schedule, posted by the bot.
+# If the bot can't post there (e.g. not invited), falls back to the old
+# SLACK_WEBHOOK_URL (#all-est-merch) so the floor still gets the schedule, and
+# DMs Luke that the fallback fired.
+PROD_SLACK_CHANNEL = os.environ.get("PROD_SLACK_CHANNEL", "C0AUAV1BTT8")  # #daily-schedule
+
+
+def _post_production(text: str):
+    """Returns (destination, error_or_None)."""
+    if SLACK_BOT_TOKEN and PROD_SLACK_CHANNEL:
+        try:
+            resp = httpx.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                json={"channel": PROD_SLACK_CHANNEL, "text": text,
+                      "unfurl_links": False, "unfurl_media": False},
+                timeout=15)
+            body = resp.json() if resp.status_code == 200 else {}
+            if body.get("ok"):
+                return "#daily-schedule", None
+            bot_err = body.get("error") or f"HTTP {resp.status_code}"
+        except Exception as e:
+            bot_err = str(e)
+        print(f"[PROD PUSH] bot post to {PROD_SLACK_CHANNEL} failed: {bot_err}", flush=True)
+        if SLACK_WEBHOOK_URL:
+            werr = _post_to_slack(text, SLACK_WEBHOOK_URL)
+            try:
+                _post_cogs_dm(f"⚠️ Production schedule couldn't post to #daily-schedule "
+                              f"({bot_err}) — sent to #all-est-merch instead. If it says "
+                              f"not_in_channel, type /invite @<bot name> in #daily-schedule.",
+                              recipients="U0504FSDYB0")
+            except Exception:
+                pass
+            return "#all-est-merch (fallback)", werr
+        return "", f"bot post failed: {bot_err}"
+    if SLACK_WEBHOOK_URL:
+        return "#all-est-merch", _post_to_slack(text, SLACK_WEBHOOK_URL)
+    return "", "no Slack delivery configured"
+
+
 def _run_production_push_impl(force_dry_run: bool = False) -> str:
     text = _build_daily_production_message()
     if force_dry_run or _dry_run():
         print(f"[PROD PUSH — DRY RUN]\n{text}", flush=True)
         return f"[DRY RUN — not posted to Slack]\n\n{text}"
-    err = _post_to_slack(text, SLACK_WEBHOOK_URL)
+    dest, err = _post_production(text)
     if err:
         return f"{err}\n\nMessage that failed to post:\n{text}"
-    return f"Posted to #all-est-merch ✓\n\n{text}"
+    return f"Posted to {dest} ✓\n\n{text}"
 
 
 @mcp.tool()
@@ -4107,7 +4166,7 @@ def run_production_push(dry_run: bool = False) -> str:
 _last_prod_push_date = None
 
 def run_daily_scheduler():
-    """Background thread: post TODAY's production schedule to #all-est-merch
+    """Background thread: post TODAY's production schedule to #daily-schedule
     at 7:00 AM America/Chicago, weekdays, skipping federal holidays."""
     global _last_prod_push_date
     while True:

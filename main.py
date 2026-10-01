@@ -126,6 +126,7 @@ def query_printavo(query: str, variables: dict = None, allow_partial: bool = Fal
 MAX_PAGE_SIZE = 25
 PAGE_DELAY_S  = 0.4
 EMPTY_RETRIES = 3
+FIND_ORDER_MAX_PAGES = 8   # _find_order slow path: up to 200 fuzzy matches per connection
 
 
 def _dig(data, path):
@@ -1295,6 +1296,41 @@ def _find_order(visual_id: str):
     for n in quote_nodes:
         if str(n.get("visualId")) == str(visual_id):
             return n["id"], "quote", None
+
+    # Slow path. Printavo's `query` is a fuzzy text search: the digits match
+    # phone numbers, PO numbers and old job names, and the OLDEST matches come
+    # back first. "6400" returned #102, #162, #174, #220, #488 before #6400, so
+    # the 5-result check above missed it. Walk pages until an exact visualId hit.
+    for conn_name, order_type in (("invoices", "invoice"), ("quotes", "quote")):
+        page_q = f"""
+        query($q: String, $first: Int, $after: String) {{
+            {conn_name}(first: $first, after: $after, query: $q) {{
+                pageInfo {{ hasNextPage endCursor }}
+                nodes {{ id visualId }}
+            }}
+        }}
+        """
+        after = None
+        for _page in range(FIND_ORDER_MAX_PAGES):
+            time.sleep(PAGE_DELAY_S)
+            r = None
+            for attempt in range(EMPTY_RETRIES):
+                r = query_printavo(page_q, {"q": str(visual_id),
+                                            "first": MAX_PAGE_SIZE,
+                                            "after": after}, allow_partial=True)
+                if "error" in r:
+                    return None, None, f"API Error: {r['error']}"
+                if (r.get(conn_name) or {}).get("nodes") or after is None and attempt >= 1:
+                    break
+                time.sleep(0.8 * (2 ** attempt))  # silent rate limit → backoff
+            conn = (r or {}).get(conn_name) or {}
+            for n in conn.get("nodes") or []:
+                if str(n.get("visualId")) == str(visual_id):
+                    return n["id"], order_type, None
+            pi = conn.get("pageInfo") or {}
+            if not pi.get("hasNextPage") or not pi.get("endCursor"):
+                break
+            after = pi["endCursor"]
     return None, None, f"Order #{visual_id} not found in invoices or quotes."
 
 

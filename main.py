@@ -13,7 +13,7 @@ mcp = FastMCP("Printavo Assistant")
 
 EMAIL            = os.environ.get("PRINTAVO_EMAIL", "")
 TOKEN            = os.environ.get("PRINTAVO_TOKEN", "")
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")      # #all-est-merch — now only the fallback for the production schedule (see PROD_SLACK_CHANNEL)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")      # #all-est-merch — no longer used by the production schedule (see PROD_SLACK_CHANNEL)
 CX_SLACK_WEBHOOK_URL = os.environ.get("CX_SLACK_WEBHOOK_URL", "") # CX digest → #cx-daily ONLY
 # Luke's private backlog block (old pickups + old/flipped quotes) goes here —
 # NOT the #cx-daily channel. Point this at a webhook for a channel only Luke
@@ -4101,45 +4101,37 @@ def _build_daily_production_message() -> str:
     return "\n".join(lines)
 
 
-# Production schedule channel (Oct 1 2026): #daily-schedule, posted by the bot.
-# If the bot can't post there (e.g. not invited), falls back to the old
-# SLACK_WEBHOOK_URL (#all-est-merch) so the floor still gets the schedule, and
-# DMs Luke that the fallback fired.
+# Production schedule channel (Oct 1 2026): #daily-schedule ONLY, posted by the
+# bot. No fallback to #all-est-merch by design — if the post fails, Luke gets a
+# DM with the error and the floor gets nothing rather than the wrong channel.
 PROD_SLACK_CHANNEL = os.environ.get("PROD_SLACK_CHANNEL", "C0AUAV1BTT8")  # #daily-schedule
 
 
 def _post_production(text: str):
     """Returns (destination, error_or_None)."""
-    if SLACK_BOT_TOKEN and PROD_SLACK_CHANNEL:
-        try:
-            resp = httpx.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-                         "Content-Type": "application/json; charset=utf-8"},
-                json={"channel": PROD_SLACK_CHANNEL, "text": text,
-                      "unfurl_links": False, "unfurl_media": False},
-                timeout=15)
-            body = resp.json() if resp.status_code == 200 else {}
-            if body.get("ok"):
-                return "#daily-schedule", None
-            bot_err = body.get("error") or f"HTTP {resp.status_code}"
-        except Exception as e:
-            bot_err = str(e)
-        print(f"[PROD PUSH] bot post to {PROD_SLACK_CHANNEL} failed: {bot_err}", flush=True)
-        if SLACK_WEBHOOK_URL:
-            werr = _post_to_slack(text, SLACK_WEBHOOK_URL)
-            try:
-                _post_cogs_dm(f"⚠️ Production schedule couldn't post to #daily-schedule "
-                              f"({bot_err}) — sent to #all-est-merch instead. If it says "
-                              f"not_in_channel, type /invite @<bot name> in #daily-schedule.",
-                              recipients="U0504FSDYB0")
-            except Exception:
-                pass
-            return "#all-est-merch (fallback)", werr
-        return "", f"bot post failed: {bot_err}"
-    if SLACK_WEBHOOK_URL:
-        return "#all-est-merch", _post_to_slack(text, SLACK_WEBHOOK_URL)
-    return "", "no Slack delivery configured"
+    if not SLACK_BOT_TOKEN:
+        return "", "SLACK_BOT_TOKEN not set — cannot post to #daily-schedule"
+    try:
+        resp = httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            json={"channel": PROD_SLACK_CHANNEL, "text": text,
+                  "unfurl_links": False, "unfurl_media": False},
+            timeout=15)
+        body = resp.json() if resp.status_code == 200 else {}
+        if body.get("ok"):
+            return "#daily-schedule", None
+        err = body.get("error") or f"HTTP {resp.status_code}"
+    except Exception as e:
+        err = str(e)
+    print(f"[PROD PUSH] post to #daily-schedule failed: {err}", flush=True)
+    try:
+        _post_cogs_dm(f"⚠️ Today's production schedule did NOT post to #daily-schedule "
+                      f"({err}). Nothing was sent anywhere else.", recipients="U0504FSDYB0")
+    except Exception:
+        pass
+    return "", f"post to #daily-schedule failed: {err}"
 
 
 def _run_production_push_impl(force_dry_run: bool = False) -> str:

@@ -3401,6 +3401,226 @@ def run_art_digest_scheduler():
         time.sleep(120)
 
 
+# ── MISSING-COGS ALERT (Monday 9:00 AM CT) ───────────────────────────────────
+# Policy (Oct 1 2026): Mechelle enters goods cost in Printavo → Payment/Expenses
+# at the time of ordering. Every Monday 9:00 AM Central this DMs Luke + Mechelle
+# the DIRECT orders past ORDER GOODS that still have no expense. Contract orders
+# (any "contract" line-item category) and $0 orders are skipped. The Scorecard
+# column-F fill stays in the printavo-cogs-fill skill; this is the alert only.
+COGS_ALERT_ENABLED  = os.environ.get("COGS_ALERT_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+COGS_DM_USER_IDS    = os.environ.get("COGS_DM_USER_IDS", "U0504FSDYB0,U07VDET3XEX")  # Luke, Mechelle
+COGS_WINDOW_DAYS    = int(os.environ.get("COGS_WINDOW_DAYS", "60"))   # by order createdAt
+COGS_ALERT_SINCE    = os.environ.get("COGS_ALERT_SINCE", "2026-08-01")  # never look before policy era
+COGS_MAX_LIST       = 40
+
+# Statuses where goods are not ordered yet — everything else in the window counts.
+_COGS_PRE_GOODS = {_norm_status(s) for s in (
+    "Quote", "MOCK-UP REQUESTED", "MOCK-UP READY", "QUOTE APPROVAL SENT",
+    "QUOTE APPROVED", "ORDER GOODS", "PROMO - ART APPROVAL SENT",
+    "PROMO - ART APPROVED", "PROMO - ART DECLINED",
+    "CONTRACT - WAITING ON ARTWORK", "CONTRACT - WAITING ON GOODS", "UGP SHIPPED")}
+# Shown separately rather than guessed at.
+_COGS_CHECK = {_norm_status(s) for s in ("ORDER ON HOLD - ISSUE", "BD")}
+
+_COGS_FRAG = """
+    pageInfo { hasNextPage endCursor }
+    nodes {
+        id visualId nickname total
+        status { name }
+        timestamps { createdAt }
+        contact { fullName customer { companyName } }
+        expenses(first: 1) { nodes { id } }
+    }
+"""
+
+
+def _cogs_cutoff_utc() -> datetime:
+    since = datetime.fromisoformat(COGS_ALERT_SINCE).replace(tzinfo=timezone.utc)
+    return max(datetime.now(timezone.utc) - timedelta(days=COGS_WINDOW_DAYS), since)
+
+
+def _fetch_cogs_candidates() -> dict:
+    """Walk invoices newest-first and keep those created inside the window.
+    Sorted walk stops at the first page entirely older than the cutoff. If the
+    API rejects the sort args, falls back to a full unsorted walk (slow, but
+    complete). Returns {"orders": [...], "pages": n, "sorted": bool} or {"error"}."""
+    cutoff = _cogs_cutoff_utc()
+    sorted_q = f"""
+    query($first: Int, $after: String) {{
+        invoices(first: $first, after: $after, sortOn: VISUAL_ID, sortDescending: true) {{ {_COGS_FRAG} }}
+    }}"""
+    plain_q = f"""
+    query($first: Int, $after: String) {{
+        invoices(first: $first, after: $after) {{ {_COGS_FRAG} }}
+    }}"""
+    for q, is_sorted in ((sorted_q, True), (plain_q, False)):
+        orders, after, pages, failed = [], None, 0, None
+        while pages < 400:
+            conn = None
+            for attempt in range(EMPTY_RETRIES):
+                r = query_printavo(q, {"first": MAX_PAGE_SIZE, "after": after})
+                if "error" in r:
+                    failed = r["error"]
+                    break
+                c = r.get("invoices") or {}
+                if c.get("nodes") or (pages == 0 and attempt >= 1):
+                    conn = c
+                    break
+                time.sleep(0.8 * (2 ** attempt))   # silent rate limit
+            if failed or conn is None:
+                failed = failed or f"page {pages + 1} empty after retries"
+                break
+            pages += 1
+            if is_sorted and pages == 1:
+                # Guard: if the API silently ignored the sort, page 1 won't be
+                # descending — the early stop would then miss everything.
+                vids = [int(n.get("visualId") or 0) for n in conn.get("nodes") or []]
+                if vids != sorted(vids, reverse=True):
+                    failed = "sort args ignored (page 1 not descending)"
+                    break
+            in_window = 0
+            for n in conn.get("nodes") or []:
+                created = _parse_iso((n.get("timestamps") or {}).get("createdAt"))
+                if created and created >= cutoff:
+                    in_window += 1
+                    orders.append(n)
+            pi = conn.get("pageInfo") or {}
+            if is_sorted and in_window == 0:
+                break                       # everything older from here down
+            if not pi.get("hasNextPage") or not pi.get("endCursor"):
+                break
+            after = pi["endCursor"]
+            time.sleep(PAGE_DELAY_S)
+        if not failed:
+            return {"orders": orders, "pages": pages, "sorted": is_sorted}
+        print(f"[COGS ALERT] {'sorted' if is_sorted else 'plain'} walk failed: {failed}", flush=True)
+    return {"error": f"invoice walk failed: {failed}"}
+
+
+def _build_cogs_alert():
+    """Returns (text, ok)."""
+    fetched = _fetch_cogs_candidates()
+    if "error" in fetched:
+        return f"⚠️ COGS alert could not run — {fetched['error']}", False
+    missing, check = [], []
+    for n in fetched["orders"]:
+        status = (n.get("status") or {}).get("name", "")
+        ns = _norm_status(status)
+        if ns in _COGS_PRE_GOODS:
+            continue
+        if float(n.get("total") or 0) <= 0:
+            continue
+        if ((n.get("expenses") or {}).get("nodes")):
+            continue
+        (check if ns in _COGS_CHECK else missing).append(n)
+    # Direct only: drop orders with any "contract" line-item category.
+    hits = missing + check
+    cats = {}
+    for i in range(0, len(hits), 20):
+        cats.update(_fetch_categories_batch([h["id"] for h in hits[i:i + 20]]))
+        time.sleep(PAGE_DELAY_S)
+    missing = [h for h in missing if not _order_is_contract(cats.get(h["id"]))]
+    check   = [h for h in check   if not _order_is_contract(cats.get(h["id"]))]
+
+    billed = {_norm_status(s) for s in ("INVOICED", "PAID & DONE")}
+    missing.sort(key=lambda n: (0 if _norm_status((n.get("status") or {}).get("name")) in billed else 1,
+                                int(n.get("visualId") or 0)))
+
+    def line(n):
+        url = f"https://www.printavo.com/invoices/{n['id']}"
+        nick = n.get("nickname") or "(no nickname)"
+        tag = " _(RESET)_" if "reset" in nick.lower() else ""
+        status = (n.get("status") or {}).get("name", "")
+        return (f"• <{url}|#{n.get('visualId')}> — {nick}{tag} — {status} — "
+                f"${float(n.get('total') or 0):,.0f}")
+
+    try:
+        date_str = _central_now().strftime("%a %b %-d")
+    except ValueError:
+        date_str = _central_now().strftime("%a %b %d")
+    since = _cogs_cutoff_utc().astimezone(_central_now().tzinfo).strftime("%b %-d")
+    if not missing and not check:
+        return (f"✅ *COGS check — {date_str}* · All Direct orders past ORDER GOODS "
+                f"since {since} have COGS in Printavo."), True
+    lines = [f"*COGS check — {date_str}* · Direct orders created since {since}"]
+    if missing:
+        lines.append(f"\n⚠️ *{len(missing)} Direct order(s) past ORDER GOODS with no COGS in Printavo*")
+        lines.append("Enter the goods cost in Printavo → Payment / Expenses. "
+                     "Invoiced / paid orders are listed first.")
+        lines += [line(n) for n in missing[:COGS_MAX_LIST]]
+        if len(missing) > COGS_MAX_LIST:
+            lines.append(f"…and {len(missing) - COGS_MAX_LIST} more.")
+    if check:
+        lines.append("\n🔎 *Check status* (on hold / unclear — no COGS yet)")
+        lines += [line(n) for n in check]
+    return "\n".join(lines), True
+
+
+def _post_cogs_dm(text: str, recipients: str = None):
+    if not SLACK_BOT_TOKEN:
+        return "Error: SLACK_BOT_TOKEN not set — cannot DM the COGS alert."
+    errors = []
+    for uid in [u.strip() for u in (recipients or COGS_DM_USER_IDS).split(",") if u.strip()]:
+        try:
+            resp = httpx.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                json={"channel": uid, "text": text,
+                      "unfurl_links": False, "unfurl_media": False},
+                timeout=15)
+            body = resp.json() if resp.status_code == 200 else {}
+            if not body.get("ok"):
+                errors.append(f"{uid}: {body.get('error') or resp.status_code}")
+        except Exception as e:
+            errors.append(f"{uid}: {e}")
+    return None if not errors else "; ".join(errors)
+
+
+def _run_cogs_alert_impl(force_dry_run: bool = False) -> str:
+    text, ok = _build_cogs_alert()
+    if force_dry_run or _dry_run():
+        return f"[DRY RUN — not posted]\n\n{text}"
+    if not ok:
+        _post_cogs_dm(text, recipients="U0504FSDYB0")  # tell Luke it broke; never go silent
+        return text
+    err = _post_cogs_dm(text)
+    if err:
+        return f"{err}\n\nAlert that failed to post:\n{text}"
+    return f"Posted to {COGS_DM_USER_IDS} ✓\n\n{text}"
+
+
+@mcp.tool()
+def run_cogs_alert(dry_run: bool = False) -> str:
+    """
+    Build and DM Luke + Mechelle the missing-COGS alert right now, without
+    waiting for Monday 9 AM: Direct orders past ORDER GOODS, created in the
+    window, total > $0, with no expense in Printavo Payment/Expenses. Contract
+    orders are excluded. dry_run=True returns the text without posting.
+    """
+    return _run_cogs_alert_impl(force_dry_run=dry_run)
+
+
+_last_cogs_alert_date = None
+
+def run_cogs_alert_scheduler():
+    """Background thread: Mondays 9:00 AM America/Chicago. Runs on holidays too
+    (Mechelle's list doesn't change because it's a holiday)."""
+    global _last_cogs_alert_date
+    while True:
+        try:
+            now_ct = _central_now()
+            if (COGS_ALERT_ENABLED
+                    and now_ct.weekday() == 0
+                    and now_ct.hour == 9 and now_ct.minute < 10
+                    and _last_cogs_alert_date != now_ct.date().isoformat()):
+                _last_cogs_alert_date = now_ct.date().isoformat()
+                print(f"[COGS ALERT] {_run_cogs_alert_impl()[:200]}", flush=True)
+        except Exception as e:
+            print(f"[COGS ALERT] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
 # ── DAILY SLACK SCHEDULER ─────────────────────────────────────────────────────
 
 def _is_us_federal_holiday(dt: datetime) -> bool:
@@ -4444,6 +4664,9 @@ cx_digest_thread.start()
 
 art_digest_thread = threading.Thread(target=run_art_digest_scheduler, daemon=True)
 art_digest_thread.start()
+
+cogs_alert_thread = threading.Thread(target=run_cogs_alert_scheduler, daemon=True)
+cogs_alert_thread.start()
 
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))

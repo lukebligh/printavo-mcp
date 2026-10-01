@@ -1,3 +1,5 @@
 fastmcp
 httpx
 tzdata
+google-auth
+requests

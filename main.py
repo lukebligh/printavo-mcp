@@ -733,6 +733,10 @@ def get_invoice_expenses(visual_ids: str) -> str:
     expense_sum, cogs, more_expenses_unread, error}]}.
     cogs = abs(sum of expense amounts) — Printavo stores expenses as negatives.
     """
+    return json.dumps({"results": _invoice_expenses_impl(visual_ids)})
+
+
+def _invoice_expenses_impl(visual_ids: str) -> list:
     ids = [v.strip().lstrip("#") for v in str(visual_ids).split(",") if v.strip()]
     exp_frag = ("id visualId expenses(first: 25) { nodes { id name amount "
                 "transactionAt userGenerated } pageInfo { hasNextPage } }")
@@ -776,7 +780,7 @@ def get_invoice_expenses(visual_ids: str) -> str:
                    cogs=round(abs(total), 2),
                    more_expenses_unread=bool((conn.get("pageInfo") or {}).get("hasNextPage")))
         results.append(row)
-    return json.dumps({"results": results})
+    return results
 
 
 @mcp.tool()
@@ -3575,10 +3579,16 @@ def _build_cogs_alert():
     except ValueError:
         date_str = _central_now().strftime("%a %b %d")
     since = _cogs_cutoff_utc().astimezone(_central_now().tzinfo).strftime("%b %-d")
+    filled = _cogs_filled_last_7_days()
+    fill_line = (f"✅ Scorecard: filled {filled[0]} COGS cell(s) this week (${filled[1]:,.2f})"
+                 if filled else "")
     if not missing and not check:
-        return (f"✅ *COGS check — {date_str}* · All Direct orders past ORDER GOODS "
-                f"since {since} have COGS in Printavo."), True
+        return "\n".join(x for x in (
+            f"✅ *COGS check — {date_str}* · All Direct orders past ORDER GOODS "
+            f"since {since} have COGS in Printavo.", fill_line) if x), True
     lines = [f"*COGS check — {date_str}* · Direct orders created since {since}"]
+    if fill_line:
+        lines.append(fill_line)
     if missing:
         lines.append(f"\n⚠️ *{len(missing)} Direct order(s) past ORDER GOODS with no COGS in Printavo*")
         lines.append("Enter the goods cost in Printavo → Payment / Expenses. "
@@ -3654,6 +3664,277 @@ def run_cogs_alert_scheduler():
                 print(f"[COGS ALERT] {_run_cogs_alert_impl()[:200]}", flush=True)
         except Exception as e:
             print(f"[COGS ALERT] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
+# ── DAILY COGS FILL → Scorecard column F (6:00 AM CT) ────────────────────────
+# Copies Printavo Payment/Expenses into 'Daily Sales 2026'!F for recent Direct
+# rows. Writes ONLY blank or $0 cells; never overwrites a value, never touches a
+# formula. Auth: Google service account in env GOOGLE_SERVICE_ACCOUNT_JSON,
+# shared as Editor on the Scorecard only. Quiet unless something needs Luke.
+COGS_FILL_ENABLED   = os.environ.get("COGS_FILL_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+COGS_SHEET_ID       = os.environ.get("COGS_SHEET_ID", "1tqIvSWbqbwkwMjEc8xrExY6CqXLZAhYgNq9j7b6O7Ts")
+COGS_SHEET_TAB      = os.environ.get("COGS_SHEET_TAB", "Daily Sales 2026")
+COGS_FILL_DAYS      = int(os.environ.get("COGS_FILL_DAYS", "35"))   # by Process Date (col A)
+COGS_FILL_HOUR_CT   = int(os.environ.get("COGS_FILL_HOUR_CT", "6"))
+COGS_DISAGREE_USD   = 5.0
+_SHEETS_API         = "https://sheets.googleapis.com/v4/spreadsheets"
+_gsa_creds          = None
+
+
+def _sheets_token() -> str:
+    """Bearer token for the service account (cached; google-auth refreshes)."""
+    global _gsa_creds
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not raw:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set on Railway")
+    from google.oauth2 import service_account
+    import google.auth.transport.requests as gat
+    if _gsa_creds is None:
+        _gsa_creds = service_account.Credentials.from_service_account_info(
+            json.loads(raw), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    if not _gsa_creds.valid:
+        _gsa_creds.refresh(gat.Request())
+    return _gsa_creds.token
+
+
+def _sheets_get(ranges: list, render: str = "UNFORMATTED_VALUE") -> list:
+    """values:batchGet → list of row-lists per range (rows padded by caller)."""
+    resp = httpx.get(f"{_SHEETS_API}/{COGS_SHEET_ID}/values:batchGet",
+                     params={"ranges": ranges, "valueRenderOption": render,
+                             "dateTimeRenderOption": "SERIAL_NUMBER"},
+                     headers={"Authorization": f"Bearer {_sheets_token()}"},
+                     timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Sheets read HTTP {resp.status_code}: {resp.text[:200]}")
+    return [vr.get("values", []) for vr in resp.json().get("valueRanges", [])]
+
+
+def _sheets_write_cells(cells: dict) -> int:
+    """cells = {row: value} for column F. One batchUpdate, one range per cell, so
+    no neighbouring cell is ever touched. Returns totalUpdatedCells."""
+    if not cells:
+        return 0
+    data = [{"range": f"'{COGS_SHEET_TAB}'!F{r}", "values": [[v]]} for r, v in cells.items()]
+    resp = httpx.post(f"{_SHEETS_API}/{COGS_SHEET_ID}/values:batchUpdate",
+                      json={"valueInputOption": "RAW", "data": data},
+                      headers={"Authorization": f"Bearer {_sheets_token()}"},
+                      timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Sheets write HTTP {resp.status_code}: {resp.text[:200]}")
+    return int(resp.json().get("totalUpdatedCells", 0))
+
+
+def _cogs_num(v):
+    """Sheet cell → float, or None if blank. Handles 1235, '1235', '$1,235'."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).replace("$", "").replace(",", "").strip()
+    try:
+        return float(s) if s else None
+    except ValueError:
+        return None
+
+
+def _cogs_date(v):
+    """Process Date → date. Real dates arrive as serial numbers; typed text as
+    '8/8/2026' or '08/11/2026'. Returns None if unreadable."""
+    from datetime import date as _date
+    if isinstance(v, (int, float)) and v > 30000:
+        return (datetime(1899, 12, 30) + timedelta(days=float(v))).date()
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(v).strip(), fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _cogs_fill_log_path():
+    p = os.environ.get("COGS_FILL_LOG_PATH", "")
+    if p:
+        return p
+    return "/data/cogs_fill_log.json" if os.path.isdir("/data") else ""
+
+
+def _cogs_fill_log_append(entry: dict):
+    p = _cogs_fill_log_path()
+    if not p:
+        return
+    try:
+        log = json.load(open(p)) if os.path.exists(p) else []
+    except Exception:
+        log = []
+    log.append(entry)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    log = [e for e in log if e.get("at", "") >= cutoff]
+    with open(p, "w") as f:
+        json.dump(log, f)
+
+
+def _cogs_filled_last_7_days():
+    """(rows, dollars) written by the daily fill in the last 7 days, or None
+    if there is no persistent log (no Railway volume)."""
+    p = _cogs_fill_log_path()
+    if not p or not os.path.exists(p):
+        return None
+    try:
+        log = json.load(open(p))
+    except Exception:
+        return None
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    rows = [w for e in log if e.get("at", "") >= cutoff for w in e.get("written", [])]
+    return len(rows), round(sum(w[2] for w in rows), 2)
+
+
+def _run_cogs_fill_impl(dry_run: bool = False) -> dict:
+    """Returns a report dict: window, written, flags, errors, text."""
+    tab = f"'{COGS_SHEET_TAB}'"
+    colB = _sheets_get([f"{tab}!B1:B3000"])[0]
+    last = max((i + 1 for i, r in enumerate(colB) if r and str(r[0]).strip()), default=0)
+    if last < 2:
+        raise RuntimeError("no data rows found in column B")
+    lo = max(2, last - 400)
+    vals, rcol = _sheets_get([f"{tab}!A{lo}:F{last}", f"{tab}!R{lo}:R{last}"])
+    fform = _sheets_get([f"{tab}!F{lo}:F{last}"], render="FORMULA")[0]
+
+    def cell(rows, i, j):
+        row = rows[i] if i < len(rows) else []
+        return row[j] if j < len(row) else None
+
+    cutoff = (_central_now() - timedelta(days=COGS_FILL_DAYS)).date()
+    window = []                                   # walk UP from the bottom
+    for i in range(last - lo, -1, -1):
+        d = _cogs_date(cell(vals, i, 0))
+        if d is not None and d < cutoff:
+            break
+        window.append(i)
+    rows = []
+    for i in window:
+        inv = str(cell(vals, i, 1) or "").strip()
+        if not inv or str(cell(rcol, i, 0) or "").strip() != "Direct":
+            continue
+        if (_cogs_num(cell(vals, i, 3)) or 0) <= 0:
+            continue
+        rows.append({"row": lo + i, "inv": inv, "job": str(cell(vals, i, 2) or ""),
+                     "f": _cogs_num(cell(vals, i, 5)),
+                     "formula": str(cell(fform, i, 0) or "").startswith("=")})
+    counts = {}
+    for r in rows:
+        counts[r["inv"]] = counts.get(r["inv"], 0) + 1
+
+    flags, errors, plan = [], [], {}
+    todo = [r for r in rows if not r["formula"] and (r["f"] is None or r["f"] == 0)]
+    dups = [r for r in todo if counts[r["inv"]] > 1]
+    for r in dups:
+        flags.append(f"#{r['inv']} is on {counts[r['inv']]} Direct rows (row {r['row']}) — not filled, double-count risk")
+    todo = [r for r in todo if counts[r["inv"]] == 1]
+    found = {}
+    for k in range(0, len(todo), 25):
+        for res in _invoice_expenses_impl(",".join(r["inv"] for r in todo[k:k + 25])):
+            found[res["visual_id"]] = res
+    for r in todo:
+        res = found.get(r["inv"]) or {}
+        if not res.get("found") or res.get("error"):
+            errors.append(f"#{r['inv']} (row {r['row']}): {res.get('error', 'no result')}")
+            continue
+        cogs = float(res.get("cogs") or 0)
+        if cogs <= 0:
+            continue
+        plan[r["row"]] = (r["inv"], round(cogs, 2))
+        exps = res.get("expenses") or []
+        if len(exps) > 2:
+            flags.append(f"#{r['inv']} (row {r['row']}): {len(exps)} expense lines → ${cogs:,.2f}")
+        for e in exps:
+            nm = str(e.get("name") or "").lower()
+            if any(w in nm for w in ("ship", "ups", "fedex", "freight", "card", "fee")):
+                flags.append(f"#{r['inv']} (row {r['row']}): expense '{e.get('name')}' looks like a fee — included")
+
+    written = []
+    if plan and not dry_run:
+        # Re-read the target cells right before writing; skip any that filled up.
+        order = list(plan)
+        got = _sheets_get([f"{tab}!F{row}" for row in order], render="FORMULA")
+        fresh = {row: (g[0][0] if g and g[0] else None) for row, g in zip(order, got)}
+        safe = {row: val for row, (inv, val) in plan.items()
+                if _cogs_num(fresh[row]) in (None, 0) and not str(fresh[row] or "").startswith("=")}
+        n = _sheets_write_cells(safe)
+        sorder = list(safe)
+        got = _sheets_get([f"{tab}!F{row}" for row in sorder]) if sorder else []
+        check = {row: (g[0][0] if g and g[0] else None) for row, g in zip(sorder, got)}
+        for row, val in safe.items():
+            if abs((_cogs_num(check[row]) or 0) - val) < 0.005:
+                written.append([row, plan[row][0], val])
+            else:
+                errors.append(f"row {row} (#{plan[row][0]}): write did not verify (reads {check[row]})")
+        if n != len(safe):
+            errors.append(f"Sheets reported {n} cells updated, expected {len(safe)}")
+        _cogs_fill_log_append({"at": datetime.now(timezone.utc).isoformat(), "written": written})
+    return {"window_rows": f"{lo + min(window)}–{last}" if window else "none",
+            "cutoff": cutoff.isoformat(), "direct_rows": len(rows),
+            "planned": [[row, inv, val] for row, (inv, val) in plan.items()],
+            "written": written, "flags": flags, "errors": errors}
+
+
+def _cogs_fill_text(rep: dict, dry_run: bool) -> str:
+    head = "[DRY RUN — nothing written] " if dry_run else ""
+    rows = rep["planned"] if dry_run else rep["written"]
+    total = sum(r[2] for r in rows)
+    lines = [f"{head}*COGS fill* · rows {rep['window_rows']} (since {rep['cutoff']}) · "
+             f"{rep['direct_rows']} Direct rows checked",
+             f"{'Would write' if dry_run else 'Wrote'} {len(rows)} cell(s), ${total:,.2f}"]
+    lines += [f"• row {r[0]} · #{r[1]} · ${r[2]:,.2f}" for r in rows]
+    if rep["flags"]:
+        lines.append("\n📝 *Flags*")
+        lines += [f"• {f}" for f in rep["flags"]]
+    if rep["errors"]:
+        lines.append("\n⚠️ *Errors*")
+        lines += [f"• {e}" for e in rep["errors"]]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def run_cogs_fill(dry_run: bool = True) -> str:
+    """
+    Fill 'Daily Sales 2026'!F (COGS) from Printavo Payment/Expenses for Direct
+    rows whose Process Date is in the last 35 days. Writes only blank or $0
+    cells; never overwrites a value or a formula; verifies every write.
+    dry_run defaults to TRUE here — pass dry_run=false to write. The 6:00 AM CT
+    daily schedule writes for real.
+    """
+    try:
+        rep = _run_cogs_fill_impl(dry_run=dry_run)
+    except Exception as e:
+        return f"COGS fill failed: {e}"
+    return _cogs_fill_text(rep, dry_run)
+
+
+_last_cogs_fill_date = None
+
+def run_cogs_fill_scheduler():
+    """Background thread: every day at COGS_FILL_HOUR_CT (6 AM) Central. DMs
+    Luke only when there are flags or errors — clean days are silent."""
+    global _last_cogs_fill_date
+    while True:
+        try:
+            now_ct = _central_now()
+            if (COGS_FILL_ENABLED
+                    and now_ct.hour == COGS_FILL_HOUR_CT and now_ct.minute < 10
+                    and _last_cogs_fill_date != now_ct.date().isoformat()):
+                _last_cogs_fill_date = now_ct.date().isoformat()
+                try:
+                    rep = _run_cogs_fill_impl(dry_run=False)
+                    text = _cogs_fill_text(rep, False)
+                    noisy = rep["flags"] or rep["errors"]
+                except Exception as e:
+                    text, noisy = f"⚠️ COGS fill failed this morning: {e}", True
+                print(f"[COGS FILL] {text[:300]}", flush=True)
+                if noisy:
+                    _post_cogs_dm(text, recipients="U0504FSDYB0")
+        except Exception as e:
+            print(f"[COGS FILL] scheduler error: {e}", flush=True)
         time.sleep(120)
 
 
@@ -4703,6 +4984,9 @@ art_digest_thread.start()
 
 cogs_alert_thread = threading.Thread(target=run_cogs_alert_scheduler, daemon=True)
 cogs_alert_thread.start()
+
+cogs_fill_thread = threading.Thread(target=run_cogs_fill_scheduler, daemon=True)
+cogs_fill_thread.start()
 
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))

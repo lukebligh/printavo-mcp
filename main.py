@@ -3417,7 +3417,7 @@ COGS_MAX_LIST       = 40
 # Contract) on Oct 1 2026 — the same lookup that sets column R on Daily Sales.
 # Matched case-insensitively on the order's company (or contact name if no
 # company). Add new contract shops here, or extend via env COGS_CONTRACT_EXTRA
-# (comma-separated). Line-item category "contract" is a second safety net.
+# (comma-separated).
 _COGS_CONTRACT_COMPANIES = (
     "Underground Printing", "Good Times Inc.", "Chapman Promotions & Design LLC",
     "Grasroots", "Jacobyco, LLC", "Brand Co", "Proforma RGP Creative", "StrategicKC",
@@ -3552,14 +3552,9 @@ def _build_cogs_alert():
         if _cogs_is_contract_customer(n):
             continue
         (check if ns in _COGS_CHECK else missing).append(n)
-    # Direct only: drop orders with any "contract" line-item category.
-    hits = missing + check
-    cats = {}
-    for i in range(0, len(hits), 20):
-        cats.update(_fetch_categories_batch([h["id"] for h in hits[i:i + 20]]))
-        time.sleep(PAGE_DELAY_S)
-    missing = [h for h in missing if not _order_is_contract(cats.get(h["id"]))]
-    check   = [h for h in check   if not _order_is_contract(cats.get(h["id"]))]
+    # Direct vs Contract comes ONLY from the customer list above, matching the
+    # Scorecard's column R. Line-item categories are not used: Direct customers
+    # are sometimes priced on a contract matrix (#7267 Big River Race Mgmt).
 
     billed = {_norm_status(s) for s in ("INVOICED", "PAID & DONE")}
     missing.sort(key=lambda n: (0 if _norm_status((n.get("status") or {}).get("name")) in billed else 1,

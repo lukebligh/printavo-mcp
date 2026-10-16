@@ -566,7 +566,7 @@ def get_recent_orders(limit: int = 10) -> str:
     """Get the most recent Printavo orders."""
     q = """
     query($first: Int, $after: String) {
-        invoices(first: $first, after: $after, sortDescending: true) {
+        invoices(first: $first, after: $after, sortOn: VISUAL_ID, sortDescending: true) {
             totalNodes
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -5240,11 +5240,16 @@ def _pd_fetch_orders() -> list:
     for field in ("invoices", "quotes"):
         q = f"""
         query($first: Int, $after: String) {{
-            {field}(first: $first, after: $after, sortDescending: true) {{ {_PD_ORDER_FRAG} }}
+            {field}(first: $first, after: $after, sortOn: VISUAL_ID, sortDescending: true) {{ {_PD_ORDER_FRAG} }}
         }}"""
+        # sortDescending alone returns OLDEST first (Feb 2020); it needs
+        # sortOn: VISUAL_ID to mean newest-first. Guard it anyway.
         r = paginate(q, connection_path=(field,), max_records=PD_SYNC_SCAN)
         if "error" in r:
             raise RuntimeError(f"Printavo {field} scan: {str(r['error'])[:200]}")
+        vids = [int(n.get("visualId") or 0) for n in r["nodes"][:25]]
+        if vids and vids != sorted(vids, reverse=True):
+            raise RuntimeError(f"Printavo {field} scan: sort ignored (not newest-first) — refusing to sync")
         for n in r["nodes"]:
             oid = str(n.get("id"))
             created = _parse_iso((n.get("timestamps") or {}).get("createdAt"))

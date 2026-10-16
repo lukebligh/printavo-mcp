@@ -5039,6 +5039,549 @@ cogs_alert_thread.start()
 cogs_fill_thread = threading.Thread(target=run_cogs_fill_scheduler, daemon=True)
 cogs_fill_thread.start()
 
+
+# ── PRINTAVO → PIPEDRIVE DEAL SYNC (replaces Zap 1 "Quote Sent" + Zap 2 "Won") ─
+# Every PD_SYNC_EVERY_MIN minutes, read the newest Printavo orders and make
+# Pipedrive match WHERE EACH ORDER IS NOW — not what it passed through. A status
+# change between two runs can no longer be missed, because the next run still
+# sees the order's current status. (This is why the Zaps failed: they caught
+# status *events* on a poll, and orders moved on before the poll landed.)
+#
+#   Status = QUOTE APPROVAL SENT            → deal to "Quote Sent" (stage 8)
+#   Status at/after QUOTE APPROVED (by the
+#   status position in Printavo), minus the
+#   exclusions below                        → deal WON at the real order total
+#   Anything earlier (Quote, Mock-up…)      → nothing
+#
+# FINDING THE DEAL — no human pastes a quote number:
+#   1. Open deal already carrying this Printavo Quote #            → that deal
+#   2. Pipedrive person by Printavo Customer ID (contact or customer
+#      id) or email → that person's / org's ONE open deal with no
+#      quote # yet                                                  → that deal
+#      (two or more candidates = ambiguous → exception, never guess)
+#   3. Won-class order and the org already has a hand-marked WON deal
+#      within ±30 days at ±10% of the total                         → link it
+#   4. No deal and the account is not Contract                      → create it
+#      (creates the org/person too if Pipedrive has never seen them)
+#   Contract accounts (Customers 2026 tab, or org Channel = Contract) → skipped
+#
+# The sync writes the Printavo Quote # onto every deal it touches, so the next
+# run matches by step 1. Exceptions (ambiguous / lost-deal reorders / API
+# errors) are collected and DM'd to the deal owner (Clint) ONCE a day at PD_SYNC_DM_HOUR_CT —
+# only if there are any. Clean days are silent.
+#
+# HARD GATE: the scheduler does nothing unless PD_SYNC_ENABLED=true. Deploy,
+# run run_pipedrive_sync(dry_run=True), read the report, then flip the flag.
+PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN", "")
+PD_API_V2           = os.environ.get("PIPEDRIVE_API_V2", "https://api.pipedrive.com/api/v2")
+PD_SYNC_ENABLED     = os.environ.get("PD_SYNC_ENABLED", "").strip().lower() in ("1", "true", "yes")
+PD_SYNC_EVERY_MIN   = int(os.environ.get("PD_SYNC_EVERY_MIN", "15"))
+PD_SYNC_SINCE       = os.environ.get("PD_SYNC_SINCE", "2026-10-01")   # ignore orders created before
+PD_SYNC_SCAN        = int(os.environ.get("PD_SYNC_SCAN", "100"))      # newest N per connection
+PD_SYNC_DM_USER_IDS = os.environ.get("PD_SYNC_DM_USER_IDS", "U07VDHDSMUJ")  # Clint (deal owner)
+PD_SYNC_DM_HOUR_CT  = int(os.environ.get("PD_SYNC_DM_HOUR_CT", "16"))  # 4 PM
+PD_SYNC_OWNER_ID    = os.environ.get("PD_SYNC_OWNER_ID", "26695756")  # owner for CREATED deals: Clint Barnes (Pipedrive user id)
+PD_PIPELINE_ID      = int(os.environ.get("PD_PIPELINE_ID", "2"))       # Est Merch Sales
+PD_STAGE_QUOTE_SENT = int(os.environ.get("PD_STAGE_QUOTE_SENT", "8"))
+PD_STAGE_QUALIFIED  = int(os.environ.get("PD_STAGE_QUALIFIED", "6"))
+PD_FIELD_QUOTE_NO   = "34b696822006612c7c5d18ba2fc67ac27fdfa7ee"   # Deal: Printavo Quote #
+PD_FIELD_CUST_ID    = "4a5b745f427b6c5fa26f18f1f8fd4ae5ebc5c48b"   # Person: Printavo Customer ID
+PD_FIELD_CHANNEL    = "a44a4c56f456df91f3163e2596d164a4c0874f25"   # Org: Channel
+PD_CHANNEL_DIRECT, PD_CHANNEL_CONTRACT = 39, 40
+PD_WON_LINK_DAYS    = 30
+PD_WON_LINK_PCT     = 0.10
+
+STATUS_NAMES.setdefault("QUOTE_APPROVAL_SENT", "QUOTE APPROVAL SENT")
+STATUS_NAMES.setdefault("QUOTE_APPROVED", "QUOTE APPROVED")
+# Statuses that never move a deal, wherever they sit in Printavo's order.
+# Comma-separated override via PD_SYNC_EXCLUDE; anything starting "GXS -" is
+# always excluded (art-vendor queue, not a sales state).
+_PD_EXCLUDE = {_norm_status(s) for s in os.environ.get(
+    "PD_SYNC_EXCLUDE", "ORDER ON HOLD - ISSUE,BD").split(",") if s.strip()}
+
+
+def _pd_state_path() -> str:
+    p = os.environ.get("PD_SYNC_STATE_PATH", "")
+    if p:
+        return p
+    if os.path.isdir("/data"):
+        return "/data/pd_sync_state.json"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "pd_sync_state.json")
+
+
+def _pd_load_state() -> dict:
+    try:
+        with open(_pd_state_path()) as f:
+            s = json.load(f)
+            s.setdefault("orders", {})
+            s.setdefault("exceptions", {})
+            return s
+    except Exception:
+        return {"orders": {}, "exceptions": {}, "last_dm": ""}
+
+
+def _pd_save_state(s: dict):
+    path = _pd_state_path()
+    try:
+        with open(path + ".tmp", "w") as f:
+            json.dump(s, f)
+        os.replace(path + ".tmp", path)
+    except Exception as e:
+        print(f"[PD SYNC] state save failed: {e}", flush=True)
+
+
+# ── Pipedrive REST (v2) ───────────────────────────────────────────────────────
+def _pd(method: str, path: str, params: dict = None, body: dict = None):
+    """One Pipedrive v2 call. Returns (data, error). Retries 429/5xx twice."""
+    if not PIPEDRIVE_API_TOKEN:
+        return None, "PIPEDRIVE_API_TOKEN not set"
+    q = dict(params or {})
+    q["api_token"] = PIPEDRIVE_API_TOKEN
+    last = ""
+    for attempt in range(3):
+        try:
+            r = httpx.request(method, f"{PD_API_V2}{path}", params=q, json=body, timeout=30)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {r.status_code}"
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            j = r.json() if r.content else {}
+            if r.status_code >= 400 or not j.get("success", True):
+                return None, f"HTTP {r.status_code}: {str(j.get('error') or j)[:200]}"
+            return j.get("data"), None
+        except Exception as e:
+            last = str(e)
+            time.sleep(1.5 * (2 ** attempt))
+    return None, last
+
+
+def _pd_search(entity: str, term: str, fields: str, exact: bool = True) -> list:
+    if not term or len(str(term)) < 2:
+        return []
+    data, err = _pd("GET", f"/{entity}/search",
+                    {"term": str(term), "fields": fields, "exact_match": str(exact).lower(), "limit": 20})
+    if err:
+        raise RuntimeError(f"{entity} search '{term}': {err}")
+    return [i.get("item") or {} for i in ((data or {}).get("items") or [])]
+
+
+def _pd_get(entity: str, eid) -> dict:
+    data, err = _pd("GET", f"/{entity}/{eid}")
+    if err:
+        raise RuntimeError(f"get {entity} {eid}: {err}")
+    return data or {}
+
+
+def _pd_list_deals(**filters) -> list:
+    data, err = _pd("GET", "/deals", dict(filters, limit=100))
+    if err:
+        raise RuntimeError(f"list deals {filters}: {err}")
+    return data or []
+
+
+def _pd_quote_no(deal: dict) -> str:
+    return str(((deal.get("custom_fields") or {}).get(PD_FIELD_QUOTE_NO)) or "").strip()
+
+
+# ── Classification ────────────────────────────────────────────────────────────
+_pd_status_pos_cache = {"at": 0.0, "pos": None}
+
+
+def _pd_status_positions() -> dict:
+    c = _pd_status_pos_cache
+    if c["pos"] is not None and time.time() - c["at"] < 3600:
+        return c["pos"]
+    q = """
+    query($first: Int, $after: String) {
+        statuses(first: $first, after: $after) {
+            nodes { name position }
+            pageInfo { hasNextPage endCursor }
+        }
+    }"""
+    r = paginate(q, connection_path=("statuses",))
+    if "error" in r:
+        raise RuntimeError(f"status positions: {r['error']}")
+    pos = {_norm_status(n["name"]): n.get("position") for n in r["nodes"]}
+    c.update(at=time.time(), pos=pos)
+    return pos
+
+
+def _pd_classify(status_name: str) -> str:
+    """'sent' | 'won' | '' (no action)."""
+    n = _norm_status(status_name)
+    if n == _norm_status(STATUS_NAMES["QUOTE_APPROVAL_SENT"]):
+        return "sent"
+    if n in _PD_EXCLUDE or n.startswith("gxs -"):
+        return ""
+    pos = _pd_status_positions()
+    approved = pos.get(_norm_status(STATUS_NAMES["QUOTE_APPROVED"]))
+    mine = pos.get(n)
+    if approved is None or mine is None:
+        return ""
+    return "won" if mine >= approved else ""
+
+
+# ── Printavo scan ─────────────────────────────────────────────────────────────
+_PD_ORDER_FRAG = """
+    pageInfo { hasNextPage endCursor }
+    nodes {
+        id visualId nickname total
+        status { name }
+        timestamps { createdAt }
+        contact { id fullName email customer { id companyName } }
+        approvalRequests(first: 5) { nodes { name response { respondedAt } } }
+    }
+"""
+
+
+def _pd_fetch_orders() -> list:
+    since = datetime.fromisoformat(PD_SYNC_SINCE).replace(tzinfo=timezone.utc)
+    out, seen = [], set()
+    for field in ("invoices", "quotes"):
+        q = f"""
+        query($first: Int, $after: String) {{
+            {field}(first: $first, after: $after, sortDescending: true) {{ {_PD_ORDER_FRAG} }}
+        }}"""
+        r = paginate(q, connection_path=(field,), max_records=PD_SYNC_SCAN)
+        if "error" in r:
+            raise RuntimeError(f"Printavo {field} scan: {str(r['error'])[:200]}")
+        for n in r["nodes"]:
+            oid = str(n.get("id"))
+            created = _parse_iso((n.get("timestamps") or {}).get("createdAt"))
+            if oid in seen or (created and created < since):
+                continue
+            seen.add(oid)
+            c = n.get("contact") or {}
+            cust = c.get("customer") or {}
+            responded = None
+            for ar in ((n.get("approvalRequests") or {}).get("nodes") or []):
+                t = _parse_iso((ar.get("response") or {}).get("respondedAt"))
+                if t and "quote" in (ar.get("name") or "quote").lower():
+                    responded = max(responded, t) if responded else t
+            out.append({
+                "id": oid, "visualId": str(n.get("visualId")), "kind": field,
+                "nickname": n.get("nickname") or "", "total": float(n.get("total") or 0),
+                "status": (n.get("status") or {}).get("name", ""),
+                "created": created, "approved_at": responded,
+                "contact_id": str(c.get("id") or ""), "customer_id": str(cust.get("id") or ""),
+                "email": (c.get("email") or "").strip(), "name": c.get("fullName") or "",
+                "company": cust.get("companyName") or c.get("fullName") or "",
+                "_raw": n,
+            })
+    return out
+
+
+# ── Matching ──────────────────────────────────────────────────────────────────
+def _pd_find_person(o: dict):
+    for cid in (o["contact_id"], o["customer_id"]):
+        if cid:
+            for item in _pd_search("persons", cid, "custom_fields"):
+                p = _pd_get("persons", item["id"])
+                if str((p.get("custom_fields") or {}).get(PD_FIELD_CUST_ID) or "").strip() == cid:
+                    return p
+    if o["email"]:
+        for item in _pd_search("persons", o["email"], "email"):
+            return _pd_get("persons", item["id"])
+    return None
+
+
+def _pd_org_channel(org_id) -> int:
+    if not org_id:
+        return 0
+    org = _pd_get("organizations", org_id)
+    v = (org.get("custom_fields") or {}).get(PD_FIELD_CHANNEL)
+    if isinstance(v, dict):
+        v = v.get("id")
+    try:
+        return int(v or 0)
+    except Exception:
+        return 0
+
+
+def _pd_org_id(p: dict):
+    o = p.get("org_id") or p.get("organization") or {}
+    return o.get("id") if isinstance(o, dict) else o
+
+
+def _pd_resolve(o: dict, cls: str, state: dict) -> dict:
+    """Decide what to do. Returns {"action", "deal"?, "person"?, "org_id"?, "why"}."""
+    prior = (state["orders"].get(o["id"]) or {}).get("deal")
+    if prior:
+        try:
+            d = _pd_get("deals", prior)
+            if d and not d.get("is_deleted"):
+                return {"action": "update", "deal": d, "why": "known deal"}
+        except Exception:
+            pass
+
+    # Search items carry only the matched values, not the field map — read
+    # each hit in full and compare the real field.
+    hits = [d for d in (_pd_get("deals", i["id"]) for i in
+                        _pd_search("deals", o["visualId"], "custom_fields"))
+            if _pd_quote_no(d) == o["visualId"] and not d.get("is_deleted")]
+    if len(hits) == 1:
+        return {"action": "update", "deal": hits[0], "why": "quote # match"}
+    if len(hits) > 1:
+        return {"action": "exception", "why": f"{len(hits)} deals carry quote #{o['visualId']}"}
+
+    if _cogs_is_contract_customer(o["_raw"]):
+        return {"action": "skip", "why": "contract (Customers 2026)"}
+
+    person = _pd_find_person(o)
+    org_id = _pd_org_id(person) if person else None
+    if org_id and _pd_org_channel(org_id) == PD_CHANNEL_CONTRACT:
+        return {"action": "skip", "why": "contract (org Channel)"}
+
+    if person or org_id:
+        pools = []
+        if person:
+            pools.append(_pd_list_deals(person_id=person["id"], status="open"))
+        if org_id:
+            pools.append(_pd_list_deals(org_id=org_id, status="open"))
+        cands = {}
+        for pool in pools:
+            for d in pool:
+                if d.get("pipeline_id") == PD_PIPELINE_ID and not _pd_quote_no(d):
+                    cands[d["id"]] = d
+        if len(cands) == 1:
+            return {"action": "update", "deal": next(iter(cands.values())), "person": person,
+                    "org_id": org_id, "why": "only open deal on the account"}
+        if len(cands) > 1:
+            names = "; ".join(f"#{d['id']} {d.get('title','')[:40]}" for d in list(cands.values())[:4])
+            return {"action": "exception",
+                    "why": f"{len(cands)} open deals on the account ({names}) — type "
+                           f"{o['visualId']} into the Printavo Quote # field on the right "
+                           f"Pipedrive deal; the next run finishes it"}
+        if cls == "won" and org_id:
+            ref = o["approved_at"] or o["created"] or datetime.now(timezone.utc)
+            for d in _pd_list_deals(org_id=org_id, status="won"):
+                wt = _parse_iso(d.get("won_time"))
+                val = float(d.get("value") or 0)
+                if (wt and abs((wt - ref).days) <= PD_WON_LINK_DAYS and not _pd_quote_no(d)
+                        and o["total"] and abs(val - o["total"]) <= PD_WON_LINK_PCT * o["total"]):
+                    return {"action": "link", "deal": d, "why": "matches a hand-marked won deal"}
+            for d in _pd_list_deals(org_id=org_id, status="lost")[:50]:
+                lt = _parse_iso(d.get("lost_time"))
+                if lt and (datetime.now(timezone.utc) - lt).days <= 14 and not _pd_quote_no(d):
+                    return {"action": "exception",
+                            "why": f"order approved but the account's recent deal #{d['id']} is LOST — reopen or confirm"}
+    return {"action": "create", "person": person, "org_id": org_id, "why": "no deal yet"}
+
+
+# ── Writes ────────────────────────────────────────────────────────────────────
+def _pd_patch_deal(deal_id, body: dict):
+    """won_time is only writable once a deal is already Won, so it goes in a
+    second call — and a refusal there never undoes the win itself."""
+    body = dict(body)
+    won_time = body.pop("won_time", None)
+    data, err = _pd("PATCH", f"/deals/{deal_id}", body=body)
+    if err:
+        raise RuntimeError(f"update deal {deal_id}: {err}")
+    if won_time:
+        _, err2 = _pd("PATCH", f"/deals/{deal_id}", body={"won_time": won_time})
+        if err2:
+            print(f"[PD SYNC] deal {deal_id} won, but won_time not set: {err2}", flush=True)
+    return data
+
+
+def _pd_ensure_party(o: dict, person, org_id):
+    if not org_id:
+        name = o["company"] or o["name"] or f"Printavo customer {o['contact_id']}"
+        found = [x for x in _pd_search("organizations", name, "name")
+                 if _cogs_norm_co(x.get("name")) == _cogs_norm_co(name)]
+        if found:
+            org_id = found[0]["id"]
+            if _pd_org_channel(org_id) == PD_CHANNEL_CONTRACT:
+                return None, None, "contract (org Channel)"
+        else:
+            data, err = _pd("POST", "/organizations", body={
+                "name": name, "custom_fields": {PD_FIELD_CHANNEL: PD_CHANNEL_DIRECT}})
+            if err:
+                raise RuntimeError(f"create org '{name}': {err}")
+            org_id = data["id"]
+    if not person and (o["name"] or o["email"]):
+        body = {"name": o["name"] or o["email"], "org_id": org_id,
+                "custom_fields": {PD_FIELD_CUST_ID: o["contact_id"]}}
+        if o["email"]:
+            body["emails"] = [{"value": o["email"], "primary": True, "label": "work"}]
+        data, err = _pd("POST", "/persons", body=body)
+        if err:
+            raise RuntimeError(f"create person '{o['name']}': {err}")
+        person = data
+    return person, org_id, None
+
+
+def _pd_won_time(o: dict) -> str:
+    t = o["approved_at"] or datetime.now(timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _pd_apply(o: dict, cls: str, plan: dict, dry_run: bool) -> str:
+    """Execute a plan. Returns a one-line description of what was (or would be) done."""
+    qn = {PD_FIELD_QUOTE_NO: o["visualId"]}
+    tag = f"#{o['visualId']} {o['company'][:30]} ${o['total']:,.2f}"
+    if plan["action"] in ("update", "link"):
+        d = plan["deal"]
+        st = d.get("status")
+        if st == "won" or (plan["action"] == "link"):
+            # Already won (often by hand): stamp the quote # and the real total.
+            body = {}
+            if _pd_quote_no(d) != o["visualId"]:
+                body["custom_fields"] = qn
+            if o["total"] and abs(float(d.get("value") or 0) - o["total"]) > 0.005:
+                body["value"] = o["total"]
+            msg = f"{tag} → deal {d['id']} already won (quote # / total written)" if body else ""
+        elif st == "lost":
+            return f"!! {tag} → deal {d['id']} is LOST; not touched"
+        elif cls == "won":
+            body = {"status": "won", "value": o["total"], "custom_fields": qn,
+                    "won_time": _pd_won_time(o)}
+            msg = f"{tag} → deal {d['id']} WON"
+        else:  # sent
+            if d.get("stage_id") == PD_STAGE_QUOTE_SENT and _pd_quote_no(d) == o["visualId"]:
+                return ""
+            body = {"stage_id": PD_STAGE_QUOTE_SENT, "value": o["total"], "custom_fields": qn}
+            msg = f"{tag} → deal {d['id']} to Quote Sent"
+        if body and not dry_run:
+            _pd_patch_deal(d["id"], body)
+        o["_deal"] = d["id"]
+        return msg
+    if plan["action"] == "create":
+        person, org_id = plan.get("person"), plan.get("org_id")
+        if dry_run:
+            who = "existing org" if org_id else "NEW org + person"
+            o["_deal"] = None
+            return f"{tag} → CREATE deal ({'won' if cls == 'won' else 'Quote Sent'}, {who})"
+        person, org_id, skip = _pd_ensure_party(o, person, org_id)
+        if skip:
+            return ""
+        body = {"title": f"{o['company'] or o['name']} — {o['nickname'] or 'Order'} (#{o['visualId']})"[:250],
+                "value": o["total"], "currency": "USD", "pipeline_id": PD_PIPELINE_ID,
+                "stage_id": PD_STAGE_QUOTE_SENT, "org_id": org_id,
+                "custom_fields": qn}
+        if person:
+            body["person_id"] = person["id"]
+        if PD_SYNC_OWNER_ID:
+            body["owner_id"] = int(PD_SYNC_OWNER_ID)
+        data, err = _pd("POST", "/deals", body=body)
+        if err:
+            raise RuntimeError(f"create deal {tag}: {err}")
+        o["_deal"] = data["id"]
+        if cls == "won":
+            _pd_patch_deal(data["id"], {"status": "won", "won_time": _pd_won_time(o)})
+        return f"{tag} → created deal {data['id']} ({'WON' if cls == 'won' else 'Quote Sent'})"
+    return ""
+
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+def _run_pipedrive_sync_impl(dry_run: bool = True) -> dict:
+    rep = {"scanned": 0, "acted": [], "skipped": 0, "exceptions": [], "errors": []}
+    state = _pd_load_state()
+    try:
+        orders = _pd_fetch_orders()
+    except Exception as e:
+        rep["errors"].append(str(e))
+        return rep
+    rep["scanned"] = len(orders)
+    for o in orders:
+        try:
+            cls = _pd_classify(o["status"])
+        except Exception as e:
+            rep["errors"].append(str(e))
+            break
+        prev = state["orders"].get(o["id"]) or {}
+        if not cls or prev.get("done") == "won" or (cls == "sent" and prev.get("done") == "sent"):
+            continue
+        try:
+            plan = _pd_resolve(o, cls, state)
+            if plan["action"] == "skip":
+                rep["skipped"] += 1
+                if not dry_run:
+                    state["orders"][o["id"]] = {"done": "won", "skip": plan["why"]}
+                continue
+            if plan["action"] == "exception":
+                line = f"#{o['visualId']} {o['company'][:30]} ({o['status']}): {plan['why']}"
+                rep["exceptions"].append(line)
+                if not dry_run:
+                    state["exceptions"][o["id"]] = line
+                continue
+            msg = _pd_apply(o, cls, plan, dry_run)
+            if msg:
+                rep["acted"].append(msg)
+            if not dry_run:
+                state["exceptions"].pop(o["id"], None)
+                state["orders"][o["id"]] = {"done": cls, "deal": o.get("_deal"),
+                                            "at": datetime.now(timezone.utc).isoformat()}
+        except Exception as e:
+            rep["errors"].append(f"#{o['visualId']}: {str(e)[:200]}")
+        time.sleep(0.25)
+    if not dry_run:
+        live = {o["id"] for o in orders}
+        state["exceptions"] = {k: v for k, v in state["exceptions"].items() if k in live}
+        _pd_save_state(state)
+    rep["open_exceptions"] = list(state["exceptions"].values())
+    return rep
+
+
+def _pd_sync_text(rep: dict, dry_run: bool) -> str:
+    head = "[DRY RUN — nothing written] " if dry_run else ""
+    lines = [f"{head}Printavo → Pipedrive sync: {rep['scanned']} orders read, "
+             f"{len(rep['acted'])} deal changes, {rep['skipped']} contract skipped, "
+             f"{len(rep['exceptions'])} need a human, {len(rep['errors'])} errors."]
+    for k, title in (("acted", "Changes"), ("exceptions", "Needs a human"), ("errors", "Errors")):
+        if rep[k]:
+            lines.append(f"\n{title}:")
+            lines += [f"  • {x}" for x in rep[k][:60]]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def run_pipedrive_sync(dry_run: bool = True) -> str:
+    """
+    Sync Printavo order status into Pipedrive deals right now: QUOTE APPROVAL
+    SENT → Quote Sent stage; any status at/after QUOTE APPROVED → deal Won at
+    the order total. Finds the deal by quote #, then by the customer's one open
+    deal, then creates it (non-contract accounts only). dry_run=True (default)
+    reports what it WOULD do and writes nothing.
+    """
+    rep = _run_pipedrive_sync_impl(dry_run=dry_run)
+    return _pd_sync_text(rep, dry_run)
+
+
+_last_pd_sync_slot = None
+
+
+def run_pipedrive_sync_scheduler():
+    global _last_pd_sync_slot
+    while True:
+        try:
+            if PD_SYNC_ENABLED and PIPEDRIVE_API_TOKEN:
+                now_ct = _central_now()
+                slot = f"{now_ct:%Y-%m-%d %H}-{now_ct.minute // max(PD_SYNC_EVERY_MIN, 1)}"
+                if slot != _last_pd_sync_slot:
+                    _last_pd_sync_slot = slot
+                    rep = _run_pipedrive_sync_impl(dry_run=False)
+                    if rep["acted"] or rep["errors"]:
+                        print(f"[PD SYNC] {_pd_sync_text(rep, False)[:600]}", flush=True)
+                    # One quiet DM a day, only when something needs a human.
+                    state = _pd_load_state()
+                    today = now_ct.date().isoformat()
+                    if (now_ct.hour == PD_SYNC_DM_HOUR_CT and state.get("last_dm") != today):
+                        state["last_dm"] = today
+                        _pd_save_state(state)
+                        need = list(state["exceptions"].values()) + rep["errors"]
+                        if need:
+                            _post_cogs_dm("*Pipedrive sync — needs a human*\n" +
+                                          "\n".join(f"• {x}" for x in need[:30]),
+                                          recipients=PD_SYNC_DM_USER_IDS)
+        except Exception as e:
+            print(f"[PD SYNC] scheduler error: {e}", flush=True)
+        time.sleep(60)
+
+
+pd_sync_thread = threading.Thread(target=run_pipedrive_sync_scheduler, daemon=True)
+pd_sync_thread.start()
+
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=_port)

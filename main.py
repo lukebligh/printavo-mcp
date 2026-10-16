@@ -5349,7 +5349,16 @@ def _pd_resolve(o: dict, cls: str, state: dict) -> dict:
                 if d.get("pipeline_id") == PD_PIPELINE_ID and not _pd_quote_no(d):
                     cands[d["id"]] = d
         if len(cands) == 1:
-            return {"action": "update", "deal": next(iter(cands.values())), "person": person,
+            d = next(iter(cands.values()))
+            dv = float(d.get("value") or 0)
+            # Sanity band: a $165 add-on must not close a $934 reactivation
+            # deal. Outside 0.5x-2x of the deal's value, ask a human.
+            if dv > 0 and o["total"] and not (0.5 <= o["total"] / dv <= 2.0):
+                return {"action": "exception",
+                        "why": f"order ${o['total']:,.2f} vs the account's only open deal "
+                               f"#{d['id']} '{d.get('title','')[:40]}' at ${dv:,.2f} — if it is "
+                               f"that job, type {o['visualId']} into its Printavo Quote # field"}
+            return {"action": "update", "deal": d, "person": person,
                     "org_id": org_id, "why": "only open deal on the account"}
         if len(cands) > 1:
             names = "; ".join(f"#{d['id']} {d.get('title','')[:40]}" for d in list(cands.values())[:4])
@@ -5497,6 +5506,8 @@ def _run_pipedrive_sync_impl(dry_run: bool = True) -> dict:
         prev = state["orders"].get(o["id"]) or {}
         if not cls or prev.get("done") == "won" or (cls == "sent" and prev.get("done") == "sent"):
             continue
+        if o["total"] <= 0:
+            continue   # $0 store/placeholder orders are not sales
         try:
             plan = _pd_resolve(o, cls, state)
             if plan["action"] == "skip":

@@ -4672,6 +4672,55 @@ def _shop_day_start(d) -> datetime:
     return datetime(d.year, d.month, d.day, PROD_DAY_START_H, 0, 0, tzinfo=SHOP_TZ)
 
 
+def _shop_day_end(d) -> datetime:
+    """4 PM shop-local on date `d`."""
+    return datetime(d.year, d.month, d.day, PROD_DAY_END_H, 0, 0, tzinfo=SHOP_TZ)
+
+
+def _next_workday(d):
+    """The next Mon–Fri date after `d`."""
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5:
+        d = d + timedelta(days=1)
+    return d
+
+
+def _work_span(start_dt: datetime, minutes: int) -> tuple:
+    """Where a block ENDS on the calendar, and how its minutes land per day.
+
+    A job that fits in one production day (<= 8h) is a straight block:
+    start + minutes, all of it on the start day — unchanged from before,
+    including small jobs a human dragged late in the day.
+
+    A job longer than one production day runs as ONE continuous block across
+    days, the way the shop actually works it: it burns the rest of the start
+    day up to 4 PM, then 8 AM–4 PM on each following WEEKDAY until its hours
+    are used up. The block visually covers the nights between (16h starting
+    Tue 8 AM ends Wed 4 PM), but capacity is only counted in shop hours.
+
+    Returns (end_dt, [(date, minutes), ...]).
+    """
+    minutes = max(1, int(minutes))
+    if minutes <= PROD_MAX_BLOCK_MIN:
+        return start_dt + timedelta(minutes=minutes), [(start_dt.date(), minutes)]
+    chunks, left = [], minutes
+    day = start_dt.date()
+    first_avail = int(max(0, (_shop_day_end(day) - start_dt).total_seconds() // 60))
+    cursor_end = start_dt
+    if first_avail:
+        take = min(left, first_avail)
+        chunks.append((day, take))
+        left -= take
+        cursor_end = start_dt + timedelta(minutes=take)
+    while left > 0:
+        day = _next_workday(day)
+        take = min(left, PROD_MAX_BLOCK_MIN)
+        chunks.append((day, take))
+        left -= take
+        cursor_end = _shop_day_start(day) + timedelta(minutes=take)
+    return cursor_end, chunks
+
+
 def _parse_dt(s: str):
     if not s:
         return None
@@ -4699,6 +4748,9 @@ BLOCK_WRITE_RETRIES = int(os.environ.get("BLOCK_WRITE_RETRIES", "3"))
 def _write_block(internal_id: str, start_dt: datetime, minutes: int) -> dict:
     """Write startAt/dueAt on an invoice, then VERIFY the echo.
 
+    `minutes` is shop time. Jobs over one production day become one continuous
+    multi-day block — see _work_span.
+
     Touches NOTHING else — customerDueAt and invoiceAt are deliberately absent
     from the mutation.
 
@@ -4708,7 +4760,7 @@ def _write_block(internal_id: str, start_dt: datetime, minutes: int) -> dict:
     startAt/dueAt against what we asked for and retry with backoff, so the tool
     can never report a write it did not actually make.
     """
-    end_dt = start_dt + timedelta(minutes=max(1, minutes))
+    end_dt, _ = _work_span(start_dt, minutes)
     mutation = """
     mutation($id: ID!, $startAt: ISO8601DateTime, $dueAt: ISO8601DateTime) {
         invoiceUpdate(id: $id, input: { startAt: $startAt, dueAt: $dueAt }) {
@@ -4786,8 +4838,6 @@ def set_production_block(visual_id: str, start_datetime: str = "",
     else:
         bd = {"manual": minutes}
 
-    capped = min(minutes, PROD_MAX_BLOCK_MIN)
-
     if start_datetime:
         start_dt = _parse_dt(start_datetime)
         if not start_dt:
@@ -4798,15 +4848,15 @@ def set_production_block(visual_id: str, start_datetime: str = "",
             return f"#{visual_id} has no production date set — nothing to anchor the block to."
         start_dt = _shop_day_start(existing.date())
 
-    out = _write_block(internal_id, start_dt, capped)
+    out = _write_block(internal_id, start_dt, minutes)
     if "error" in out:
         return f"API Error: {out['error']}"
     node = (out.get("invoiceUpdate") or {})
     note = ""
-    if capped < minutes:
-        note = (f"\n  ⚠️ True estimate {_format_est_time(minutes)} exceeds the "
-                f"{PROD_MAX_BLOCK_MIN // 60}h production day — block capped. "
-                f"This job needs more than one day.")
+    _, chunks = _work_span(start_dt, minutes)
+    if len(chunks) > 1:
+        note = ("\n  Multi-day block — shop time by day: " + ", ".join(
+            f"{d:%a %m/%d} {_format_est_time(m)}" for d, m in chunks))
     return (f"#{visual_id} | {inv.get('nickname','')}\n"
             f"  Status:   {status}\n"
             f"  Estimate: {_format_est_time(minutes)} ({minutes} min) {dict(bd)}\n"
@@ -4845,6 +4895,16 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
     skipped = len(nodes) - len(schedulable)
 
     groups_raw = _fetch_groups_batch([n["id"] for n in schedulable if n.get("id")])
+    # Printavo occasionally returns a null order inside an otherwise good
+    # batch (HTTP 200, no error) — the 10/18 9 AM run lost 2 orders this way
+    # and the 11 AM run read them fine. One slow second pass before we call
+    # anything a failure.
+    _missing = [n["id"] for n in schedulable
+                if n.get("id") and groups_raw.get(n["id"]) is None]
+    if _missing:
+        time.sleep(3)
+        _retry = _fetch_groups_batch(_missing)
+        groups_raw.update({k: v for k, v in _retry.items() if v is not None})
 
     changed, held, problems, overflow, placeholders = [], [], [], [], []
     day_load = defaultdict(lambda: defaultdict(int))
@@ -4877,11 +4937,6 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
             minutes, bd = estimate_minutes_groups(order_groups, status)
         if not minutes:
             continue
-        capped = min(minutes, PROD_MAX_BLOCK_MIN)
-        if capped < minutes:
-            overflow.append(f"  #{vid} — {nick} — needs {_format_est_time(minutes)}, "
-                            f"capped at {PROD_MAX_BLOCK_MIN // 60}h")
-
         human_placed = not _is_auto_placed(existing)
         if force_place or not human_placed:
             start_dt = _shop_day_start(existing.date())
@@ -4890,29 +4945,44 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
             start_dt = existing
             action   = "resize"
 
-        for deco, m in bd.items():
-            if isinstance(m, int):
-                day_load[start_dt.strftime("%a %m/%d")][deco] += m
+        end_dt, chunks = _work_span(start_dt, minutes)
+        # Capacity lands on the days the work is actually done — a 17h job
+        # is ~8h + ~8h + ~1h, not 17h on day one.
+        for d, cm in chunks:
+            frac = cm / minutes
+            for deco, m in bd.items():
+                if isinstance(m, int):
+                    day_load[d.strftime("%a %m/%d")][deco] += int(round(m * frac))
+        if len(chunks) > 1:
+            overflow.append(f"  #{vid} — {nick} — {_format_est_time(minutes)} → "
+                            + ", ".join(f"{d:%a %m/%d} {_format_est_time(cm)}"
+                                        for d, cm in chunks))
 
+        end_fmt = ("%a %m/%d %I:%M%p" if end_dt.date() != start_dt.date()
+                   else "%I:%M%p")
         line = (f"  #{vid} — {nick} — {_format_est_time(minutes)} — "
                 f"{start_dt:%a %m/%d %I:%M%p} → "
-                f"{(start_dt + timedelta(minutes=capped)):%I:%M%p}  [{action}]")
+                f"{end_dt:{end_fmt}}  [{action}]")
 
         if dry_run:
             changed.append(line)
             continue
 
         time.sleep(BLOCK_WRITE_DELAY_S)
-        out = _write_block(iid, start_dt, capped)
+        out = _write_block(iid, start_dt, minutes)
         if "error" in out:
             problems.append(f"  #{vid} — write failed: {out['error']}")
         else:
             changed.append(line)
 
     hdr = "DRY RUN — nothing written" if dry_run else "WRITTEN TO PRINTAVO"
-    fetch_fail = sum(1 for _p in problems if "could not fetch imprints" in _p)
-    fail_txt = (f"  \u26a0\ufe0f  {fetch_fail} ORDERS HAVE NO TIME ESTIMATE — "
-                f"the capacity numbers below are UNDERSTATED"
+    _ff = [_p.strip().split(" — ")[0] for _p in problems
+           if "could not fetch imprints" in _p]
+    fetch_fail = len(_ff)
+    fail_txt = (f"  \u26a0\ufe0f  PRINTAVO DID NOT RETURN {fetch_fail} ORDER(S) "
+                f"({', '.join(_ff)}) — no block written for them this run; "
+                f"capacity numbers below are UNDERSTATED. Usually clears on the "
+                f"next run — alert again means look."
                 if fetch_fail else "  0 fetch failures — capacity numbers are complete")
     lines = [
         f"PRODUCTION BLOCK SWEEP — {hdr}",
@@ -4927,7 +4997,7 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
     lines += changed or ["  none"]
 
     if overflow:
-        lines += ["", f"⚠️ LONGER THAN ONE PRODUCTION DAY ({len(overflow)}):"] + overflow
+        lines += ["", f"MULTI-DAY JOBS — one block, shop time by day ({len(overflow)}):"] + overflow
 
     if placeholders:
         lines += ["", f"⚠️ NO IMPRINT DETAIL — placeholder blocks ({len(placeholders)}):"] + placeholders
@@ -5009,7 +5079,7 @@ def run_block_sweep_scheduler():
                         print(f"[BLOCK SWEEP] {fail_line}", flush=True)
                     # A calendar that is quietly incomplete is worse than no
                     # calendar — say so out loud, in the channel.
-                    if "NO TIME ESTIMATE" in fail_line and SLACK_WEBHOOK_URL:
+                    if "DID NOT RETURN" in fail_line and SLACK_WEBHOOK_URL:
                         try:
                             httpx.post(SLACK_WEBHOOK_URL, timeout=15, json={
                                 "text": ":rotating_light: *Production calendar is "

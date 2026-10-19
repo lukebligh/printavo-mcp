@@ -4136,6 +4136,14 @@ def _post_production(text: str):
 
 def _run_production_push_impl(force_dry_run: bool = False) -> str:
     text = _build_daily_production_message()
+    try:
+        carry, carry_err = _carryover_orders()
+        if carry:
+            text += ("\n\n⚠️ *Carried over — production date passed, still open "
+                     f"({len(carry)})* — re-date these or they're off the calendar:\n"
+                     + "\n".join(_carryover_lines(carry, bullet="• ")))
+    except Exception as _ce:
+        print(f"[PROD PUSH] carryover check failed: {_ce}", flush=True)
     if force_dry_run or _dry_run():
         print(f"[PROD PUSH — DRY RUN]\n{text}", flush=True)
         return f"[DRY RUN — not posted to Slack]\n\n{text}"
@@ -4863,6 +4871,55 @@ def set_production_block(visual_id: str, start_datetime: str = "",
             f"  Block:    {node.get('startAt')} → {node.get('dueAt')}{note}")
 
 
+# Orders whose production date has PASSED but are still in a production status.
+# The sweep window starts today, so these were invisible to the calendar's
+# capacity numbers and to the Monday Overload Count until someone re-dated
+# them (10/18: ~15 store orders parked on the prior Wednesday). Report only —
+# never moved, never re-blocked.
+CARRYOVER_LOOKBACK_DAYS = int(os.environ.get("CARRYOVER_LOOKBACK_DAYS", "14"))
+
+
+def _carryover_orders(exclude_ids=None) -> tuple:
+    """(rows, error). Each row: {vid, nick, status, date}. Oldest first."""
+    now = datetime.now(SHOP_TZ)
+    start = now - timedelta(days=CARRYOVER_LOOKBACK_DAYS)
+    res = paginate("""
+    query($prodAfter: ISO8601DateTime, $prodBefore: ISO8601DateTime, $first: Int, $after: String) {
+        invoices(inProductionAfter: $prodAfter, inProductionBefore: $prodBefore, first: $first, after: $after) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes { id visualId nickname startAt status { name } }
+        }
+    }
+    """, {
+        "prodAfter":  start.strftime("%Y-%m-%d") + "T00:00:00Z",
+        "prodBefore": now.strftime("%Y-%m-%d") + "T23:59:59Z",
+    })
+    if "error" in res:
+        return [], res["error"]
+    skip = set(exclude_ids or [])
+    rows = []
+    for n in res.get("nodes", []):
+        if n.get("id") in skip:
+            continue
+        status = (n.get("status") or {}).get("name", "")
+        if _norm(status) not in _SWEEP_STATUSES or _prod_class(status) == "PROMO":
+            continue
+        st = _parse_dt(n.get("startAt"))
+        if not st or st.date() >= now.date():
+            continue
+        rows.append({"vid": n.get("visualId"), "nick": (n.get("nickname") or "")[:38],
+                     "status": status, "date": st.date()})
+    rows.sort(key=lambda r: (r["date"], str(r["vid"])))
+    return rows, None
+
+
+def _carryover_lines(rows, bullet="  ") -> list:
+    today = datetime.now(SHOP_TZ).date()
+    return [f"{bullet}#{r['vid']} — {r['nick']} — {r['status']} — was "
+            f"{r['date']:%a %m/%d} ({(today - r['date']).days}d ago)" for r in rows]
+
+
 def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
                        force_place: bool = False) -> str:
     """Implementation — called by the MCP tool AND the background scheduler."""
@@ -5004,6 +5061,13 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
 
     if problems:
         lines += ["", f"⚠️ NEEDS ATTENTION ({len(problems)}):"] + problems
+
+    carry, carry_err = _carryover_orders(exclude_ids=[n.get("id") for n in nodes])
+    if carry_err:
+        lines += ["", f"⚠️ Could not check for carried-over orders: {carry_err}"]
+    elif carry:
+        lines += ["", f"⚠️ CARRIED OVER — production date passed, still open, NOT in "
+                      f"the load below ({len(carry)}):"] + _carryover_lines(carry)
 
     if day_load:
         lines += ["", f"DAILY LOAD vs {PROD_MAX_BLOCK_MIN // 60}h capacity per lane:"]

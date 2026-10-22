@@ -1052,6 +1052,8 @@ def get_daily_sales_rows(visual_ids: str) -> str:
                 id visualId nickname subtotal salesTax salesTaxAmount total tags
                 status {{ name }}
                 owner {{ name }}
+                timestamps {{ createdAt updatedAt }}
+                approvalRequests(first: 5) {{ nodes {{ name response {{ respondedAt }} }} }}
                 contact {{ fullName email customer {{ companyName }} }}
                 lineItemGroups {{ nodes {{
                     lineItems {{ nodes {{ sizes {{ count }} }} }}
@@ -1092,6 +1094,10 @@ def get_daily_sales_rows(visual_ids: str) -> str:
             "contact_name": c.get("fullName") or "", "contact_email": c.get("email") or "",
             "company": (c.get("customer") or {}).get("companyName") or "",
             "deco_code": code, "status": (o.get("status") or {}).get("name"),
+            "created_at": (o.get("timestamps") or {}).get("createdAt"),
+            "updated_at": (o.get("timestamps") or {}).get("updatedAt"),
+            "approvals": [{"name": a.get("name"), "responded_at": (a.get("response") or {}).get("respondedAt")}
+                          for a in (o.get("approvalRequests") or {}).get("nodes", [])],
         })
         time.sleep(0.4)
     return json.dumps(out, indent=1)

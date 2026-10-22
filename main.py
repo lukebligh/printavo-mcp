@@ -1033,6 +1033,70 @@ def diagnose_order(visual_id: str) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def get_daily_sales_rows(visual_ids: str) -> str:
+    """Read-only. Returns the fields the 'Daily Sales 2026' sheet row needs for
+    each order (comma-separated visual ids): job name, subtotal, tax rate, total,
+    per-line-item quantities, owner, Printavo URL, tags, contact name/email,
+    company, decoration code (sp/emb/dtf/store). JSON, one object per order.
+    Used to backfill rows when the Zapier QUOTE APPROVED zap misses orders."""
+    out = []
+    for vid in [v.strip().lstrip("#") for v in visual_ids.split(",") if v.strip()]:
+        iid, otype, err = _find_order(vid)
+        if err or not iid:
+            out.append({"visual_id": vid, "error": err or "not found"})
+            continue
+        q = f"""
+        query($id: ID!) {{
+            {otype}(id: $id) {{
+                id visualId nickname subtotal salesTax salesTaxAmount total tags
+                status {{ name }}
+                owner {{ name }}
+                contact {{ fullName email customer {{ companyName }} }}
+                lineItemGroups {{ nodes {{
+                    lineItems {{ nodes {{ sizes {{ count }} }} }}
+                    imprints {{ nodes {{ typeOfWork {{ name }}
+                        pricingMatrixColumn {{ columnName matrix {{ name }} }} }} }}
+                }} }}
+            }}
+        }}"""
+        r = query_printavo(q, {"id": iid}, allow_partial=True)
+        if "error" in r:
+            out.append({"visual_id": vid, "error": r["error"]})
+            continue
+        o = r.get(otype) or {}
+        qtys, decos = [], set()
+        for g in (o.get("lineItemGroups") or {}).get("nodes", []):
+            for li in (g.get("lineItems") or {}).get("nodes", []):
+                n = sum(int(s.get("count") or 0) for s in (li.get("sizes") or []))
+                if n:
+                    qtys.append(n)
+            for imp in (g.get("imprints") or {}).get("nodes", []):
+                decos.add(_decoration_type(imp, _status_deco_fallback((o.get("status") or {}).get("name", ""))))
+        tags = o.get("tags") or []
+        if any("store" in str(t).lower() for t in tags):
+            code = "store"
+        elif len(decos) == 1:
+            code = {"Screen Print": "sp", "Embroidery": "emb", "DTF": "dtf"}.get(decos.pop(), "")
+        else:
+            code = ",".join(sorted({"Screen Print": "sp", "Embroidery": "emb", "DTF": "dtf"}.get(d, d) for d in decos))
+        c = o.get("contact") or {}
+        out.append({
+            "visual_id": o.get("visualId"), "job_name": o.get("nickname"),
+            "subtotal": o.get("subtotal"), "sales_tax_rate": o.get("salesTax"),
+            "sales_tax_amount": o.get("salesTaxAmount"), "total": o.get("total"),
+            "quantities": ",".join(str(x) for x in qtys),
+            "owner": (o.get("owner") or {}).get("name"),
+            "url": f"https://www.printavo.com/invoices/{o.get('id')}",
+            "tags": " ".join(str(t) for t in tags),
+            "contact_name": c.get("fullName") or "", "contact_email": c.get("email") or "",
+            "company": (c.get("customer") or {}).get("companyName") or "",
+            "deco_code": code, "status": (o.get("status") or {}).get("name"),
+        })
+        time.sleep(0.4)
+    return json.dumps(out, indent=1)
+
+
 # ── FIXED: get_production_schedule ────────────────────────────────────────────
 # BUG (original): the query never fetched lineItemGroups/imprints at all,
 # so Items and Imprints were always 0 for every order.

@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+*.png
+*.bak
+*.prepatch
+*.prebatchfix
+*-SKILL.md
+Claude outputs
+deploy

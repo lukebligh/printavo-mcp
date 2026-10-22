@@ -1,0 +1,41 @@
+# Built and deployed by the Cloud Build trigger on every push to main.
+# All Cloud Run settings live here — change them by committing, not in the console.
+substitutions:
+  _REGION: us-central1
+  _SERVICE: printavo-mcp
+  _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/apps/printavo-mcp:${COMMIT_SHA}
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "."]
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}"]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_IMAGE}
+      - --region=${_REGION}
+      - --service-account=printavo-mcp-run@${PROJECT_ID}.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      # Schedulers run as threads inside the server: exactly one instance, always on.
+      - --min-instances=1
+      - --max-instances=1
+      - --no-cpu-throttling
+      - --cpu=1
+      - --memory=1Gi
+      - --timeout=3600
+      - --execution-environment=gen2
+      # State files (snapshots, Pipedrive sync state, COGS log) — code defaults to /data.
+      - --clear-volumes
+      - --clear-volume-mounts
+      - --add-volume=name=data,type=cloud-storage,bucket=${PROJECT_ID}-printavo-data
+      - --add-volume-mount=volume=data,mount-path=/data
+      - --env-vars-file=deploy/env.yaml
+      - --set-secrets=PRINTAVO_TOKEN=PRINTAVO_TOKEN:latest,PIPEDRIVE_API_TOKEN=PIPEDRIVE_API_TOKEN:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest,CX_SLACK_WEBHOOK_URL=CX_SLACK_WEBHOOK_URL:latest,CX_BACKLOG_SLACK_WEBHOOK_URL=CX_BACKLOG_SLACK_WEBHOOK_URL:latest,ART_SLACK_WEBHOOK_URL=ART_SLACK_WEBHOOK_URL:latest,GOOGLE_SERVICE_ACCOUNT_JSON=GOOGLE_SERVICE_ACCOUNT_JSON:latest,SAGE_AUTH_KEY=SAGE_AUTH_KEY:latest,SSACTIVEWEAR_APIKEY=SSACTIVEWEAR_APIKEY:latest
+images:
+  - ${_IMAGE}

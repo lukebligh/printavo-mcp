@@ -67,6 +67,11 @@ STATUS_NAMES = {
     # CX digest Z4 — blocked
     "CONTRACT_WAITING_ARTWORK": "CONTRACT - WAITING ON ARTWORK",
     "CONTRACT_WAITING_GOODS":   "CONTRACT - WAITING ON GOODS",
+    "DIRECT_WAITING_GOODS":     "DIRECT - WAITING ON GOODS",
+    # Goods gate (Oct 26 2026): ART APPROVED (Store: QUOTE APPROVED) →
+    # VERIFY GOODS → lane PRE-PRO, or → CONTRACT/DIRECT - WAITING ON GOODS
+    # when short. One shared status across all lanes; Justin flips it.
+    "VERIFY_GOODS":             "VERIFY GOODS",
     "PROMO_ON_ORDER":           "PROMO - ORDER",
     # Lifecycle statuses used by the Cowork skills
     "SHIPPED":                  "SHIPPED",
@@ -1233,7 +1238,8 @@ def get_production_schedule(days_ahead: int = 7) -> str:
                 tg["imprints"]  += gqty
 
         # Estimate time — SINGLE SOURCE OF TRUTH (see PRODUCTION TIME MODEL).
-        total_min, _bd = estimate_minutes_groups(order_groups, status)
+        total_min, _bd = estimate_minutes_groups(
+            order_groups, _class_status(status, inv.get("nickname")))
         est_time   = _format_est_time(total_min)
 
         screens_str = str(total_screens) if total_screens > 0 else "N/A"
@@ -2432,7 +2438,7 @@ DIGEST_SECTIONS = [
      "stuck 5+ days waiting on artwork, goods, or promo stock. "
      "These don't fix themselves — each one needs a chase or a decision today.",
      ["CONTRACT_WAITING_ARTWORK", "CONTRACT_WAITING_GOODS",
-      "PROMO_ON_ORDER"], 5, {"stale": "slack"}),
+      "DIRECT_WAITING_GOODS", "PROMO_ON_ORDER"], 5, {"stale": "slack"}),
 ]
 
 
@@ -4042,6 +4048,94 @@ def _is_us_federal_holiday(dt: datetime) -> bool:
     return False
 
 
+# Statuses that mean an order has NOT cleared the goods gate (art approved AND
+# goods verified). Anything on today's schedule in one of these gets flagged.
+_PRE_GATE_STATUSES = {_norm_status(s) for s in (
+    "QUOTE APPROVED", "ORDER GOODS", "MOCK-UP REQUESTED", "MOCK-UP READY",
+    "CONTRACT - WAITING ON ARTWORK", "PROOF REQUESTED", "ART APPROVAL SENT",
+    "ART APPROVED", "ARTWORK DECLINED", "VERIFY GOODS",
+    "CONTRACT - WAITING ON GOODS", "DIRECT - WAITING ON GOODS")}
+GATE_QUEUE_MAX_LINES = int(os.environ.get("GATE_QUEUE_MAX_LINES", "25"))
+
+
+def _fetch_orders_in_status(status_name: str) -> dict:
+    """Every invoice currently in one status, with its production date.
+    Returns {"orders": [...]} or {"error": ...}."""
+    sres = fetch_all_statuses()
+    if "error" in sres:
+        return {"error": f"Could not fetch statuses: {sres['error']}"}
+    sid = {_norm_status(x["name"]): x["id"] for x in sres["nodes"]}.get(
+        _norm_status(status_name))
+    if not sid:
+        return {"error": f"status '{status_name}' not found in Printavo"}
+    q = """
+    query($first: Int, $after: String, $statusIds: [ID!]) {
+        invoices(first: $first, after: $after, statusIds: $statusIds) {
+            totalNodes
+            pageInfo { hasNextPage endCursor }
+            nodes {
+                id visualId nickname startAt
+                status { name }
+                contact { fullName customer { companyName } }
+            }
+        }
+    }
+    """
+    r = paginate(q, {"statusIds": [sid]})
+    if "error" in r:
+        return {"error": r["error"]}
+    out = []
+    for n in r["nodes"]:
+        if _norm_status((n.get("status") or {}).get("name")) != _norm_status(status_name):
+            continue  # belt and braces if the filter is ever ignored
+        c = n.get("contact") or {}
+        out.append({
+            "vid": n.get("visualId"),
+            "nick": (n.get("nickname") or "(no nickname)")[:40],
+            "company": (c.get("customer") or {}).get("companyName") or c.get("fullName") or "—",
+            "prod": _parse_dt(n.get("startAt")),
+        })
+    return {"orders": out}
+
+
+def _goods_gate_lines(today_flags: list) -> list:
+    """The goods-gate block for the daily post: today's jobs that have not
+    cleared the gate, then Justin's VERIFY GOODS queue by production date."""
+    lines = []
+    if today_flags:
+        lines.append("\n🚦 *Scheduled today but NOT cleared through the goods gate* "
+                     "— no screens or sew-out until these are in their lane:")
+        lines.extend(today_flags)
+    q = _fetch_orders_in_status(STATUS_NAMES["VERIFY_GOODS"])
+    if "error" in q:
+        lines.append(f"\n🧾 *Verify Goods queue* — ⚠️ could not read: {q['error']}")
+        return lines
+    orders = q["orders"]
+    if not orders:
+        lines.append("\n🧾 *Verify Goods queue* — empty ✅")
+        return lines
+    today = datetime.now(SHOP_TZ).date()
+    far = datetime(2999, 1, 1, tzinfo=SHOP_TZ)
+    orders.sort(key=lambda o: (o["prod"] or far, str(o["vid"])))
+    lines.append(f"\n🧾 *Verify Goods queue — {len(orders)} order"
+                 f"{'s' if len(orders) != 1 else ''}* — count in and flip to the "
+                 f"lane, or to WAITING ON GOODS if short:")
+    for o in orders[:GATE_QUEUE_MAX_LINES]:
+        d = o["prod"].date() if o["prod"] else None
+        if d is None:
+            when = "no production date"
+        elif d < today:
+            when = f"⚠️ prod date passed ({d:%a %m/%d})"
+        elif d == today:
+            when = "⚠️ prod TODAY"
+        else:
+            when = f"prod {d:%a %m/%d}"
+        lines.append(f"• #{o['vid']} — {o['company']} — {o['nick']} — {when}")
+    if len(orders) > GATE_QUEUE_MAX_LINES:
+        lines.append(f"…and {len(orders) - GATE_QUEUE_MAX_LINES} more in VERIFY GOODS.")
+    return lines
+
+
 def _build_daily_production_message() -> str:
     """TODAY's production schedule for #all-est-merch, grouped by decoration
     type (Screen Print / Embroidery / DTF). Uses the fetch-all paginator."""
@@ -4073,7 +4167,8 @@ def _build_daily_production_message() -> str:
         return f"{header}\n⚠️ Could not pull the schedule: {result['error']}"
     nodes = result.get("nodes", [])
     if not nodes:
-        return f"{header}\nNothing on the production schedule today."
+        return "\n".join([f"{header}\nNothing on the production schedule today."]
+                         + _goods_gate_lines([]))
 
     ids = [n["id"] for n in nodes if n.get("id")]
     groups_raw = _fetch_groups_batch(ids)
@@ -4081,6 +4176,7 @@ def _build_daily_production_message() -> str:
     sections = {"Screen Print": [], "Embroidery": [], "DTF": []}
     totals = {t: {"orders": 0, "pcs": 0, "imprints": 0, "screens": 0, "minutes": 0}
               for t in sections}
+    gate_flags = []
 
     for n in nodes:
         iid = n.get("id")
@@ -4090,6 +4186,8 @@ def _build_daily_production_message() -> str:
         company = ((contact.get("customer") or {}).get("companyName")
                    or contact.get("fullName") or "—")
         nickname = n.get("nickname") or "(no nickname)"
+        if _norm_status(status) in _PRE_GATE_STATUSES:
+            gate_flags.append(f"• #{n.get('visualId')} — {company} — {nickname} — {status}")
 
         obj = groups_raw.get(iid)
         groups = _parse_obj_groups(obj, deco_default=deco_fallback) if obj else []
@@ -4130,7 +4228,7 @@ def _build_daily_production_message() -> str:
                                      "screens": 0, "minutes": 0})
             type_imprints = g["imprints"]
             type_pcs = g["pcs"]
-            _cls = _prod_class(status)
+            _cls = _prod_class(_class_status(status, n.get("nickname")))
             if _cls == "PROMO":
                 minutes = 0
             elif _cls == "STORE":
@@ -4168,6 +4266,7 @@ def _build_daily_production_message() -> str:
             hdr += f" | est {_format_est_time(t['minutes'])}"
         lines.append(hdr)
         lines.extend(order_lines)
+    lines.extend(_goods_gate_lines(gate_flags))
     return "\n".join(lines)
 
 
@@ -4616,6 +4715,7 @@ STORE_MIN_FLOOR         = int(os.environ.get("STORE_MIN_FLOOR", "10"))
 _SWEEP_STATUSES = {
     "QUOTE APPROVED", "ORDER GOODS",
     "CONTRACT - WAITING ON ARTWORK", "CONTRACT - WAITING ON GOODS",
+    "VERIFY GOODS", "DIRECT - WAITING ON GOODS",
     "PROOF REQUESTED", "ART APPROVAL SENT", "ART APPROVED",
     "SP - PRE-PRO", "SP - READY", "SP - IN PRODUCTION",
     "EMB - ORDER DIGITIZING", "EMB - PRE-PRO", "EMB - SEW OUT APPROVAL SENT",
@@ -4639,6 +4739,30 @@ def _prod_class(status_name: str) -> str:
     if "STORE" in s:
         return "STORE"
     return "NORMAL"
+
+
+# Shared statuses a STORE order can sit in before STORE - PRE PRO (Oct 26 2026
+# goods gate: QUOTE APPROVED → VERIFY GOODS → STORE - PRE PRO). None of them
+# say "STORE", so the status alone would classify a store order as NORMAL and
+# block it as Screen Print off its zero-color imprint rows.
+_STORE_GATE_STATUSES = {
+    "QUOTE APPROVED", "ORDER GOODS", "VERIFY GOODS",
+    "CONTRACT - WAITING ON GOODS", "DIRECT - WAITING ON GOODS",
+}
+_STORE_NICK_RE = re.compile(r"\bstore merch\b", re.I)
+
+
+def _class_status(status_name: str, nickname: str = "") -> str:
+    """The status string to classify an order by (_prod_class).
+
+    InkSoft store orders are nicknamed '<Name> Store Merch'. While one sits in
+    a shared gate status, that nickname marks it STORE. Lane statuses always
+    win — the nickname is only consulted inside _STORE_GATE_STATUSES.
+    """
+    if ((status_name or "").strip().upper() in _STORE_GATE_STATUSES
+            and _STORE_NICK_RE.search(nickname or "")):
+        return f"STORE (store-merch nickname) / {status_name}"
+    return status_name
 
 
 def _stitch_count(imp: dict) -> int:
@@ -4910,7 +5034,8 @@ def set_production_block(visual_id: str, start_datetime: str = "",
            or sum(int(g.get("qty") or 0) for g in order_groups))
 
     if not minutes:
-        minutes, bd = estimate_minutes_groups(order_groups, status)
+        minutes, bd = estimate_minutes_groups(
+            order_groups, _class_status(status, inv.get("nickname")))
         if not minutes:
             return f"#{visual_id} ({status}) — excluded from scheduling. Nothing written."
     else:
@@ -5054,14 +5179,15 @@ def _sweep_blocks_impl(days_ahead: int = 21, dry_run: bool = True,
         imprints = [i for g in order_groups for i in g["imprints"]]
         qty = (int(n.get("totalQuantity") or 0)
                or sum(int(g.get("qty") or 0) for g in order_groups))
-        if not imprints and _prod_class(status) == "NORMAL":
+        cls_status = _class_status(status, n.get("nickname"))
+        if not imprints and _prod_class(cls_status) == "NORMAL":
             # No imprint detail — place a visible placeholder rather than
             # dropping the order out of the capacity picture entirely.
             minutes, bd = NO_IMPRINT_MIN, {"Unscheduled": NO_IMPRINT_MIN}
             placeholders.append(f"  #{vid} — {nick} — {qty} pcs — "
                                 f"{NO_IMPRINT_MIN}m placeholder, needs imprint detail")
         else:
-            minutes, bd = estimate_minutes_groups(order_groups, status)
+            minutes, bd = estimate_minutes_groups(order_groups, cls_status)
         if not minutes:
             continue
         human_placed = not _is_auto_placed(existing)

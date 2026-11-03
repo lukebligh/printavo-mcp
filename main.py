@@ -6038,8 +6038,11 @@ def _intake_base_url() -> str:
 
 
 def _safe_filename(name: str) -> str:
+    """Printavo names the file after the URL's last segment, verbatim — so keep it
+    to characters that never get percent-encoded (spaces become underscores)."""
     name = os.path.basename(name or "attachment").strip() or "attachment"
-    return re.sub(r"[^\w.\- ()#&+,]", "_", name)[:180]
+    name = re.sub(r"\s+", "_", name)
+    return re.sub(r"[^\w.\-()]", "_", name)[:180]
 
 
 @mcp.custom_route("/intake-file/{token}/{filename}", methods=["GET"])
@@ -6152,7 +6155,7 @@ def import_email_attachments(visual_id: str, mailbox: str, message_ref: str,
             failed.append(f"{name}: staging {e}")
             continue
 
-        url = f"{base}/intake-file/{tok}/{_urlquote(name)}"
+        url = f"{base}/intake-file/{tok}/{_urlquote(name)}"  # name is already URL-safe
         mutation = """
         mutation($parentId: ID!, $url: String!) {
             productionFileCreate(parentId: $parentId, publicFileUrl: $url) { id name }
@@ -6172,6 +6175,37 @@ def import_email_attachments(visual_id: str, mailbox: str, message_ref: str,
         lines += [f"{label}: {x}" for x in items]
     return "\n".join(lines)
 
+
+
+@mcp.tool()
+def set_production_note(visual_id: str, note: str, append: bool = True) -> str:
+    """
+    Write the order's Production Notes field (imprint size, goods ETA, ship method…).
+    visual_id: Printavo order number
+    note:      text to write
+    append:    True = add below any existing note; False = replace it
+    """
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return f"ERROR: {err}"
+    text = note.strip()
+    if append:
+        cur = query_printavo(f"query($id: ID!) {{ {order_type}(id: $id) {{ productionNote }} }}",
+                             {"id": internal_id})
+        existing = ((cur.get(order_type) or {}).get("productionNote") or "").strip() \
+            if "error" not in cur else ""
+        if existing and text not in existing:
+            text = existing + "\n" + text
+        elif existing:
+            text = existing
+    field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
+    res = query_printavo(f"""mutation($id: ID!, $note: String) {{
+        {field}(id: $id, input: {{ productionNote: $note }}) {{ id productionNote }} }}""",
+        {"id": internal_id, "note": text})
+    if "error" in res:
+        return f"API Error: {res['error']}"
+    saved = (res.get(field) or {}).get("productionNote", "")
+    return f"Production note on #{visual_id}:\n{saved}"
 
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))

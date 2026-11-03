@@ -636,6 +636,16 @@ def search_orders(query: str, limit: int = 10, newest_first: bool = False) -> st
     if "error" in result:
         return f"Error: {result['error']}"
     nodes = result.get("nodes", [])
+    # Quotes live in a separate connection — include them, or a freshly built
+    # QUOTE is invisible to dedup checks.
+    qq = q.replace("invoices(", "quotes(")
+    qres = paginate(qq, {"q": query}, connection_path=("quotes",), max_records=limit)
+    if "error" not in qres:
+        seen = {n.get("id") for n in nodes}
+        nodes += [n for n in qres.get("nodes", []) if n.get("id") not in seen]
+    if newest_first:
+        nodes.sort(key=lambda n: int(n.get("visualId") or 0), reverse=True)
+    nodes = nodes[:limit]
     if not nodes:
         return f"No orders found matching '{query}'."
     lines = [f"SEARCH RESULTS for '{query}' ({len(nodes)} found):"]

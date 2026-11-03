@@ -6364,6 +6364,180 @@ def apply_contract_order_rules(visual_id: str, net30: bool, delivery_method: str
     return "\n".join(out)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTRACT PRICING without the browser (Nov 2026)
+# Printavo's API returns matrix column IDs but not the cell values, and the
+# "Refresh Pricing" button calls a web-session endpoint the API token can't use.
+# So: each imprint carries its matrix + column in Printavo (set below); the price
+# is computed from the matrix copies in ./pricing/matrices and written to every
+# line item in the group. Per-piece price = sum of each imprint's cell at the
+# group's total-quantity tier — the same rule the UGP skill verified against
+# Printavo's own Refresh Pricing.
+# KEEP ./pricing/matrices/*.csv IN STEP WITH PRINTAVO when a matrix changes.
+# ─────────────────────────────────────────────────────────────────────────────
+_MATRIX_KINDS = {
+    # kind: (substring of Printavo matrix name, csv key in _EST_MATRICES)
+    "sp":  ("contract sp 2025", "contract_sp"),
+    "emb": ("contract emb", "contract_emb"),
+    "dtf": ("transfers contract", "transfers_contract"),
+}
+
+
+def _matrix_kind_for_name(matrix_name: str):
+    n = (matrix_name or "").lower()
+    for kind, (needle, _csv) in _MATRIX_KINDS.items():
+        if needle in n:
+            return kind
+    return None
+
+
+def _find_matrix_column(kind: str, complexity: str):
+    """kind sp|emb|dtf; complexity = color count (sp), stitch count or column label
+    (emb), size label like LC / A4 / SQ (dtf). Returns (column_id, column_name, err)."""
+    needle, csv_key = _MATRIX_KINDS[kind]
+    r = query_printavo("""query { account { pricingMatrices(first: 50) {
+        nodes { id name columns { id columnName } } } } }""")
+    if "error" in r:
+        return None, None, f"API Error: {r['error']}"
+    mats = ((r.get("account") or {}).get("pricingMatrices") or {}).get("nodes", [])
+    m = next((x for x in mats if needle in (x.get("name") or "").lower()), None)
+    if not m:
+        return None, None, f"No matrix matching '{needle}'. Available: {[x.get('name') for x in mats]}"
+    cols = {(c.get("columnName") or "").strip(): c["id"] for c in (m.get("columns") or [])}
+    try:
+        csv_cols, _mk, _tiers = _est_load_matrix(csv_key)
+        label, _idx = _est_resolve_col(csv_cols, complexity)
+    except Exception as e:
+        return None, None, f"{e}"
+    for name, cid in cols.items():
+        if name.lower() == label.lower() or name.lower().startswith(label.lower()):
+            return cid, name, None
+    return None, None, f"Column '{label}' not in Printavo matrix '{m.get('name')}': {list(cols)}"
+
+
+@mcp.tool()
+def set_imprint_matrix(imprint_id: str, kind: str, complexity: str) -> str:
+    """
+    Point an imprint at the right contract pricing matrix column.
+    kind:       'sp' (Contract SP 2025 (NEW)), 'emb' (Contract EMB 2024), 'dtf' (TRANSFERS CONTRACT)
+    complexity: sp → ink colors ("2"); emb → stitch count ("7500"); dtf → size ("LC", "A4", "SQ", "A3", "A5")
+    """
+    kind = kind.strip().lower()
+    if kind not in _MATRIX_KINDS:
+        return "kind must be sp, emb or dtf"
+    cid, cname, err = _find_matrix_column(kind, complexity)
+    if err:
+        return f"ERROR: {err}"
+    r = query_printavo("""mutation($id: ID!, $c: ID!) {
+        imprintUpdate(id: $id, input: { pricingMatrixColumn: { id: $c } }) {
+            id pricingMatrixColumn { columnName matrix { name } } } }""", {"id": imprint_id, "c": cid})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    pc = (r.get("imprintUpdate") or {}).get("pricingMatrixColumn") or {}
+    return f"Imprint {imprint_id} → {(pc.get('matrix') or {}).get('name')} / {pc.get('columnName')}"
+
+
+@mcp.tool()
+def add_imprint_matrix(line_item_group_id: str, kind: str, complexity: str) -> str:
+    """Add an imprint to a group on the right contract matrix (see set_imprint_matrix)."""
+    kind = kind.strip().lower()
+    if kind not in _MATRIX_KINDS:
+        return "kind must be sp, emb or dtf"
+    cid, cname, err = _find_matrix_column(kind, complexity)
+    if err:
+        return f"ERROR: {err}"
+    r = query_printavo("""mutation($g: ID!, $c: ID!) {
+        imprintCreate(lineItemGroupId: $g, input: { pricingMatrixColumn: { id: $c } }) {
+            id pricingMatrixColumn { columnName matrix { name } } } }""", {"g": line_item_group_id, "c": cid})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    cr = r.get("imprintCreate") or {}
+    pc = cr.get("pricingMatrixColumn") or {}
+    return f"Imprint added: {cr.get('id')} → {(pc.get('matrix') or {}).get('name')} / {pc.get('columnName')}"
+
+
+@mcp.tool()
+def price_from_matrix(visual_id: str, dry_run: bool = False) -> str:
+    """
+    Price every line item from its group's imprints — the API stand-in for
+    clicking Refresh Pricing. Run AFTER all line items, sizes and imprints are set.
+    Per group: tier = largest matrix quantity ≤ group total pieces; per-piece price
+    = sum of each imprint's matrix cell at that tier; written to every line item in
+    the group. Stops (writes nothing) if an imprint has no matrix, a matrix isn't a
+    contract matrix, or the quantity is below the lowest tier.
+    """
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return f"ERROR: {err}"
+    q = f"""query($id: ID!) {{ {order_type}(id: $id) {{ total lineItemGroups {{ nodes {{ id
+        lineItems {{ nodes {{ id position price description sizes {{ size count }} }} }}
+        imprints {{ nodes {{ id pricingMatrixColumn {{ columnName matrix {{ name }} }} }} }} }} }} }} }}"""
+    res = query_printavo(q, {"id": internal_id})
+    if "error" in res:
+        return f"API Error: {res['error']}"
+    groups = ((res.get(order_type) or {}).get("lineItemGroups") or {}).get("nodes", [])
+    plan, problems = [], []
+    for gi, g in enumerate(groups, 1):
+        items = (g.get("lineItems") or {}).get("nodes", [])
+        imps = (g.get("imprints") or {}).get("nodes", [])
+        qty = sum(int(s.get("count") or 0) for li in items for s in (li.get("sizes") or []))
+        if not items or qty == 0:
+            continue
+        if not imps:
+            problems.append(f"Group {gi}: no imprints")
+            continue
+        per_piece, parts, tier_q = 0.0, [], None
+        for im in imps:
+            pc = im.get("pricingMatrixColumn") or {}
+            mname = (pc.get("matrix") or {}).get("name") or ""
+            kind = _matrix_kind_for_name(mname)
+            if not kind:
+                problems.append(f"Group {gi}: imprint {im['id']} is on '{mname or 'no matrix'}', not a contract matrix")
+                continue
+            csv_cols, _mk, tiers = _est_load_matrix(_MATRIX_KINDS[kind][1])
+            if qty < int(float(tiers[0][0])):
+                problems.append(f"Group {gi}: {qty} pcs is below the lowest {mname} tier ({tiers[0][0]})")
+                continue
+            tier = _est_pick_tier(tiers, qty)
+            col = pc.get("columnName", "").strip()
+            idx = next((i for lbl, i in csv_cols.items() if lbl.lower() == col.lower()), None)
+            if idx is None:
+                problems.append(f"Group {gi}: column '{col}' not in local copy of {mname} — refresh pricing/matrices")
+                continue
+            cell = float(tier[idx])
+            per_piece += cell
+            tier_q = tier[0]
+            parts.append(f"{col} {cell:.2f}")
+        if problems:
+            continue
+        per_piece = round(per_piece, 2)
+        plan.append((gi, items, per_piece, qty, tier_q, parts))
+
+    if problems:
+        return "NOT PRICED — fix first:\n" + "\n".join(f"  • {p}" for p in problems)
+    lines = [f"#{visual_id} matrix pricing{' (DRY RUN)' if dry_run else ''}:"]
+    for gi, items, pp, qty, tq, parts in plan:
+        lines.append(f"  Group {gi}: {qty} pcs → tier {tq} → " + " + ".join(parts) + f" = ${pp:.2f}/pc")
+        if dry_run:
+            continue
+        for li in items:
+            r = query_printavo("""mutation($id: ID!, $p: Float!, $pos: Int!) {
+                lineItemUpdate(id: $id, input: { price: $p, position: $pos }) { id price } }""",
+                {"id": li["id"], "p": pp, "pos": li.get("position") or 1})
+            if "error" in r:
+                lines.append(f"    ERROR line item {li['id']}: {r['error']}")
+            time.sleep(0.4)
+    if not dry_run:
+        back = query_printavo(f"""query($id: ID!) {{ {order_type}(id: $id) {{ total subtotal
+            lineItemGroups {{ nodes {{ lineItems {{ nodes {{ price }} }} }} }} }} }}""", {"id": internal_id})
+        b = back.get(order_type) or {}
+        prices = [li.get("price") for g in (b.get("lineItemGroups") or {}).get("nodes", [])
+                  for li in (g.get("lineItems") or {}).get("nodes", [])]
+        lines.append(f"  NOW: line prices {prices} | subtotal {b.get('subtotal')} | total {b.get('total')}")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=_port)

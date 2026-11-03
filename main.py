@@ -5928,6 +5928,251 @@ def run_pipedrive_sync_scheduler():
 pd_sync_thread = threading.Thread(target=run_pipedrive_sync_scheduler, daemon=True)
 pd_sync_thread.start()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL INTAKE — Outlook attachments → Printavo production files (Nov 2026)
+#
+# Printavo only takes production files by public URL. So: pull each attachment
+# from Microsoft Graph (app-only, client credentials), park it under /data/intake
+# behind an unguessable token, serve it from this server at /intake-file/…, and
+# hand that URL to productionFileCreate. Links expire after INTAKE_LINK_TTL_S.
+# ─────────────────────────────────────────────────────────────────────────────
+import secrets as _secrets
+import shutil as _shutil
+from urllib.parse import quote as _urlquote
+
+MS_TENANT_ID      = os.environ.get("MS_TENANT_ID", "")
+MS_CLIENT_ID      = os.environ.get("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET  = os.environ.get("MS_CLIENT_SECRET", "")
+INTAKE_MAILBOXES  = {m.strip().lower() for m in os.environ.get(
+    "INTAKE_MAILBOXES", "luke@estmerch.com,sales@estmerch.com").split(",") if m.strip()}
+INTAKE_DIR        = os.environ.get("INTAKE_DIR", "/data/intake")
+INTAKE_LINK_TTL_S = int(os.environ.get("INTAKE_LINK_TTL_S", "3600"))
+INTAKE_MAX_BYTES  = int(os.environ.get("INTAKE_MAX_BYTES", str(100 * 1024 * 1024)))
+PUBLIC_BASE_URL   = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+_GRAPH            = "https://graph.microsoft.com/v1.0"
+_graph_tok        = {"token": "", "exp": 0.0}
+# Signature logos that Outlook doesn't always flag as inline.
+_SIG_IMAGE_RE     = re.compile(r"^(image|outlook-)\w*\.(png|jpe?g|gif)$", re.I)
+
+
+def _graph_token() -> str:
+    if not (MS_TENANT_ID and MS_CLIENT_ID and MS_CLIENT_SECRET):
+        raise RuntimeError("MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET not set")
+    if _graph_tok["token"] and time.time() < _graph_tok["exp"] - 120:
+        return _graph_tok["token"]
+    r = httpx.post(
+        f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token",
+        data={"client_id": MS_CLIENT_ID, "client_secret": MS_CLIENT_SECRET,
+              "scope": "https://graph.microsoft.com/.default",
+              "grant_type": "client_credentials"}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Microsoft sign-in failed (HTTP {r.status_code}): {r.text[:300]}")
+    j = r.json()
+    _graph_tok["token"] = j["access_token"]
+    _graph_tok["exp"] = time.time() + float(j.get("expires_in", 3600))
+    return _graph_tok["token"]
+
+
+def _graph_get(path: str, params: dict = None, raw: bool = False):
+    r = httpx.get(_GRAPH + path, params=params, timeout=180, follow_redirects=True,
+                  headers={"Authorization": f"Bearer {_graph_token()}"})
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:300]}"
+    return (r.content if raw else r.json()), None
+
+
+def _resolve_message(mailbox: str, message_ref: str):
+    """message_ref = internetMessageId ('<...>') or a Graph/connector message id.
+    Returns (graph_message_id, error)."""
+    ref = message_ref.strip()
+    if ref.startswith("<"):
+        esc = ref.replace("'", "''")
+        data, err = _graph_get(f"/users/{mailbox}/messages",
+                               {"$filter": f"internetMessageId eq '{esc}'", "$select": "id"})
+        if err:
+            return None, f"Lookup by internetMessageId failed: {err}"
+        vals = (data or {}).get("value", [])
+        if not vals:
+            return None, f"No message with internetMessageId {ref} in {mailbox}"
+        return vals[0]["id"], None
+    # Connector ids are URL-safe base64; Graph REST ids may use / and +. Try both.
+    for cand in (ref, ref.replace("-", "/").replace("_", "+")):
+        data, err = _graph_get(f"/users/{mailbox}/messages/{_urlquote(cand, safe='')}",
+                               {"$select": "id"})
+        if data:
+            return data["id"], None
+    return None, f"Message not found in {mailbox}: {err}"
+
+
+def _intake_cleanup():
+    """Drop parked files whose links have expired."""
+    try:
+        if not os.path.isdir(INTAKE_DIR):
+            return
+        now = time.time()
+        for tok in os.listdir(INTAKE_DIR):
+            meta_p = os.path.join(INTAKE_DIR, tok, "_meta.json")
+            try:
+                with open(meta_p) as f:
+                    exp = float(json.load(f).get("exp", 0))
+            except Exception:
+                exp = 0
+            if exp and exp < now:
+                _shutil.rmtree(os.path.join(INTAKE_DIR, tok), ignore_errors=True)
+    except Exception as e:
+        print(f"[INTAKE] cleanup error: {e}", flush=True)
+
+
+def _intake_base_url() -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        req = get_http_request()
+        host = req.headers.get("x-forwarded-host") or req.headers.get("host")
+        if host:
+            return f"https://{host}"
+    except Exception:
+        pass
+    raise RuntimeError("Can't work out this server's public URL — set PUBLIC_BASE_URL")
+
+
+def _safe_filename(name: str) -> str:
+    name = os.path.basename(name or "attachment").strip() or "attachment"
+    return re.sub(r"[^\w.\- ()#&+,]", "_", name)[:180]
+
+
+@mcp.custom_route("/intake-file/{token}/{filename}", methods=["GET"])
+async def _intake_file_route(request):
+    from starlette.responses import FileResponse, PlainTextResponse
+    tok = request.path_params.get("token", "")
+    fn = request.path_params.get("filename", "")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{30,}", tok):
+        return PlainTextResponse("not found", status_code=404)
+    folder = os.path.join(INTAKE_DIR, tok)
+    try:
+        with open(os.path.join(folder, "_meta.json")) as f:
+            meta = json.load(f)
+    except Exception:
+        return PlainTextResponse("not found", status_code=404)
+    if float(meta.get("exp", 0)) < time.time() or fn != meta.get("filename"):
+        return PlainTextResponse("expired", status_code=404)
+    return FileResponse(os.path.join(folder, fn),
+                        media_type=meta.get("content_type") or "application/octet-stream",
+                        filename=fn)
+
+
+@mcp.tool()
+def import_email_attachments(visual_id: str, mailbox: str, message_ref: str,
+                             skip_existing: bool = True, dry_run: bool = False) -> str:
+    """
+    Copy an email's attachments into a Printavo order's Production Files.
+    visual_id:   Printavo order number (e.g. "7461")
+    mailbox:     luke@estmerch.com or sales@estmerch.com
+    message_ref: the email's internetMessageId ("<...@...>", preferred — the same
+                 across both mailboxes) or its Outlook message id
+    skip_existing: skip files whose name is already on the order
+    dry_run:     list what would be uploaded without touching Printavo
+    Skips inline/signature images. Attached emails (.msg) and OneDrive/SharePoint
+    link attachments can't be copied — they are reported so a human can grab them.
+    """
+    mailbox = (mailbox or "").strip().lower()
+    if mailbox not in INTAKE_MAILBOXES:
+        return f"Mailbox {mailbox!r} not allowed. Allowed: {', '.join(sorted(INTAKE_MAILBOXES))}"
+    try:
+        msg_id, err = _resolve_message(mailbox, message_ref)
+    except RuntimeError as e:
+        return f"ERROR: {e}"
+    if err:
+        return f"ERROR: {err}"
+
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return f"ERROR: {err}"
+    existing = set()
+    if skip_existing:
+        q = f"""query($id: ID!) {{ {order_type}(id: $id) {{
+                   productionFiles {{ nodes {{ name }} }} }} }}"""
+        res = query_printavo(q, {"id": internal_id})
+        for n in ((res.get(order_type) or {}).get("productionFiles") or {}).get("nodes", []) \
+                if "error" not in res else []:
+            existing.add((n.get("name") or "").lower())
+
+    data, err = _graph_get(
+        f"/users/{mailbox}/messages/{_urlquote(msg_id, safe='')}/attachments",
+        {"$select": "id,name,contentType,size,isInline"})
+    if err:
+        return f"ERROR listing attachments: {err}"
+    atts = (data or {}).get("value", [])
+
+    _intake_cleanup()
+    try:
+        base = _intake_base_url()
+    except RuntimeError as e:
+        return f"ERROR: {e}"
+
+    uploaded, skipped, manual, failed = [], [], [], []
+    for a in atts:
+        name = _safe_filename(a.get("name"))
+        kind = a.get("@odata.type", "")
+        size = int(a.get("size") or 0)
+        if kind.endswith("itemAttachment") or kind.endswith("referenceAttachment"):
+            manual.append(f"{name} ({'attached email' if 'item' in kind else 'cloud link'})")
+            continue
+        if a.get("isInline") or (_SIG_IMAGE_RE.match(name) and size < 200_000):
+            skipped.append(f"{name} (inline/signature)")
+            continue
+        if name.lower() in existing:
+            skipped.append(f"{name} (already on order)")
+            continue
+        if size > INTAKE_MAX_BYTES:
+            manual.append(f"{name} (too large: {size/1e6:.0f} MB)")
+            continue
+        if dry_run:
+            uploaded.append(f"{name} [dry run]")
+            continue
+
+        blob, err = _graph_get(
+            f"/users/{mailbox}/messages/{_urlquote(msg_id, safe='')}"
+            f"/attachments/{_urlquote(a['id'], safe='')}/$value", raw=True)
+        if err or not blob:
+            failed.append(f"{name}: download {err or 'empty'}")
+            continue
+        tok = _secrets.token_urlsafe(32)
+        folder = os.path.join(INTAKE_DIR, tok)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(blob)
+            with open(os.path.join(folder, "_meta.json"), "w") as f:
+                json.dump({"filename": name, "content_type": a.get("contentType"),
+                           "exp": time.time() + INTAKE_LINK_TTL_S,
+                           "visual_id": visual_id}, f)
+        except Exception as e:
+            failed.append(f"{name}: staging {e}")
+            continue
+
+        url = f"{base}/intake-file/{tok}/{_urlquote(name)}"
+        mutation = """
+        mutation($parentId: ID!, $url: String!) {
+            productionFileCreate(parentId: $parentId, publicFileUrl: $url) { id name }
+        }"""
+        res = query_printavo(mutation, {"parentId": internal_id, "url": url})
+        if "error" in res:
+            failed.append(f"{name}: Printavo {res['error']}")
+        else:
+            pf = res.get("productionFileCreate") or {}
+            uploaded.append(f"{pf.get('name', name)} (ID {pf.get('id')})")
+        time.sleep(0.4)  # Printavo silently rate-limits rapid calls
+
+    lines = [f"Order #{visual_id} ← {mailbox}: {len(uploaded)} uploaded, "
+             f"{len(skipped)} skipped, {len(manual)} need a human, {len(failed)} failed"]
+    for label, items in (("UPLOADED", uploaded), ("SKIPPED", skipped),
+                         ("NEEDS A HUMAN", manual), ("FAILED", failed)):
+        lines += [f"{label}: {x}" for x in items]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=_port)

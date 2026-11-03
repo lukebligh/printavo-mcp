@@ -6309,12 +6309,27 @@ def apply_contract_order_rules(visual_id: str, net30: bool, delivery_method: str
         return f"DRY RUN #{visual_id}:\n" + ("\n".join(log) or "Nothing to change.")
 
     errors = []
-    if inp:
-        field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
-        r = query_printavo(f"""mutation($id: ID!, $input: {'QuoteInput' if order_type == 'quote' else 'InvoiceInput'}!) {{
-            {field}(id: $id, input: $input) {{ id }} }}""", {"id": internal_id, "input": inp})
+    field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
+    in_type = "QuoteInput" if order_type == "quote" else "InvoiceInput"
+
+    def _upd(payload, label):
+        if not payload:
+            return
+        r = query_printavo(f"""mutation($id: ID!, $input: {in_type}!) {{
+            {field}(id: $id, input: $input) {{ id }} }}""", {"id": internal_id, "input": payload})
         if "error" in r:
-            errors.append(f"update: {r['error']}")
+            errors.append(f"{label}: {r['error']}")
+        time.sleep(0.4)
+
+    # Terms go alone: Printavo validates the derived payment-due date and can reject
+    # the whole update. Give it an explicit due date (invoice date + 30) for NET 30.
+    terms_inp = {k: inp.pop(k) for k in ("paymentTerm", "invoiceAt") if k in inp}
+    _upd(inp, "delivery/ship-to")
+    if net30 and "paymentTerm" in terms_inp:
+        base_s = (o.get("invoiceAt") or "")[:10] or datetime.now().strftime("%Y-%m-%d")
+        base = datetime.strptime(base_s, "%Y-%m-%d")
+        terms_inp["paymentDueAt"] = (base + timedelta(days=30)).strftime("%Y-%m-%d")
+    _upd(terms_inp, "terms/invoice date")
     for f in to_delete:
         r = query_printavo("mutation($id: ID!){ feeDelete(id: $id){ id } }", {"id": f["id"]})
         if "error" in r:

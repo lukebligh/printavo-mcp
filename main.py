@@ -6538,6 +6538,24 @@ def price_from_matrix(visual_id: str, dry_run: bool = False) -> str:
     return "\n".join(lines)
 
 
+
+@mcp.tool()
+def delete_line_item(line_item_id: str) -> str:
+    """Delete one line item (used to trim extra lines inherited from a duplicated order)."""
+    r = query_printavo("mutation($id: ID!){ lineItemDelete(id: $id){ id } }", {"id": line_item_id})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    return f"Deleted line item {line_item_id}."
+
+
+@mcp.tool()
+def delete_imprint(imprint_id: str) -> str:
+    """Delete one imprint (used to trim extra imprints inherited from a duplicated order)."""
+    r = query_printavo("mutation($id: ID!){ imprintDelete(id: $id){ id } }", {"id": imprint_id})
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    return f"Deleted imprint {imprint_id}."
+
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=_port)

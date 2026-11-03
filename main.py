@@ -608,14 +608,16 @@ def get_recent_orders(limit: int = 10) -> str:
 
 
 @mcp.tool()
-def search_orders(query: str, limit: int = 10) -> str:
+def search_orders(query: str, limit: int = 10, newest_first: bool = False) -> str:
     """
     Search Printavo orders by keyword, order number, customer name, etc.
     query: search string (e.g. '6817', 'Underground Printing', 'BEBT')
+    newest_first: sort by order number descending (use to find a customer's latest order)
     """
+    sort = "sortOn: VISUAL_ID, sortDescending: true," if newest_first else ""
     q = """
     query($q: String, $first: Int, $after: String) {
-        invoices(first: $first, after: $after, query: $q) {
+        invoices(first: $first, after: $after, SORT query: $q) {
             totalNodes
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -629,7 +631,7 @@ def search_orders(query: str, limit: int = 10) -> str:
             }
         }
     }
-    """
+    """.replace("SORT", sort)
     result = paginate(q, {"q": query}, max_records=limit)
     if "error" in result:
         return f"Error: {result['error']}"

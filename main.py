@@ -6207,6 +6207,148 @@ def set_production_note(visual_id: str, note: str, append: bool = True) -> str:
     saved = (res.get(field) or {}).get("productionNote", "")
     return f"Production note on #{visual_id}:\n{saved}"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTRACT ORDER RULES (Nov 2026) — terms, invoice date, fees, delivery, ship-to
+# Luke's rules for contract PO entry:
+#   • NET 30 accounts (ACM, Proforma, Left Hand): NET 30 terms, no credit card fee,
+#     invoice date left to Printavo (auto 30 days out).
+#   • Everyone else: terms BLANK (triggers the pre-payment automation), invoice
+#     date = production date, 3% Credit Card Fee present.
+#   • Shipping fees carried over from a duplicate are always removed.
+# ─────────────────────────────────────────────────────────────────────────────
+_SHIP_FEE_RE = re.compile(r"ship|freight|courier|\bups\b|fedex|delivery|postage", re.I)
+
+
+def _account_named(kind: str):
+    """kind = 'paymentTerms' | 'deliveryMethods' → list of {id, name}."""
+    r = query_printavo(f"query {{ account {{ {kind} {{ nodes {{ id name }} }} }} }}")
+    if "error" in r:
+        return []
+    return (((r.get("account") or {}).get(kind) or {}).get("nodes")) or []
+
+
+@mcp.tool()
+def apply_contract_order_rules(visual_id: str, net30: bool, delivery_method: str,
+                               ship_to_json: str = "", dry_run: bool = False) -> str:
+    """
+    Apply Est Merch contract-order rules to an order after it is built.
+    visual_id:       Printavo order number
+    net30:           True for NET 30 accounts (ACM, Proforma, Left Hand); False for all others
+    delivery_method: exact Printavo delivery method name, e.g. "PICK UP", "UPS Ground",
+                     or the customer-FedEx-account method. Unknown names return the list.
+    ship_to_json:    optional ship-to address, JSON with any of: companyName, customerName,
+                     address1, address2, city, stateIso, zipCode, countryIso (default US)
+    dry_run:         report what would change without writing
+    """
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return f"ERROR: {err}"
+    q = f"""query($id: ID!) {{ {order_type}(id: $id) {{
+        startAt invoiceAt paymentTerm {{ id name }} deliveryMethod {{ id name }}
+        fees {{ nodes {{ id description amount unitPrice unitPriceAsPercentage }} }} }} }}"""
+    cur = query_printavo(q, {"id": internal_id})
+    if "error" in cur:
+        return f"API Error: {cur['error']}"
+    o = cur.get(order_type) or {}
+    fees = (o.get("fees") or {}).get("nodes", [])
+    log, inp = [], {}
+
+    # Delivery method
+    dms = _account_named("deliveryMethods")
+    dm = next((d for d in dms if (d["name"] or "").strip().lower() == delivery_method.strip().lower()), None)
+    if not dm:
+        return (f"ERROR: delivery method {delivery_method!r} not found. Available: "
+                + ", ".join(d["name"] for d in dms))
+    if ((o.get("deliveryMethod") or {}).get("id")) != dm["id"]:
+        inp["deliveryMethod"] = {"id": dm["id"]}
+        log.append(f"Delivery method → {dm['name']}")
+
+    # Terms + invoice date
+    cur_term = (o.get("paymentTerm") or {}).get("name")
+    if net30:
+        terms = _account_named("paymentTerms")
+        t = next((x for x in terms if re.search(r"net\s*-?\s*30", x["name"] or "", re.I)), None)
+        if not t:
+            return "ERROR: no NET 30 payment term on the account. Available: " + \
+                   ", ".join(x["name"] for x in terms)
+        if (o.get("paymentTerm") or {}).get("id") != t["id"]:
+            inp["paymentTerm"] = {"id": t["id"]}
+            log.append(f"Terms → {t['name']} (was {cur_term or 'blank'})")
+    else:
+        if cur_term:
+            inp["paymentTerm"] = None
+            log.append(f"Terms → blank (was {cur_term})")
+        prod = (o.get("startAt") or "")[:10]
+        if prod and (o.get("invoiceAt") or "")[:10] != prod:
+            inp["invoiceAt"] = prod
+            log.append(f"Invoice date → {prod} (production date)")
+
+    # Ship-to
+    if ship_to_json.strip():
+        try:
+            addr = json.loads(ship_to_json)
+        except Exception as e:
+            return f"ERROR: ship_to_json is not valid JSON: {e}"
+        addr.setdefault("countryIso", "US")
+        inp["shippingAddress"] = addr
+        log.append("Ship To → " + ", ".join(str(v) for v in addr.values() if v))
+
+    # Fees
+    to_delete = [f for f in fees if _SHIP_FEE_RE.search(f.get("description") or "")]
+    cc = [f for f in fees if "credit card" in (f.get("description") or "").lower()]
+    if net30:
+        to_delete += cc
+    for f in to_delete:
+        log.append(f"Remove fee: {f.get('description')} ({f.get('amount')})")
+    add_cc = (not net30) and not cc
+    if add_cc:
+        log.append("Add fee: Credit Card Fee 3%")
+
+    if dry_run:
+        return f"DRY RUN #{visual_id}:\n" + ("\n".join(log) or "Nothing to change.")
+
+    errors = []
+    if inp:
+        field = "quoteUpdate" if order_type == "quote" else "invoiceUpdate"
+        r = query_printavo(f"""mutation($id: ID!, $input: {'QuoteInput' if order_type == 'quote' else 'InvoiceInput'}!) {{
+            {field}(id: $id, input: $input) {{ id }} }}""", {"id": internal_id, "input": inp})
+        if "error" in r:
+            errors.append(f"update: {r['error']}")
+    for f in to_delete:
+        r = query_printavo("mutation($id: ID!){ feeDelete(id: $id){ id } }", {"id": f["id"]})
+        if "error" in r:
+            errors.append(f"delete fee {f.get('description')}: {r['error']}")
+        time.sleep(0.4)
+    if add_cc:
+        r = query_printavo("""mutation($pid: ID!, $input: FeeInput!) {
+            feeCreate(parentId: $pid, input: $input) { id description } }""",
+            {"pid": internal_id, "input": {"description": "Credit Card Fee", "quantity": 1,
+                                          "unitPrice": 3.0, "unitPriceAsPercentage": True,
+                                          "taxable": False}})
+        if "error" in r:
+            errors.append(f"add credit card fee: {r['error']}")
+
+    # Read back — report what Printavo actually holds, not what we sent
+    back = query_printavo(f"""query($id: ID!) {{ {order_type}(id: $id) {{
+        invoiceAt total paymentTerm {{ name }} deliveryMethod {{ name }}
+        shippingAddress {{ companyName customerName address1 city stateIso zipCode }}
+        fees {{ nodes {{ description amount }} }} }} }}""", {"id": internal_id})
+    b = back.get(order_type) or {}
+    sa = b.get("shippingAddress") or {}
+    out = [f"#{visual_id} — applied:"] + [f"  • {x}" for x in log] + [
+        "NOW:",
+        f"  Terms: {(b.get('paymentTerm') or {}).get('name') or 'blank'} | Invoice date: {b.get('invoiceAt')}",
+        f"  Delivery: {(b.get('deliveryMethod') or {}).get('name')}",
+        "  Ship To: " + (", ".join(str(v) for v in sa.values() if v) or "—"),
+        "  Fees: " + (", ".join(f"{f['description']} {f['amount']}" for f in
+                                (b.get('fees') or {}).get('nodes', [])) or "none"),
+        f"  Total: {b.get('total')}"]
+    if errors:
+        out.append("ERRORS: " + " | ".join(errors))
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=_port)

@@ -1589,6 +1589,32 @@ def update_invoice_fields(
     if "error" in result:
         return f"API Error: {result['error']}"
     inv = result.get(update_field, {})
+    block_note = ""
+    if order_type == "quote":
+        # The calendar draws an order from startAt to dueAt. A quote's startAt was
+        # never written, so a new quote stretched from a stale start to the
+        # production date (a week-long bar). Pin it to a 1-hour placeholder block on
+        # the production date (8–9 AM Central); the real block is placed on approval.
+        # Separate call: if Printavo rejects it, the header update above still stands.
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("America/Chicago")
+            d = datetime.strptime(production_date, "%Y-%m-%d")
+            start = d.replace(hour=8, tzinfo=tz)
+            blk = query_printavo(
+                """mutation($id: ID!, $startAt: ISO8601DateTime, $dueAt: ISO8601DateTime) {
+                    quoteUpdate(id: $id, input: { startAt: $startAt, dueAt: $dueAt }) {
+                        id startAt dueAt } }""",
+                {"id": internal_id, "startAt": start.isoformat(),
+                 "dueAt": (start + timedelta(hours=1)).isoformat()})
+            if "error" in blk:
+                block_note = f"\n  ⚠ Calendar block not set: {blk['error']}"
+            else:
+                b = blk.get("quoteUpdate") or {}
+                inv["dueAt"], inv["startAt"] = b.get("dueAt"), b.get("startAt")
+                block_note = f"\n  Calendar block:    {b.get('startAt')} → {b.get('dueAt')}"
+        except Exception as e:
+            block_note = f"\n  ⚠ Calendar block not set: {e}"
     prod_date = (inv.get('dueAt') or inv.get('startAt') or '')[:10]
     return (
         f"Order #{inv.get('visualId')} header updated!\n"
@@ -1597,6 +1623,7 @@ def update_invoice_fields(
         f"  Production Date:   {prod_date}\n"
         f"  Customer Due Date: {inv.get('customerDueAt', '')}\n"
         f"  Invoice Date:      {inv.get('invoiceAt', '')}"
+        f"{block_note}"
     )
 
 

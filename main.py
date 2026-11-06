@@ -6595,6 +6595,91 @@ def delete_imprint(imprint_id: str) -> str:
         return f"API Error: {r['error']}"
     return f"Deleted imprint {imprint_id}."
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SANMAR  —  read-only supplier lookups (suppliers/sanmar.py). Guarded import so a
+#  SanMar problem can never take down the rest of the server.
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    from suppliers import sanmar as _sanmar
+    _SANMAR_IMPORT_ERR = None
+except Exception as _e:  # pragma: no cover
+    _sanmar, _SANMAR_IMPORT_ERR = None, repr(_e)
+
+
+def _sanmar_run(fn):
+    if _sanmar is None:
+        return f"SanMar module failed to load: {_SANMAR_IMPORT_ERR}"
+    try:
+        return fn()
+    except Exception as e:
+        return f"SanMar error: {e}"
+
+
+@mcp.tool()
+def sanmar_order_goods(order: str) -> str:
+    """Where are the SanMar goods for a Printavo order? Pass the Printavo order number
+    (e.g. "7480") or an exact SanMar PO. Finds every SanMar PO that starts with that
+    number and returns status (incl. backorder/hold), shipments with tracking and
+    box-by-box contents, and invoice cost per line. Read-only."""
+    return _sanmar_run(lambda: _sanmar.order_report(order))
+
+
+@mcp.tool()
+def sanmar_inventory(style: str, color: str = "", size: str = "") -> str:
+    """Live SanMar stock by warehouse. style e.g. PC61; color is SanMar's catalog color
+    (e.g. "Jet Black"); size e.g. L. Leave color/size blank for the whole style."""
+    def run():
+        rows = _sanmar.inventory(style, color, size)
+        if not rows:
+            return f"No SanMar inventory found for {style} {color} {size}".strip()
+        out = []
+        for r in rows[:60]:
+            whs = ", ".join(f"{n} {q}" for n, q in r["warehouses"] if q)
+            out.append(f"{style} {r['color']} {r['size']}: {r['total']} total — {whs or 'none in stock'}")
+        if len(rows) > 60:
+            out.append(f"…{len(rows) - 60} more SKUs; narrow by color or size.")
+        return "\n".join(out)
+    return _sanmar_run(run)
+
+
+@mcp.tool()
+def sanmar_pricing(style: str, color: str = "", size: str = "") -> str:
+    """Est Merch's SanMar price (my_price = our account price) plus piece/case/sale
+    for a style, optionally narrowed by catalog color and size."""
+    def run():
+        rows = _sanmar.pricing(style, color, size)
+        if not rows:
+            return f"No SanMar pricing found for {style} {color} {size}".strip()
+        out = [f"{r['style']} {r['color']} {r['size']}: OUR PRICE {_sanmar._money(r['my_price'])} | "
+               f"case {_sanmar._money(r['case'])} | piece {_sanmar._money(r['piece'])}"
+               + (f" | sale {_sanmar._money(r['sale'])} until {r['sale_end']}" if r['sale'] and r['sale_end'] else "")
+               for r in rows[:80]]
+        if len(rows) > 80:
+            out.append(f"…{len(rows) - 80} more; narrow by color or size.")
+        return "\n".join(out)
+    return _sanmar_run(run)
+
+
+@mcp.tool()
+def sanmar_packing_slip(lpn: str) -> str:
+    """Contents of one SanMar box from the LPN barcode on its shipping label
+    (starts with LP, L, S or R). For count-in at VERIFY GOODS."""
+    def run():
+        s = _sanmar.packing_slip(lpn)
+        if not s:
+            return f"No packing slip found for {lpn}."
+        lines = [f"PO \"{s['po']}\" — box {s['box']} of {s['boxes']}, shipped {s['ship_date']}, {s['tracking']}"]
+        lines += [f"  {i['style']} {i['color']} {i['size']} ×{i['qty']}" for i in s["items"]]
+        return "\n".join(lines)
+    return _sanmar_run(run)
+
+
+@mcp.tool()
+def sanmar_health_check() -> str:
+    """Confirms the SanMar API login works (prices one PC61)."""
+    return _sanmar_run(_sanmar.health) if _sanmar else _sanmar_run(lambda: None)
+
+
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=_port)

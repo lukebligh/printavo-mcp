@@ -321,7 +321,11 @@ def find_pos(ref):
     if not ref.isdigit():
         return [ref]
     pat = re.compile(rf"^\s*#?{re.escape(ref)}(?!\d)")
-    return sorted(po for po in _known_pos() if pat.match(po))
+    seen = {}
+    for po in sorted(_known_pos()):
+        if pat.match(po):
+            seen.setdefault(po.strip().upper(), po.strip())   # SanMar returns the same PO in two casings
+    return sorted(seen.values())
 
 
 # ─────────────────────────── Human-readable order report ───────────────────────────

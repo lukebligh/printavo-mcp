@@ -7366,6 +7366,289 @@ def run_order_shadow_scheduler():
 threading.Thread(target=run_order_shadow_scheduler, daemon=True).start()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WEBSITE LEAD → PRINTAVO (Luke, Nov 7 2026)
+#  WPForms webhook (Get a Quote + contact page) → new Printavo customer (or the
+#  existing one) + a starter QUOTE holding the form details → Slack Clint.
+#  Pitches and tests are skipped (listed to Clint). Later: good/better/best auto lines.
+# ═══════════════════════════════════════════════════════════════════════════════
+import hashlib as _hashlib
+
+WEBLEAD_ENABLED = os.environ.get("WEBLEAD_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+WEBLEAD_NOTIFY = os.environ.get("WEBLEAD_NOTIFY", "U07VDHDSMUJ")          # Clint
+WEBLEAD_OWNER_NAME = os.environ.get("WEBLEAD_OWNER_NAME", "Clint")        # Printavo user who owns new leads
+_PITCH_WORDS = ("supplier", "vendor", "distributor", "partnership", "partner with", "seo", "backlink",
+                "guest post", "web design", "website design", "marketing agency", "lead generation",
+                "funding", "loan", "crypto", "outsourc", "virtual assistant", "app development",
+                "rank your", "google ranking", "advertise with", "list your business")
+
+
+def _weblead_token() -> str:
+    seed = os.environ.get("PRINTAVO_TOKEN", "") or os.environ.get("PRINTAVO_API_TOKEN", "")
+    return _hashlib.sha256(f"website-lead:{seed}".encode()).hexdigest()[:28]
+
+
+def _wl_norm_keys(d: dict) -> dict:
+    out = {}
+    for k, v in (d or {}).items():
+        out[re.sub(r"[^a-z0-9]", "", str(k).lower())] = v
+    return out
+
+
+def _wl_get(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, list):
+            v = ", ".join(str(x) for x in v if x)
+        if v not in (None, "") and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _wl_parse(payload: dict) -> dict:
+    d = _wl_norm_keys(payload)
+    name = _wl_get(d, "name", "fullname", "yourname")
+    first = _wl_get(d, "firstname", "first")
+    last = _wl_get(d, "lastname", "last")
+    if not (first or last) and name:
+        parts = name.split()
+        first, last = parts[0], " ".join(parts[1:])
+    files = d.get("fileupload") or d.get("file") or d.get("upload") or d.get("files") or ""
+    if isinstance(files, str):
+        files = re.findall(r"https?://\S+", files)
+    elif isinstance(files, list):
+        files = [str(x) for x in files if str(x).startswith("http")]
+    else:
+        files = []
+    return {
+        "first": first, "last": last, "name": (name or f"{first} {last}").strip(),
+        "company": _wl_get(d, "company", "companyname", "organization", "business"),
+        "email": _wl_get(d, "email", "emailaddress").lower(),
+        "phone": _wl_get(d, "phone", "phonenumber"),
+        "interested": _wl_get(d, "interestedin", "interested", "services", "service"),
+        "need_by": _wl_get(d, "needby", "duedate", "inhands", "date"),
+        "quantity": _wl_get(d, "quantity", "qty"),
+        "details": _wl_get(d, "giveusthedetails", "details", "howcanwehelp", "message", "comments"),
+        "landing": _wl_get(d, "landingpage", "page", "source"),
+        "files": files[:5],
+    }
+
+
+def _wl_classify(lead: dict) -> str:
+    """'' = real lead · 'test' · 'pitch' · 'invalid'"""
+    if not lead["email"] or "@" not in lead["email"]:
+        return "invalid"
+    blob = f"{lead['name']} {lead['company']}".lower()
+    if lead["email"].endswith("@estmerch.com") or re.search(r"\btest\b", blob):
+        return "test"
+    text = f"{lead['details']} {lead['company']}".lower()
+    if not lead["quantity"] and any(w in text for w in _PITCH_WORDS):
+        return "pitch"
+    return ""
+
+
+def _wl_need_by(s: str):
+    today = _central_now().date()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%m-%d-%Y"):
+        try:
+            d = datetime.strptime(s.strip(), fmt).date()
+            return d, d >= today
+        except (ValueError, AttributeError):
+            continue
+    return None, False
+
+
+_WL_OWNER = {}
+
+
+def _wl_owner_id():
+    if "id" not in _WL_OWNER:
+        r = query_printavo("query { account { users(first: 50) { nodes { id name email } } } }")
+        nodes = (((r.get("account") or {}).get("users") or {}).get("nodes") or []) if "error" not in r else []
+        hit = next((u for u in nodes if WEBLEAD_OWNER_NAME.lower() in f"{u.get('name')} {u.get('email')}".lower()), None)
+        _WL_OWNER["id"] = hit["id"] if hit else None
+    return _WL_OWNER["id"]
+
+
+def _wl_find_existing(lead: dict):
+    """-> (contact_id, customer_id, company, order_count, how) or None"""
+    r = query_printavo("""query($q: String) { contacts(first: 5, query: $q) { nodes {
+        id email fullName customer { id companyName orderCount } } } }""", {"q": lead["email"]})
+    for c in ((r.get("contacts") or {}).get("nodes") or []) if "error" not in r else []:
+        if (c.get("email") or "").lower() == lead["email"] and c.get("customer"):
+            cu = c["customer"]
+            return c["id"], cu["id"], cu.get("companyName"), cu.get("orderCount") or 0, "email"
+    if lead["company"]:
+        time.sleep(PAGE_DELAY_S)
+        r = query_printavo("""query($q: String) { customers(first: 5, query: $q) { nodes {
+            id companyName orderCount primaryContact { id } } } }""", {"q": lead["company"]})
+        norm = lambda s: re.sub(r"[^a-z0-9]", "", re.sub(r"\b(llc|inc|co|corp|company|ltd)\b", "", (s or "").lower()))
+        for cu in ((r.get("customers") or {}).get("nodes") or []) if "error" not in r else []:
+            if norm(cu.get("companyName")) == norm(lead["company"]) and cu.get("primaryContact"):
+                return cu["primaryContact"]["id"], cu["id"], cu["companyName"], cu.get("orderCount") or 0, "company"
+    return None
+
+
+def _weblead_process(payload: dict, dry_run: bool = False, force: bool = False) -> dict:
+    lead = _wl_parse(payload)
+    kind = _wl_classify(lead)
+    if kind and not force:
+        return {"result": kind, "lead": lead}
+    key = _hashlib.sha256(f"{lead['email']}|{lead['details'][:200]}".encode()).hexdigest()[:20]
+    seen = _goods_json("weblead_seen.json", {})
+    if key in seen and not dry_run and not force:
+        return {"result": "duplicate", "lead": lead, "quote": seen[key]}
+    existing = _wl_find_existing(lead)
+    need, future = _wl_need_by(lead["need_by"])
+    due = need if future else (_central_now().date() + timedelta(days=14))
+    company = lead["company"] or lead["name"]
+    stamp = _central_now().strftime("%m/%d %-I:%M%p").lower()
+    note = [f"WEB LEAD (auto · {stamp})",
+            f"Interested in: {lead['interested'] or '—'}",
+            f"Quantity: {lead['quantity'] or '—'}",
+            f"Need by: {lead['need_by'] or '—'}" + ("" if future or not lead["need_by"] else " (date passed or unreadable — due set 2 weeks out)"),
+            f"Details: {lead['details'] or '—'}",
+            f"Contact: {lead['name']} · {lead['email']} · {lead['phone'] or 'no phone'}"]
+    if existing and existing[4] == "company":
+        note.append(f"NOTE: new person at an existing customer — add {lead['name']} as a contact.")
+    if lead["landing"]:
+        note.append(f"Form page: {lead['landing']}")
+    plan = {"existing": existing, "company": company, "due": due.isoformat(), "note": "\n".join(note),
+            "files": lead["files"]}
+    if dry_run:
+        return {"result": "dry_run", "lead": lead, "plan": plan}
+    owner = _wl_owner_id()
+    if existing:
+        contact_id = existing[0]
+    else:
+        inp = {"companyName": company,
+               "primaryContact": {"firstName": lead["first"], "lastName": lead["last"],
+                                  "email": [lead["email"]], "phone": lead["phone"] or None}}
+        if owner:
+            inp["owner"] = {"id": owner}
+        r = query_printavo("""mutation($input: CustomerCreateInput!) { customerCreate(input: $input) {
+            id companyName primaryContact { id } } }""", {"input": inp})
+        if "error" in r or not (r.get("customerCreate") or {}).get("primaryContact"):
+            raise RuntimeError(f"customerCreate failed: {r.get('error') or r}")
+        contact_id = r["customerCreate"]["primaryContact"]["id"]
+    time.sleep(PAGE_DELAY_S)
+    svc = (lead["interested"].split(",")[0].strip() if lead["interested"] else "")
+    q_in = {"contact": {"id": contact_id},
+            "nickname": f"{company[:40]} — web lead" + (f" ({svc})" if svc else ""),
+            "dueAt": f"{due.isoformat()}T17:00:00Z", "customerDueAt": due.isoformat(),
+            "productionNote": plan["note"]}
+    if owner:
+        q_in["owner"] = {"id": owner}
+    r = query_printavo("""mutation($input: QuoteCreateInput!) { quoteCreate(input: $input) {
+        id visualId } }""", {"input": q_in})
+    if "error" in r or not r.get("quoteCreate"):
+        raise RuntimeError(f"quoteCreate failed: {r.get('error') or r}")
+    quote = r["quoteCreate"]
+    files_ok = 0
+    for url in lead["files"]:
+        time.sleep(PAGE_DELAY_S)
+        fr = query_printavo("""mutation($parentId: ID!, $url: String!) {
+            productionFileCreate(parentId: $parentId, publicFileUrl: $url) { id } }""",
+            {"parentId": quote["id"], "url": url})
+        files_ok += 1 if "error" not in fr else 0
+    seen[key] = quote["visualId"]
+    _goods_json_save("weblead_seen.json", seen)
+    return {"result": "created", "lead": lead, "plan": plan, "quote": quote["visualId"],
+            "quote_id": quote["id"], "files": files_ok, "new_customer": not existing}
+
+
+def _weblead_slack(res: dict) -> str:
+    lead = res["lead"]
+    if res["result"] == "created":
+        ex = res["plan"]["existing"]
+        who = ("🆕 new customer" if res["new_customer"] else
+               f"🔁 RETURNING customer ({ex[3]} past orders)" if ex[4] == "email" else
+               f"🔁 existing customer {ex[2]} — new contact, add them")
+        return (f"🌐 *Web lead → Printavo quote #{res['quote']}* — {res['plan']['company']} · {who}\n"
+                f"{lead['interested'] or 'service not picked'} · qty {lead['quantity'] or '—'} · "
+                f"need by {lead['need_by'] or '—'}\n{lead['name']} · {lead['phone'] or 'no phone'} · {lead['email']}"
+                + (f"\n“{lead['details'][:300]}”" if lead["details"] else "")
+                + (f"\n{res['files']} file(s) in Production Files" if res.get("files") else ""))
+    if res["result"] == "pitch":
+        return (f"🌐 Web form skipped as a likely pitch, not entered in Printavo: {lead['name']} "
+                f"({lead['company'] or lead['email']}) — “{lead['details'][:200]}”. If it's real, say so and enter it.")
+    return ""
+
+
+def _weblead_run(payload: dict):
+    try:
+        res = _weblead_process(payload)
+        print(f"[WEBLEAD] {res['result']} {res['lead'].get('email')} {res.get('quote', '')}", flush=True)
+        msg = _weblead_slack(res)
+        if msg:
+            _post_cogs_dm(msg, recipients=WEBLEAD_NOTIFY)
+    except Exception as e:
+        print(f"[WEBLEAD] failed: {e}", flush=True)
+        _post_cogs_dm(f"⚠️ Web lead NOT entered in Printavo ({e}). Payload email: "
+                      f"{(payload or {}).get('email', '?')} — enter it by hand.",
+                      recipients=WEBLEAD_NOTIFY + ",U0504FSDYB0")
+
+
+@mcp.custom_route("/hooks/website-lead/{token}", methods=["POST"])
+async def _weblead_route(request):
+    from starlette.responses import JSONResponse
+    if not WEBLEAD_ENABLED or request.path_params.get("token") != _weblead_token():
+        return JSONResponse({"ok": False}, status_code=404)
+    try:
+        ctype = request.headers.get("content-type", "")
+        if "json" in ctype:
+            payload = await request.json()
+        else:
+            form = await request.form()
+            payload = {k: (form.getlist(k) if len(form.getlist(k)) > 1 else form.get(k)) for k in form.keys()}
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad body"}, status_code=400)
+    threading.Thread(target=_weblead_run, args=(payload,), daemon=True).start()
+    return JSONResponse({"ok": True})
+
+
+@mcp.tool()
+def website_lead_test(payload_json: str, dry_run: bool = True, force: bool = False, cleanup: bool = False) -> str:
+    """Test the website-lead → Printavo intake with a JSON form payload (keys like name,
+    company, email, phone, interested_in, need_by, quantity, details, file_upload).
+    dry_run (default) shows what would be created. force=True processes even test/pitch
+    entries (for an end-to-end test). Also prints the webhook URL to paste into WPForms."""
+    url = f"https://printavo-mcp-147806931173.us-central1.run.app/hooks/website-lead/{_weblead_token()}"
+    try:
+        payload = json.loads(payload_json) if payload_json.strip() else {}
+    except ValueError as e:
+        return f"Bad JSON: {e}\nWebhook URL: {url}"
+    if not payload:
+        return f"Webhook URL for WPForms: {url}"
+    try:
+        res = _weblead_process(payload, dry_run=dry_run, force=force)
+    except Exception as e:
+        return f"Failed: {e}\nWebhook URL: {url}"
+    out = [f"Result: {res['result']}"]
+    if res.get("plan"):
+        p = res["plan"]
+        ex = p["existing"]
+        out.append(f"Customer: {'EXISTING ' + str(ex[2]) + ' (matched by ' + ex[4] + ')' if ex else 'NEW — ' + p['company']}")
+        out.append(f"Due: {p['due']} · files: {len(p['files'])}")
+        out.append("Production note:\n" + p["note"])
+    if res.get("quote"):
+        out.append(f"Quote #{res['quote']} created.")
+        out.append("Slack to Clint would read:\n" + _weblead_slack(res))
+        if cleanup and res.get("quote_id"):
+            d = query_printavo("mutation($id: ID!) { quoteDelete(id: $id) { id } }", {"id": res["quote_id"]})
+            out.append(f"Cleanup: quote deleted {'OK' if 'error' not in d else d['error']}")
+            if res.get("new_customer"):
+                time.sleep(PAGE_DELAY_S)
+                ex = _wl_find_existing(res["lead"])
+                if ex:
+                    d = query_printavo("mutation($id: ID!) { customerDelete(id: $id) { id } }", {"id": ex[1]})
+                    out.append(f"Cleanup: customer deleted {'OK' if 'error' not in d else d['error']}")
+            seen = _goods_json("weblead_seen.json", {})
+            _goods_json_save("weblead_seen.json", {k: v for k, v in seen.items() if v != res["quote"]})
+    out.append(f"\nWebhook URL for WPForms: {url}")
+    return "\n".join(out)
+
+
 @mcp.tool()
 def sanmar_related(style: str) -> str:
     """SanMar's own related styles for a product (Substitutable / Common Grouping /

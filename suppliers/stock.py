@@ -44,12 +44,12 @@ def _sk(c):
 
 
 def _pick_colors(colors, want):
-    """Exact > contains > same skeleton > skeleton contains."""
+    """Exact > same skeleton (abbreviation) > contains > skeleton contains."""
     if not want:
         return sorted(colors)
     w, ws = _cn(want), _sk(want)
-    for test in (lambda c: _cn(c) == w, lambda c: w in _cn(c),
-                 lambda c: _sk(c) == ws, lambda c: ws and ws in _sk(c)):
+    for test in (lambda c: _cn(c) == w, lambda c: _sk(c) == ws,
+                 lambda c: w in _cn(c), lambda c: ws and ws in _sk(c)):
         hit = sorted(c for c in colors if test(c))
         if hit:
             return hit

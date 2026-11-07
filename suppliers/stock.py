@@ -32,8 +32,16 @@ def _skey(s):
     return (_ORDER.index(s) if s in _ORDER else 99, s)
 
 
+_ABBR = {"ht": "heather", "htr": "heather", "hthr": "heather", "hth": "heather", "athl": "athletic",
+         "dk": "dark", "lt": "light", "vtg": "vintage", "nvy": "navy", "grn": "green", "bl": "blue",
+         "gry": "grey", "gray": "grey", "prpl": "purple", "blk": "black", "wht": "white", "org": "orange",
+         "ylw": "yellow", "chrcl": "charcoal", "roy": "royal", "elec": "electric", "trbl": "triblend"}
+
+
 def _cn(c):
-    return re.sub(r"[^a-z0-9]", "", (c or "").lower())
+    """Normalize a color: split SanMar camelCase ('HthrNavy'), expand abbreviations."""
+    words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])", " ", c or "").lower())
+    return "".join(_ABBR.get(w, w) for w in words if w)
 
 
 def _sk(c):
@@ -71,6 +79,18 @@ def _near(supplier, whs):
     return max(have.items(), key=lambda x: x[1]) if have else None
 
 
+_NEED = {}
+
+
+def _best(picked, by):
+    """Several colors matched -> the one that covers the most needed sizes, then most stock."""
+    def score(c):
+        rows = by.get(c, {})
+        cover = sum(1 for z, q in _NEED.items() if z in rows and rows[z]["stock"] >= (q or 1))
+        return (cover, len(rows), sum(r["stock"] for r in rows.values()))
+    return sorted(picked, key=score, reverse=True)
+
+
 def _money(x):
     return f"${x:,.2f}"
 
@@ -93,13 +113,16 @@ def sanmar_side(style, color):
         pass
     colors = sorted({r["color"] for r in inv})
     picked = _pick_colors(colors, color)
-    rows = {}
+    by = {}
     for r in inv:
-        if r["color"] in picked[:1]:
+        if r["color"] in picked:
             sz = norm_size(r["size"])
-            rows[sz] = {"stock": r["total"], "price": prices.get((_cn(r["color"]), sz)) or prices.get(("sk:" + _sk(r["color"]), sz)),
-                        "top": _near("SanMar", r["warehouses"])}
-    return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked, "rows": rows}
+            by.setdefault(r["color"], {})[sz] = {
+                "stock": r["total"], "top": _near("SanMar", r["warehouses"]),
+                "price": prices.get((_cn(r["color"]), sz)) or prices.get(("sk:" + _sk(r["color"]), sz))}
+    picked = _best(picked, by)
+    return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked,
+            "rows": by.get(picked[0], {}) if picked else {}}
 
 
 # SanMar prefixes some outside brands; S&S lists them by the bare number.
@@ -116,14 +139,17 @@ def ss_side(style, color, brand=""):
         return {"supplier": "S&S", "found": False}
     colors = sorted({i.get("colorName") or "" for i in items})
     picked = _pick_colors(colors, color)
-    rows = {}
+    by = {}
     for i in items:
-        if i.get("colorName") in picked[:1]:
+        if i.get("colorName") in picked:
+            rows = by.setdefault(i.get("colorName"), {})
             sz = norm_size(i.get("sizeName"))
             price = next((float(i[f]) for f in ("customerPrice", "salePrice", "casePrice", "piecePrice")
                           if isinstance(i.get(f), (int, float)) and i[f] > 0), None)
             whs = [(w.get("warehouseAbbr") or "?", int(w.get("qty") or 0)) for w in (i.get("warehouses") or [])]
             rows[sz] = {"stock": int(i.get("qty") or 0), "price": price, "top": _near("S&S", whs)}
+    picked = _best(picked, by)
+    rows = by.get(picked[0], {}) if picked else {}
     styles = sorted({f"{i.get('brandName', '')} {i.get('styleName', '')}".strip() for i in items})
     return {"supplier": "S&S", "found": True, "colors": colors, "picked": picked, "rows": rows,
             "styles": styles}
@@ -131,6 +157,8 @@ def ss_side(style, color, brand=""):
 
 def check(style, color="", sizes="", brand=""):
     need = parse_need(sizes)
+    _NEED.clear()
+    _NEED.update(need)
     sides = []
     for fn in (lambda: sanmar_side(style, color), lambda: ss_side(style, color, brand)):
         try:

@@ -150,9 +150,16 @@ def ss_side(style, color, brand=""):
             sz = norm_size(i.get("sizeName"))
             price = next((float(i[f]) for f in ("customerPrice", "salePrice", "casePrice", "piecePrice")
                           if isinstance(i.get(f), (int, float)) and i[f] > 0), None)
-            whs = [(w.get("warehouseAbbr") or "?", int(w.get("qty") or 0)) for w in (i.get("warehouses") or [])]
-            rows[sz] = {"stock": int(i.get("qty") or 0), "price": price, "top": _near("S&S", whs)}
-    picked = _best(picked, by)
+            # drop-ship stock (abbr DS / dropship flag) isn't shelf stock and prices higher -> excluded
+            whs = [(w.get("warehouseAbbr") or "?", int(w.get("qty") or 0)) for w in (i.get("warehouses") or [])
+                   if not w.get("dropship") and (w.get("warehouseAbbr") or "").upper() != "DS"]
+            if not whs and (i.get("warehouses") or []):
+                continue
+            rows[sz] = {"stock": sum(q for _n, q in whs) if whs else int(i.get("qty") or 0),
+                        "price": price, "top": _near("S&S", whs)}
+    by = {c: r for c, r in by.items() if r}
+    colors = sorted(by) or colors
+    picked = _best([c for c in picked if c in by], by)
     rows = by.get(picked[0], {}) if picked else {}
     styles = sorted({f"{i.get('brandName', '')} {i.get('styleName', '')}".strip() for i in items})
     return {"supplier": "S&S", "found": True, "colors": colors, "picked": picked, "rows": rows,

@@ -7227,6 +7227,16 @@ def blank_check(style: str, color: str = "", sizes: str = "", brand: str = "", s
 
 
 @mcp.tool()
+def sanmar_related(style: str) -> str:
+    """SanMar's own related styles for a product (Substitutable / Common Grouping /
+    Companion Sell) from its product data. blank_check uses these for substitutes."""
+    def run():
+        rel = _sanmar.related(style.strip())
+        return (f"{style}: " + "; ".join(f"{t}: {p}" for t, p in rel)) if rel else f"SanMar lists no related styles for {style}."
+    return _sanmar_run(run)
+
+
+@mcp.tool()
 def sanmar_health_check() -> str:
     """Confirms the SanMar API login works (prices one PC61)."""
     return _sanmar_run(_sanmar.health) if _sanmar else _sanmar_run(lambda: None)

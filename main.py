@@ -7401,7 +7401,7 @@ def _wl_get(d, *keys):
         if isinstance(v, list):
             v = ", ".join(str(x) for x in v if x)
         if v not in (None, "") and str(v).strip():
-            return str(v).strip()
+            return re.sub(r"\s*[\r\n]+\s*", ", ", str(v).strip())
     return ""
 
 

@@ -6903,10 +6903,22 @@ except Exception as _e:  # pragma: no cover
     _goods = None
     _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | goods: {_e!r}"
 
-GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "false").lower() not in ("0", "false", "no", "off")
+GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "true").lower() not in ("0", "false", "no", "off")
 GOODS_NOTES_HOURS_CT = [int(h) for h in os.environ.get("GOODS_NOTES_HOURS_CT", "8,12,16").split(",") if h.strip()]
 GOODS_ALERT_USERS = os.environ.get("GOODS_ALERT_USERS", "U07VDHDSMUJ,U07VDET3XEX,U0504FSDYB0")  # Clint, Mechelle, Luke
-_GOODS_STATUSES = ("VERIFY GOODS", "DIRECT - WAITING ON GOODS")
+# Luke, Nov 6: every DIRECT order past ORDER GOODS until it's done in production.
+# Alerts only while goods still matter (art stage → the goods gate); once an order is in
+# its lane the note keeps updating but nobody gets pinged. Contract customers are skipped
+# (customer-supplied goods); PROMO / CONTRACT / closed statuses are out of scope.
+_GOODS_ALERT_STATUSES = ("PROOF REQUESTED", "ART APPROVAL SENT", "ART APPROVED", "ARTWORK DECLINED",
+                         "VERIFY GOODS", "DIRECT - WAITING ON GOODS")
+_GOODS_STATUSES = _GOODS_ALERT_STATUSES + (
+    "SP - PRE-PRO", "SP - READY", "SP - IN PRODUCTION",
+    "EMB - ORDER DIGITIZING", "EMB - PRE-PRO", "EMB - SEW OUT APPROVAL SENT", "EMB SEW OUT DECLINED",
+    "EMB - READY", "EMB - IN PRODUCTION",
+    "DTF - ORDER TRANSFER", "DTF - PRE-PRO", "DTF - READY", "DTF - IN PRODUCTION",
+    "STORE - PRE PRO", "STORE - READY", "STORE - IN PRODUCTION",
+    "ORDER ON HOLD - ISSUE")
 
 
 def _goods_json(name, default):
@@ -6935,6 +6947,9 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
     for st in _GOODS_STATUSES:
         q = _fetch_orders_in_status(st)
         if "error" in q:
+            if "not found in Printavo" in q["error"]:      # a renamed status shouldn't kill the run
+                print(f"[GOODS] {q['error']}", flush=True)
+                continue
             raise RuntimeError(f"{st}: {q['error']}")
         for o in q["orders"]:
             o["status"] = st
@@ -6992,7 +7007,8 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
                 infos.append((str(so.get("poNumber")), info))
         has_po = bool(infos)
         prod = o["prod"].date() if o.get("prod") else None
-        exc = _goods.exceptions_for(vid, prod, infos, has_po, today=today)
+        exc = (_goods.exceptions_for(vid, prod, infos, has_po, today=today)
+               if o["status"] in _GOODS_ALERT_STATUSES else [])
         block = None
         if has_po:
             stamp = _central_now().strftime("%m/%d %-I:%M%p").lower()

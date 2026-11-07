@@ -7207,18 +7207,21 @@ except Exception as _e:  # pragma: no cover
 
 
 @mcp.tool()
-def blank_check(style: str, color: str = "", sizes: str = "", brand: str = "") -> str:
+def blank_check(style: str, color: str = "", sizes: str = "", brand: str = "", substitutes: bool = False) -> str:
     """BEFORE QUOTING (Clint): live stock + Est Merch's price at SanMar AND S&S for one
     blank, checked against the sizes the job needs, with the cheapest supplier that can
     fill the whole run and the blank cost.
     style: e.g. PC61, 5000, BC3001, ST350. color: plain words, partial OK ("forest",
     "heather navy"). sizes: "S10 M30 L40 XL20 2XL10" (or "M L XL" for stock only).
     brand: only if S&S says the style matches several brands (e.g. "Gildan").
-    Leave color blank to list the colors offered."""
+    Leave color blank to list the colors offered.
+    SUBSTITUTES are added automatically when the blank can't fill the run (close colors in
+    the same style, Est Merch swap list, SanMar related products); substitutes=True shows
+    them even when it can."""
     if _stock is None:
         return f"Blank check unavailable: {_SANMAR_IMPORT_ERR}"
     try:
-        return _stock.check(style.strip(), color.strip(), sizes, brand.strip())
+        return _stock.check(style.strip(), color.strip(), sizes, brand.strip(), substitutes)
     except Exception as e:
         return f"Blank check failed: {e}"
 

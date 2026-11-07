@@ -1,0 +1,14 @@
+{
+  "_note": "Est Merch swap list (Luke, Nov 6 2026) - blanks we treat as equivalent when the asked-for one can't fill the run. One group per line of like-for-like blanks. style = the number as SanMar/Printavo knows it; brand = needed only for S&S when the bare number is shared across brands. STARTER LIST - edit freely: add, remove, reorder (first = preferred).",
+  "groups": [
+    {"name": "Heavy cotton tee", "styles": [{"style": "PC61"}, {"style": "5000", "brand": "Gildan"}, {"style": "5280", "brand": "Hanes"}]},
+    {"name": "Heavy cotton long sleeve", "styles": [{"style": "PC61LS"}, {"style": "5400", "brand": "Gildan"}]},
+    {"name": "Youth heavy cotton tee", "styles": [{"style": "PC61Y"}, {"style": "5000B", "brand": "Gildan"}]},
+    {"name": "Soft ringspun tee", "styles": [{"style": "BC3001"}, {"style": "NL3600"}, {"style": "64000", "brand": "Gildan"}, {"style": "DT6000"}, {"style": "PC450"}]},
+    {"name": "CVC blend tee", "styles": [{"style": "BC3001CVC"}, {"style": "NL6210"}]},
+    {"name": "Tri-blend tee", "styles": [{"style": "BC3413"}, {"style": "NL6010"}, {"style": "DM130"}]},
+    {"name": "50/50 tee", "styles": [{"style": "PC55"}, {"style": "8000", "brand": "Gildan"}, {"style": "29M", "brand": "JERZEES"}]},
+    {"name": "Hooded sweatshirt", "styles": [{"style": "PC78H"}, {"style": "18500", "brand": "Gildan"}, {"style": "996M", "brand": "JERZEES"}]},
+    {"name": "Crewneck sweatshirt", "styles": [{"style": "PC78"}, {"style": "18000", "brand": "Gildan"}, {"style": "562M", "brand": "JERZEES"}]}
+  ]
+}

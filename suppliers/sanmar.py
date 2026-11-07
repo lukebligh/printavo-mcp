@@ -421,3 +421,41 @@ def normalized_invoices(start, end):
                     "po": inv["po"], "goods": f(inv["subtotal"]), "freight": f(inv["freight"]),
                     "tax": f(inv["tax"]), "total": f(inv["total"]), "lines": lines})
     return out
+
+
+# ─────────────────────────── Related products (PromoStandards Product Data V2) ───────────────────────────
+
+_REL_CACHE = {}
+
+
+def related(style):
+    """SanMar's own related styles for a product: [(relationType, productId)], e.g.
+    Substitutable / Companion Sell / Common Grouping. Cached 24h per style."""
+    key = style.strip().upper()
+    hit = _REL_CACHE.get(key)
+    if hit and time.time() - hit[0] < 86400:
+        return hit[1]
+    u, p = _creds()
+    body = (f"<ns:GetProductRequest><shar:wsVersion>2.0.0</shar:wsVersion><shar:id>{u}</shar:id>"
+            f"<shar:password>{p}</shar:password><shar:localizationCountry>us</shar:localizationCountry>"
+            f"<shar:localizationLanguage>en</shar:localizationLanguage>"
+            f"<shar:productId>{escape(style)}</shar:productId></ns:GetProductRequest>")
+    root, last = None, None
+    for path in ("/promostandards/ProductDataServiceBindingV2", "/promostandards/ProductDataServiceV2.xml"):
+        try:
+            root = _post(path, body, _ps("ProductDataService", "2.0.0"), timeout=90)
+            break
+        except SanMarError as e:      # guide lists both URLs; use whichever answers
+            last = e
+    else:
+        raise last
+    out = []
+    if root is not None:
+        seen = set()
+        for rp in _all(root, "RelatedProduct"):
+            t, pid = _t(rp, "relationType"), _t(rp, "productId")
+            if pid and pid.upper() != key and (t, pid.upper()) not in seen:
+                seen.add((t, pid.upper()))
+                out.append((t, pid))
+    _REL_CACHE[key] = (time.time(), out)
+    return out

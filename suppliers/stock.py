@@ -1,7 +1,11 @@
 """Blank check for Clint (Luke, Nov 6 2026): live stock + OUR price at SanMar and S&S
 for one style/color, sized against what the job needs. Answers "can we get it, from
 whom, and what do the blanks cost" before a quote goes out. Read-only."""
+import json
+import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from suppliers import sanmar as _sm, ss as _ss
 
@@ -115,13 +119,13 @@ def sanmar_side(style, color):
     picked = _pick_colors(colors, color)
     by = {}
     for r in inv:
-        if r["color"] in picked:
-            sz = norm_size(r["size"])
+        sz = norm_size(r["size"])
+        if True:
             by.setdefault(r["color"], {})[sz] = {
                 "stock": r["total"], "top": _near("SanMar", r["warehouses"]),
                 "price": prices.get((_cn(r["color"]), sz)) or prices.get(("sk:" + _sk(r["color"]), sz))}
     picked = _best(picked, by)
-    return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked,
+    return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked, "by": by,
             "rows": by.get(picked[0], {}) if picked else {}}
 
 
@@ -141,7 +145,7 @@ def ss_side(style, color, brand=""):
     picked = _pick_colors(colors, color)
     by = {}
     for i in items:
-        if i.get("colorName") in picked:
+        if True:
             rows = by.setdefault(i.get("colorName"), {})
             sz = norm_size(i.get("sizeName"))
             price = next((float(i[f]) for f in ("customerPrice", "salePrice", "casePrice", "piecePrice")
@@ -152,10 +156,149 @@ def ss_side(style, color, brand=""):
     rows = by.get(picked[0], {}) if picked else {}
     styles = sorted({f"{i.get('brandName', '')} {i.get('styleName', '')}".strip() for i in items})
     return {"supplier": "S&S", "found": True, "colors": colors, "picked": picked, "rows": rows,
-            "styles": styles}
+            "styles": styles, "by": by}
 
 
-def check(style, color="", sizes="", brand=""):
+# ─────────────────────────── Substitutes ───────────────────────────
+# Color families: a "close color" swap only within the same family.
+_FAMILIES = [
+    ["forest", "hunter", "evergreen", "darkgreen", "bottle", "pine", "spruce"],
+    ["kelly", "irishgreen", "clover", "sportgreen"],
+    ["navy", "midnight", "darknavy", "deepnavy", "oxfordnavy"],
+    ["royal", "cobalt", "sapphire", "trueroyal"],
+    ["red", "truered", "fire", "scarlet", "cherry", "candyapple"],
+    ["maroon", "cardinal", "burgundy", "garnet", "cranberry", "wine", "oxblood"],
+    ["black", "jetblack", "deepblack", "vintageblack"],
+    ["charcoal", "darkheather", "graphite", "darkgrey", "asphalt", "smoke"],
+    ["ash", "sportgrey", "athleticheather", "heathergrey", "lightgrey", "oxford", "silver", "greyheather"],
+    ["white", "brightwhite"],
+    ["orange", "texasorange", "burntorange", "safetyorange"],
+    ["gold", "yellow", "athleticgold", "goldenrod", "daisy"],
+    ["purple", "violet", "teampurple", "deeppurple"],
+    ["brown", "chocolate", "coffee", "darkchocolate", "espresso"],
+    ["sand", "khaki", "tan", "natural", "oatmeal", "cream", "heatherdust", "dust"],
+    ["olive", "military", "army", "militarygreen", "darkolive"],
+    ["pink", "lightpink", "azalea", "charitypink"],
+    ["carolina", "lightblue", "babyblue", "columbia", "skyblue"],
+]
+
+
+def _family(color):
+    c = _cn(color)
+    for fam in _FAMILIES:
+        if any(k in c for k in fam):
+            return fam
+    return []
+
+
+def _cover(rows):
+    """-> (ok, total$, short_sizes) for the current need against one color's size rows."""
+    total, short = 0.0, []
+    for z, q in _NEED.items():
+        r = rows.get(z)
+        if not r or r["stock"] < (q or 1):
+            short.append(z)
+            continue
+        if q and r["price"]:
+            total += q * r["price"]
+    return (not short, total, short)
+
+
+def _swaps():
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "swaps.json")) as f:
+            return json.load(f).get("groups", [])
+    except Exception:
+        return []
+
+
+def _base(style):
+    return style.strip().upper()
+
+
+def _equivalents(style):
+    """[(label, style, brand)] from the Est Merch swap list, then SanMar's related products."""
+    out, seen = [], {_base(style)}
+    for g in _swaps():
+        if any(_base(x["style"]) == _base(style) for x in g["styles"]):
+            for x in g["styles"]:
+                if _base(x["style"]) not in seen:
+                    seen.add(_base(x["style"]))
+                    out.append((f"swap list: {g['name']}", x["style"], x.get("brand", "")))
+    try:
+        for t, pid in _sm.related(style):
+            if _base(pid) not in seen and "substitut" in t.lower():
+                seen.add(_base(pid))
+                out.append(("SanMar: substitutable", pid, ""))
+        for t, pid in _sm.related(style):
+            if _base(pid) not in seen and "companion" not in t.lower():
+                seen.add(_base(pid))
+                out.append((f"SanMar: {t.lower()}", pid, ""))
+    except Exception:
+        pass
+    return out
+
+
+def _alt_colors(side, color, limit=3):
+    """Same style, close colors (same family) that cover the run, cheapest first."""
+    fam = _family(color)
+    if not fam or not side.get("found") or not side.get("by"):
+        return []
+    cur = side["picked"][0] if side.get("picked") else None
+    res = []
+    for c, rows in side["by"].items():
+        if c == cur or not any(k in _cn(c) for k in fam):
+            continue
+        ok, total, _ = _cover(rows)
+        if ok:
+            res.append((total, c))
+    return sorted(res)[:limit]
+
+
+def substitutes(style, color, sides):
+    lines = []
+    for sd in sides:
+        for total, c in _alt_colors(sd, color):
+            lines.append((total, f"  • {style} {c} @ {sd['supplier']} — covers it · {_money(total)}  (close color)"))
+    eq = _equivalents(style)[:5]
+
+    def look(e):
+        label, st, br = e
+        found = []
+        for fn in (lambda: sanmar_side(st, color), lambda: ss_side(st, color, br)):
+            try:
+                sd = fn()
+            except Exception:
+                continue
+            if not sd.get("found") or len(sd.get("styles", [])) > 1 or not sd.get("picked"):
+                continue
+            ok, total, short = _cover(sd["rows"])
+            if ok:
+                found.append((total, f"  • {(br + ' ') if br else ''}{st} {sd['picked'][0]} @ {sd['supplier']}"
+                                     f" — covers it · {_money(total)}  ({label})"))
+        return found
+
+    if eq and color:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for f in ex.map(look, eq):
+                lines += f
+    lines.sort(key=lambda x: x[0])
+    if not lines:
+        tried = ", ".join(e[1] for e in eq) or "none on the swap list"
+        return ["\nSUBSTITUTES: nothing found that covers the full run "
+                f"(close colors checked; styles tried: {tried})."]
+    return ["\nSUBSTITUTES (cheapest first):"] + [l for _t, l in lines[:8]]
+
+
+_LOCK = threading.Lock()   # _NEED is module state: one blank check at a time
+
+
+def check(style, color="", sizes="", brand="", subs=False):
+    with _LOCK:
+        return _check(style, color, sizes, brand, subs)
+
+
+def _check(style, color="", sizes="", brand="", subs=False):
     need = parse_need(sizes)
     _NEED.clear()
     _NEED.update(need)
@@ -231,6 +374,9 @@ def check(style, color="", sizes="", brand=""):
             line += f" ({_money(good[1][1] - best[1])} less than {good[1][2]})"
         out.append(line)
     elif verdicts:
-        out.append("\n⚠ Neither supplier can fill the full size run in this color — split it or pick another color.")
+        out.append("\n⚠ Neither supplier can fill the full size run in this color.")
+    no_color = color and not any(sd.get("picked") for sd in sides if sd.get("found"))
+    if need and any(need.values()) and color and (subs or not good or no_color):
+        out += substitutes(style, color, [sd for sd in sides if sd.get("found")])
     out.append("Stock is live right now, not reserved. Our price = Est Merch account price, before freight (free over $200 per supplier order).")
     return "\n".join(out)

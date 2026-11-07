@@ -62,3 +62,19 @@ def invoices_by_date(start, end):
                     "goods": _f(o.get("subtotal")), "freight": _f(o.get("shipping")) + fees,
                     "tax": _f(o.get("tax")), "total": _f(o.get("total")), "lines": lines})
     return out
+
+
+def recent_pos():
+    """PO strings for open orders plus everything placed in the last ~3 months."""
+    pos = set()
+    for params in ({"mediatype": "json"}, {"All": "True", "mediatype": "json"}):
+        try:
+            r = httpx.get(f"{BASE}/orders/", auth=_auth(), timeout=90, params=params)
+        except httpx.HTTPError as e:
+            raise SSError(f"S&S unreachable: {e}")
+        if r.status_code == 404:
+            continue
+        if r.status_code != 200:
+            raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
+        pos.update(str(o.get("poNumber") or "") for o in (r.json() or []) if o.get("poNumber"))
+    return pos

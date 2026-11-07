@@ -3677,6 +3677,19 @@ def _build_cogs_alert():
     if "error" in fetched:
         return f"⚠️ COGS alert could not run — {fetched['error']}", False
     missing, check = [], []
+    # After the supplier cutover, an order whose number is on a SanMar / S&S PO
+    # gets its COGS from the invoice automatically — not Mechelle's to enter.
+    covered = set()
+    try:
+        cut_dt = datetime.fromisoformat(COGS_SUPPLIER_CUTOVER).replace(tzinfo=timezone.utc)
+    except ValueError:
+        cut_dt = None
+    if cut_dt and _scogs is not None:
+        try:
+            pos = set(_sanmar._known_pos()) | set(_ss.recent_pos())
+            covered = {o for po in pos for o in _scogs.order_numbers(po)}
+        except Exception as e:
+            print(f"[COGS ALERT] supplier PO lookup failed: {e}", flush=True)
     for n in fetched["orders"]:
         status = (n.get("status") or {}).get("name", "")
         ns = _norm_status(status)
@@ -3685,6 +3698,9 @@ def _build_cogs_alert():
         if float(n.get("total") or 0) <= 0:
             continue
         if ((n.get("expenses") or {}).get("nodes")):
+            continue
+        created = _parse_iso((n.get("timestamps") or {}).get("createdAt"))
+        if cut_dt and created and created >= cut_dt and str(n.get("visualId")) in covered:
             continue
         if _cogs_is_contract_customer(n):
             continue
@@ -3811,6 +3827,9 @@ COGS_SHEET_TAB      = os.environ.get("COGS_SHEET_TAB", "Daily Sales 2026")
 COGS_FILL_DAYS      = int(os.environ.get("COGS_FILL_DAYS", "35"))   # by Process Date (col A)
 COGS_FILL_HOUR_CT   = int(os.environ.get("COGS_FILL_HOUR_CT", "6"))
 COGS_DISAGREE_USD   = 5.0
+# From this Process Date on, SanMar + S&S goods come from supplier invoices and
+# Mechelle enters only promo / other-vendor cost in Printavo (Luke, Nov 6 2026).
+COGS_SUPPLIER_CUTOVER = os.environ.get("COGS_SUPPLIER_CUTOVER", "2026-11-09")
 _SHEETS_API         = "https://sheets.googleapis.com/v4/spreadsheets"
 _gsa_creds          = None
 
@@ -3952,14 +3971,22 @@ def _run_cogs_fill_impl(dry_run: bool = False) -> dict:
         if (_cogs_num(cell(vals, i, 3)) or 0) <= 0:
             continue
         rows.append({"row": lo + i, "inv": inv, "job": str(cell(vals, i, 2) or ""),
-                     "f": _cogs_num(cell(vals, i, 5)),
+                     "f": _cogs_num(cell(vals, i, 5)), "date": _cogs_date(cell(vals, i, 0)),
                      "formula": str(cell(fform, i, 0) or "").startswith("=")})
     counts = {}
     for r in rows:
         counts[r["inv"]] = counts.get(r["inv"], 0) + 1
 
+    # Nov 6 2026 (Luke): rows on/after COGS_SUPPLIER_CUTOVER get COGS = SanMar + S&S
+    # invoices (auto) + Printavo expenses (Mechelle: promo / other vendors only).
+    # Earlier rows keep Printavo expenses. Either way F is UPDATED when the source
+    # changes (it used to fill blanks only, so later expenses never reached the sheet).
     flags, errors, plan = [], [], {}
-    todo = [r for r in rows if not r["formula"] and (r["f"] is None or r["f"] == 0)]
+    try:
+        cut = datetime.fromisoformat(COGS_SUPPLIER_CUTOVER).date()
+    except ValueError:
+        cut = None
+    todo = [r for r in rows if not r["formula"]]
     dups = [r for r in todo if counts[r["inv"]] > 1]
     for r in dups:
         flags.append(f"#{r['inv']} is on {counts[r['inv']]} Direct rows (row {r['row']}) — not filled, double-count risk")
@@ -3968,38 +3995,72 @@ def _run_cogs_fill_impl(dry_run: bool = False) -> dict:
     for k in range(0, len(todo), 25):
         for res in _invoice_expenses_impl(",".join(r["inv"] for r in todo[k:k + 25])):
             found[res["visual_id"]] = res
+    supplier = {}
+    if cut and any(r["date"] and r["date"] >= cut for r in todo) and _scogs is not None:
+        try:
+            per_order, sflags, _skipped, serrs, _invs = _supplier_cogs(
+                (cut - timedelta(days=21)).isoformat(), _central_now().date().isoformat())
+            supplier = {o: v["cogs"] for o, v in per_order.items()}
+            row_invs = {r["inv"] for r in todo}
+            flags += [f for f in sflags if any(n in row_invs for n in _scogs.order_numbers(f.split('PO "', 1)[-1]))]
+            if serrs:
+                errors += serrs
+                supplier = None          # a supplier is down: don't write partial COGS
+        except Exception as e:
+            errors.append(f"supplier invoices: {e}")
+            supplier = None
     for r in todo:
         res = found.get(r["inv"]) or {}
         if not res.get("found") or res.get("error"):
             errors.append(f"#{r['inv']} (row {r['row']}): {res.get('error', 'no result')}")
             continue
-        cogs = float(res.get("cogs") or 0)
+        exp_cogs = round(float(res.get("cogs") or 0), 2)
+        post = bool(cut and r["date"] and r["date"] >= cut)
+        if post:
+            if supplier is None:
+                continue
+            sup = supplier.get(r["inv"], 0.0)
+            if sup and exp_cogs and abs(exp_cogs - sup) <= max(5.0, 0.10 * sup):
+                flags.append(f"#{r['inv']}: Printavo expense ${exp_cogs:,.2f} ≈ SanMar/S&S invoice ${sup:,.2f} — "
+                             f"looks double-entered, used the invoice only (Mechelle: remove the expense)")
+                cogs = sup
+            else:
+                cogs = round(sup + exp_cogs, 2)
+        else:
+            cogs = exp_cogs
         if cogs <= 0:
             continue
-        plan[r["row"]] = (r["inv"], round(cogs, 2))
-        exps = res.get("expenses") or []
-        if len(exps) > 2:
-            flags.append(f"#{r['inv']} (row {r['row']}): {len(exps)} expense lines → ${cogs:,.2f}")
-        for e in exps:
+        if r["f"] is not None and abs(cogs - r["f"]) < 0.5:
+            continue
+        plan[r["row"]] = (r["inv"], cogs, r["f"])
+        for e in res.get("expenses") or []:
             nm = str(e.get("name") or "").lower()
             if any(w in nm for w in ("ship", "ups", "fedex", "freight", "card", "fee")):
                 flags.append(f"#{r['inv']} (row {r['row']}): expense '{e.get('name')}' looks like a fee — included")
 
     written = []
     if plan and not dry_run:
-        # Re-read the target cells right before writing; skip any that filled up.
+        # Re-read the target cells right before writing; skip any someone changed
+        # since we read them (or that became formulas).
         order = list(plan)
         got = _sheets_get([f"{tab}!F{row}" for row in order], render="FORMULA")
         fresh = {row: (g[0][0] if g and g[0] else None) for row, g in zip(order, got)}
-        safe = {row: val for row, (inv, val) in plan.items()
-                if _cogs_num(fresh[row]) in (None, 0) and not str(fresh[row] or "").startswith("=")}
+        safe = {}
+        for row, (inv, val, old) in plan.items():
+            if str(fresh[row] or "").startswith("="):
+                continue
+            now_v = _cogs_num(fresh[row])
+            if (now_v or 0) != (old or 0):
+                flags.append(f"#{inv} (row {row}): F changed during the run — skipped")
+                continue
+            safe[row] = val
         n = _sheets_write_cells(safe)
         sorder = list(safe)
         got = _sheets_get([f"{tab}!F{row}" for row in sorder]) if sorder else []
         check = {row: (g[0][0] if g and g[0] else None) for row, g in zip(sorder, got)}
         for row, val in safe.items():
             if abs((_cogs_num(check[row]) or 0) - val) < 0.005:
-                written.append([row, plan[row][0], val])
+                written.append([row, plan[row][0], val, plan[row][2]])
             else:
                 errors.append(f"row {row} (#{plan[row][0]}): write did not verify (reads {check[row]})")
         if n != len(safe):
@@ -4007,7 +4068,7 @@ def _run_cogs_fill_impl(dry_run: bool = False) -> dict:
         _cogs_fill_log_append({"at": datetime.now(timezone.utc).isoformat(), "written": written})
     return {"window_rows": f"{lo + min(window)}–{last}" if window else "none",
             "cutoff": cutoff.isoformat(), "direct_rows": len(rows),
-            "planned": [[row, inv, val] for row, (inv, val) in plan.items()],
+            "planned": [[row, inv, val, old] for row, (inv, val, old) in plan.items()],
             "written": written, "flags": flags, "errors": errors}
 
 
@@ -4018,7 +4079,8 @@ def _cogs_fill_text(rep: dict, dry_run: bool) -> str:
     lines = [f"{head}*COGS fill* · rows {rep['window_rows']} (since {rep['cutoff']}) · "
              f"{rep['direct_rows']} Direct rows checked",
              f"{'Would write' if dry_run else 'Wrote'} {len(rows)} cell(s), ${total:,.2f}"]
-    lines += [f"• row {r[0]} · #{r[1]} · ${r[2]:,.2f}" for r in rows]
+    lines += [f"• row {r[0]} · #{r[1]} · " + (f"${r[3]:,.2f} → " if len(r) > 3 and r[3] else "") + f"${r[2]:,.2f}"
+              for r in rows]
     if rep["flags"]:
         lines.append("\n📝 *Flags*")
         lines += [f"• {f}" for f in rep["flags"]]
@@ -4031,9 +4093,11 @@ def _cogs_fill_text(rep: dict, dry_run: bool) -> str:
 @mcp.tool()
 def run_cogs_fill(dry_run: bool = True) -> str:
     """
-    Fill 'Daily Sales 2026'!F (COGS) from Printavo Payment/Expenses for Direct
-    rows whose Process Date is in the last 35 days. Writes only blank or $0
-    cells; never overwrites a value or a formula; verifies every write.
+    Keep 'Daily Sales 2026'!F (COGS) current for Direct rows whose Process Date
+    is in the last 35 days. Rows on/after COGS_SUPPLIER_CUTOVER (Nov 9 2026):
+    SanMar + S&S invoice cost + Printavo expenses (promo/other vendors). Earlier
+    rows: Printavo expenses. Updates F when the source changes; never touches a
+    formula; skips a cell someone changed mid-run; verifies every write.
     dry_run defaults to TRUE here — pass dry_run=false to write. The 6:00 AM CT
     daily schedule writes for real.
     """
@@ -4046,6 +4110,30 @@ def run_cogs_fill(dry_run: bool = True) -> str:
 
 _last_cogs_fill_date = None
 
+
+def _cogs_new_flags(flags: list) -> list:
+    """Drop flags already sent on an earlier morning (the fill re-reads 35 days,
+    so a combined-PO split would otherwise repeat every day). Kept 60 days."""
+    p = "/data/cogs_flags_seen.json" if os.path.isdir("/data") else ""
+    if not p:
+        return flags
+    try:
+        seen = json.load(open(p)) if os.path.exists(p) else {}
+    except Exception:
+        seen = {}
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=60)).isoformat()
+    seen = {k: v for k, v in seen.items() if v >= cutoff}
+    fresh = [f for f in flags if f not in seen]
+    for f in fresh:
+        seen[f] = now.isoformat()
+    try:
+        with open(p, "w") as fh:
+            json.dump(seen, fh)
+    except Exception:
+        pass
+    return fresh
+
 def run_cogs_fill_scheduler():
     """Background thread: every day at COGS_FILL_HOUR_CT (6 AM) Central. DMs
     Luke only when there are flags or errors — clean days are silent."""
@@ -4057,15 +4145,18 @@ def run_cogs_fill_scheduler():
                     and now_ct.hour == COGS_FILL_HOUR_CT and now_ct.minute < 10
                     and _last_cogs_fill_date != now_ct.date().isoformat()):
                 _last_cogs_fill_date = now_ct.date().isoformat()
+                to_mechelle = False
                 try:
                     rep = _run_cogs_fill_impl(dry_run=False)
+                    rep["flags"] = _cogs_new_flags(rep["flags"])   # each flag is sent once
                     text = _cogs_fill_text(rep, False)
                     noisy = rep["flags"] or rep["errors"]
+                    to_mechelle = any("Mechelle" in f for f in rep["flags"])
                 except Exception as e:
                     text, noisy = f"⚠️ COGS fill failed this morning: {e}", True
                 print(f"[COGS FILL] {text[:300]}", flush=True)
                 if noisy:
-                    _post_cogs_dm(text, recipients="U0504FSDYB0")
+                    _post_cogs_dm(text, recipients="U0504FSDYB0,U07VDET3XEX" if to_mechelle else "U0504FSDYB0")
         except Exception as e:
             print(f"[COGS FILL] scheduler error: {e}", flush=True)
         time.sleep(120)

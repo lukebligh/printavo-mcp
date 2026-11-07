@@ -6903,7 +6903,7 @@ except Exception as _e:  # pragma: no cover
     _goods = None
     _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | goods: {_e!r}"
 
-GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "false").lower() not in ("0", "false", "no", "off")
 GOODS_NOTES_HOURS_CT = [int(h) for h in os.environ.get("GOODS_NOTES_HOURS_CT", "8,12,16").split(",") if h.strip()]
 GOODS_ALERT_USERS = os.environ.get("GOODS_ALERT_USERS", "U07VDHDSMUJ,U07VDET3XEX,U0504FSDYB0")  # Clint, Mechelle, Luke
 _GOODS_STATUSES = ("VERIFY GOODS", "DIRECT - WAITING ON GOODS")

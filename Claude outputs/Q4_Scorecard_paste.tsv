@@ -1,0 +1,58 @@
+Q4 2026 WEEKLY SCORECARD
+October 1 – December 31, 2026 · Reviewed every Monday in L10 · Quarterly Review: Dec 29
+VERSION 3.0 · OCTOBER 2026 · OWNER: LUKE BLIGH
+""
+RULE: every number is reported OUT LOUD by the person who owns it. Luke does not read them out.
+""
+""
+SALES & MARKETING
+#	METRIC	OWNER	GOAL	SOURCE	W1 10/5	W2 10/12	W3 10/19	W4 10/26	W5 11/2	W6 11/9	W7 11/16	W8 11/23	W9 11/30	W10 12/7	W11 12/14	W12 12/21	W13 12/28	13-WK AVG
+1	Weekly revenue	Luke	$20,000	Printavo / QBO														=AVERAGE(F10:R10)
+2	Inbound leads from Seafoam	Luke	18–27 / month	Seafoam report														=AVERAGE(F11:R11)
+3	Cost per lead	Luke	≤ $55  (alert > $70)	Google Ads														=AVERAGE(F12:R12)
+4	Lead → quote within 48 hrs	Clint	100%	Printavo														=AVERAGE(F13:R13)
+5	Quote → close rate	Clint	25%	Printavo														=AVERAGE(F14:R14)
+6	New direct revenue closed	Clint	$2,000	Printavo														=AVERAGE(F15:R15)
+""
+CUSTOMER SUCCESS
+#	METRIC	OWNER	GOAL	SOURCE	W1 10/5	W2 10/12	W3 10/19	W4 10/26	W5 11/2	W6 11/9	W7 11/16	W8 11/23	W9 11/30	W10 12/7	W11 12/14	W12 12/21	W13 12/28	13-WK AVG
+7	Reorder rate — direct customers ordering again within 90 days	Clint	BASELINE FIRST	Printavo														=AVERAGE(F19:R19)
+8	Pre-production touches, % of approved orders	Clint	100%	Printavo tasks														=AVERAGE(F20:R20)
+9	Customer response time	Clint	< 4 business hrs	Inbox / Printavo														=AVERAGE(F21:R21)
+""
+OPERATIONS
+#	METRIC	OWNER	GOAL	SOURCE	W1 10/5	W2 10/12	W3 10/19	W4 10/26	W5 11/2	W6 11/9	W7 11/16	W8 11/23	W9 11/30	W10 12/7	W11 12/14	W12 12/21	W13 12/28	13-WK AVG
+10	Weekly imprint count (all decoration)	Justin	4,997	Imprint Log														=AVERAGE(F25:R25)
+11	Misprint rate %	Justin	< 0.5%	Imprint Log														=AVERAGE(F26:R26)
+12	On-time delivery (OTIF)	Justin	100%	Printavo														=AVERAGE(F27:R27)
+13	Jobs scheduled without goods staged	Justin	0	Block sweep / Slack														=AVERAGE(F28:R28)
+14	Print-or-stage call made at the huddle	Justin	100%	Yes / No														=AVERAGE(F29:R29)
+15	EMB sews + DTF transfers (combined)	Bryan	425	Imprint Log														=AVERAGE(F30:R30)
+""
+PRE-PRESS & ART
+#	METRIC	OWNER	GOAL	SOURCE	W1 10/5	W2 10/12	W3 10/19	W4 10/26	W5 11/2	W6 11/9	W7 11/16	W8 11/23	W9 11/30	W10 12/7	W11 12/14	W12 12/21	W13 12/28	13-WK AVG
+16	Screens racked for next day before leaving	Richie	100%	Yes / No														=AVERAGE(F34:R34)
+17	Proof turnaround, submit → back	Richie	< 24 hrs	Printavo / GXS														=AVERAGE(F35:R35)
+""
+FINANCE
+#	METRIC	OWNER	GOAL	SOURCE	W1 10/5	W2 10/12	W3 10/19	W4 10/26	W5 11/2	W6 11/9	W7 11/16	W8 11/23	W9 11/30	W10 12/7	W11 12/14	W12 12/21	W13 12/28	13-WK AVG
+18	Weeks of cash on hand	Luke	≥ 4	Bank / QBO														=AVERAGE(F39:R39)
+19	Gross margin %	Luke	≥ 58% direct	QBO														=AVERAGE(F40:R40)
+20	AR over 60 days	Luke	< 10%	QBO														=AVERAGE(F41:R41)
+""
+MONTHLY PULSE — Luke only, not reviewed weekly
+	METRIC	OWNER	GOAL	SOURCE	OCT	NOV	DEC
+M1	Cost per SP imprint (all-in)	Luke	$0.849 → under $0.70	ADP pull ÷ Imprint Log
+M2	Cost per EMB sew (all-in)	Luke	$6.411 → under $5.50	ADP pull ÷ Imprint Log
+M3	Imprints per labor hour	Luke	31.7 → 40	ADP hours ÷ Imprint Log
+M4	Crew hours vs 40 (3-wk run)	Luke	S&R HIRING TRIGGER	ADP
+M5	Direct revenue as % of total	Luke	71% → 75%	Printavo
+M6	Search Lost IS (budget)	Luke	review	Google Ads
+M7	Block sweep fetch failures	Luke	0	Railway logs
+""
+RETIRED FROM Q3 — measuring a seat Clint no longer holds
+	New outbound contacts made (25/wk)			RETIRED
+	First meetings booked			RETIRED
+""
+FIX BEFORE GO-LIVE: the old 'Recent Avg' column was SUMMING, not averaging. Every value in it was wrong.
+The 13-WK AVG column above uses =AVERAGE() — check it after pasting.

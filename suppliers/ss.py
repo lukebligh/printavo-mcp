@@ -78,3 +78,17 @@ def recent_pos():
             raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
         pos.update(str(o.get("poNumber") or "") for o in (r.json() or []) if o.get("poNumber"))
     return pos
+
+
+def orders_recent():
+    """Raw S&S orders (open + last ~3 months) with lines, for goods-status notes."""
+    try:
+        r = httpx.get(f"{BASE}/orders/", auth=_auth(), timeout=120,
+                      params={"All": "True", "lines": "true", "mediatype": "json"})
+    except httpx.HTTPError as e:
+        raise SSError(f"S&S unreachable: {e}")
+    if r.status_code == 404:
+        return []
+    if r.status_code != 200:
+        raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
+    return r.json() or []

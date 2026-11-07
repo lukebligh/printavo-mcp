@@ -1,0 +1,87 @@
+WEEKLY SCORECARD
+Q4 2026  ·  13 weekly numbers + Monthly Pulse  ·  Reviewed every Monday in the Leadership L10
+VERSION 3.0  ·  SEPTEMBER 29, 2026  ·  OWNER: LUKE BLIGH
+
+THE RULES	Five people own numbers. Every number has exactly ONE owner. A number that cannot be reported is an ISSUE, not an excuse.
+	Two reds in a row goes to the Issues List. Trends beat snapshots — read the LAST 4 column, not this week's cell.
+	13 numbers is the ceiling. If something new goes on, something old comes off. EOS says 5–15 and means it.
+
+Q4 2026  ·  OCT 1 – DEC 31  ·  13 WEEKS  ·  QUARTERLY REVIEW DEC 29
+
+#	Lens	Metric	Owner	Goal	10/4	10/11	10/18	10/25	11/1	11/8	11/15	11/22	11/29	12/6	12/13	12/20	12/27	Q4 AVG	LAST 4	TARGET	DIR	STATUS
+SALES & MARKETING  ·  LUKE
+1.0	SALES	Weekly revenue $	Luke	$21,875 / wk  ($87.5K month)														=IFERROR(AVERAGE(F13:R13),"")	=IFERROR(AVERAGE(OFFSET($F13,0,MAX(0,COUNT($F13:$R13)-4),1,MIN(4,COUNT($F13:$R13)))),"")	21875	UP	=IF(T13="","",IF(V13="UP",IF(T13>=U13,"GREEN","RED"),IF(T13<=U13,"GREEN","RED")))
+2.0	SALES	New direct revenue closed $	Luke	$2,000 / wk														=IFERROR(AVERAGE(F14:R14),"")	=IFERROR(AVERAGE(OFFSET($F14,0,MAX(0,COUNT($F14:$R14)-4),1,MIN(4,COUNT($F14:$R14)))),"")	2000	UP	=IF(T14="","",IF(V14="UP",IF(T14>=U14,"GREEN","RED"),IF(T14<=U14,"GREEN","RED")))
+3.0	SALES	Quotes issued — new direct	Luke	5 / wk														=IFERROR(AVERAGE(F15:R15),"")	=IFERROR(AVERAGE(OFFSET($F15,0,MAX(0,COUNT($F15:$R15)-4),1,MIN(4,COUNT($F15:$R15)))),"")	5	UP	=IF(T15="","",IF(V15="UP",IF(T15>=U15,"GREEN","RED"),IF(T15<=U15,"GREEN","RED")))
+4.0	SALES	Inbound qualified leads from Seafoam	Luke	1–3 / wk														=IFERROR(AVERAGE(F16:R16),"")	=IFERROR(AVERAGE(OFFSET($F16,0,MAX(0,COUNT($F16:$R16)-4),1,MIN(4,COUNT($F16:$R16)))),"")	1	UP	=IF(T16="","",IF(V16="UP",IF(T16>=U16,"GREEN","RED"),IF(T16<=U16,"GREEN","RED")))
+
+CUSTOMER SUCCESS  ·  CLINT
+5.0	CUSTOMER	Proactive order communication — % of approved orders touched before production	Clint	100%														=IFERROR(AVERAGE(F19:R19),"")	=IFERROR(AVERAGE(OFFSET($F19,0,MAX(0,COUNT($F19:$R19)-4),1,MIN(4,COUNT($F19:$R19)))),"")	1.0	UP	=IF(T19="","",IF(V19="UP",IF(T19>=U19,"GREEN","RED"),IF(T19<=U19,"GREEN","RED")))
+6.0	CUSTOMER	Reorder & reactivation contacts made	Clint	10 / wk														=IFERROR(AVERAGE(F20:R20),"")	=IFERROR(AVERAGE(OFFSET($F20,0,MAX(0,COUNT($F20:$R20)-4),1,MIN(4,COUNT($F20:$R20)))),"")	10	UP	=IF(T20="","",IF(V20="UP",IF(T20>=U20,"GREEN","RED"),IF(T20<=U20,"GREEN","RED")))
+
+OPS — PLANNER  ·  RICHIE
+7.0	PLANNER	Monday overload count — lane-days next week over 100% capacity	Richie	0   (baseline 9/29: 3)														=IFERROR(AVERAGE(F23:R23),"")	=IFERROR(AVERAGE(OFFSET($F23,0,MAX(0,COUNT($F23:$R23)-4),1,MIN(4,COUNT($F23:$R23)))),"")	0	DOWN	=IF(T23="","",IF(V23="UP",IF(T23>=U23,"GREEN","RED"),IF(T23<=U23,"GREEN","RED")))
+8.0	PLANNER	Next-day screens ready — days of 5  (Justin reports)	Richie	5 of 5														=IFERROR(AVERAGE(F24:R24),"")	=IFERROR(AVERAGE(OFFSET($F24,0,MAX(0,COUNT($F24:$R24)-4),1,MIN(4,COUNT($F24:$R24)))),"")	5	UP	=IF(T24="","",IF(V24="UP",IF(T24>=U24,"GREEN","RED"),IF(T24<=U24,"GREEN","RED")))
+
+OPS — EXECUTIONER  ·  JUSTIN
+9.0	EXEC	OTIF — on time, in full  (see definition below)	Justin	100%														=IFERROR(AVERAGE(F27:R27),"")	=IFERROR(AVERAGE(OFFSET($F27,0,MAX(0,COUNT($F27:$R27)-4),1,MIN(4,COUNT($F27:$R27)))),"")	1.0	UP	=IF(T27="","",IF(V27="UP",IF(T27>=U27,"GREEN","RED"),IF(T27<=U27,"GREEN","RED")))
+10.0	EXEC	Misprints as % of weekly imprints	Justin	< 1.5%														=IFERROR(AVERAGE(F28:R28),"")	=IFERROR(AVERAGE(OFFSET($F28,0,MAX(0,COUNT($F28:$R28)-4),1,MIN(4,COUNT($F28:$R28)))),"")	0.015	DOWN	=IF(T28="","",IF(V28="UP",IF(T28>=U28,"GREEN","RED"),IF(T28<=U28,"GREEN","RED")))
+11.0	EXEC	Weekly imprint count — SP + EMB + DTF	Justin	4,571  (13-wk mean)														=IFERROR(AVERAGE(F29:R29),"")	=IFERROR(AVERAGE(OFFSET($F29,0,MAX(0,COUNT($F29:$R29)-4),1,MIN(4,COUNT($F29:$R29)))),"")	4571	UP	=IF(T29="","",IF(V29="UP",IF(T29>=U29,"GREEN","RED"),IF(T29<=U29,"GREEN","RED")))
+12.0	EXEC	Goods staged for the next day — days of 5	Justin	5 of 5														=IFERROR(AVERAGE(F30:R30),"")	=IFERROR(AVERAGE(OFFSET($F30,0,MAX(0,COUNT($F30:$R30)-4),1,MIN(4,COUNT($F30:$R30)))),"")	5	UP	=IF(T30="","",IF(V30="UP",IF(T30>=U30,"GREEN","RED"),IF(T30<=U30,"GREEN","RED")))
+
+EMB & DTF  ·  BRYAN
+13.0	EMB/DTF	EMB sews + DTF transfers	Bryan	425 / wk  (13-wk mean)														=IFERROR(AVERAGE(F33:R33),"")	=IFERROR(AVERAGE(OFFSET($F33,0,MAX(0,COUNT($F33:$R33)-4),1,MIN(4,COUNT($F33:$R33)))),"")	425	UP	=IF(T33="","",IF(V33="UP",IF(T33>=U33,"GREEN","RED"),IF(T33<=U33,"GREEN","RED")))
+
+
+MONTHLY PULSE  — reported the first L10 after month close. NOT weekly. These move too slowly to watch every Monday.
+#	Metric	Owner	Goal	Oct	Nov	Dec	Baseline / source
+M1	Direct reorder rate — rolling 90 day	Luke	70%				54% today (44 of 82 accounts). The largest number in the business.
+M2	All-in cost per SP imprint	Luke	≤ $1.430				$1.430 today. Monthly ADP pull ÷ Imprint Log. Never weekly.
+M3	All-in cost per EMB sew	Luke	≤ $6.411				$6.411 today. The EMB line loses $5,298/yr at this rate.
+M4	Total AR $	Luke	watch				$91,206 Sept
+M5	AR over 60 days — % of total AR	Luke	< 10%				3–7% all year. Healthy. Moved off the weekly board because it is always green.
+M6	Ad spend $ / cost per lead	Luke	$1,500 floor / $55 CPL				Below $1,500 Google cannot optimise. Floor, not a target.
+M7	Revenue vs Q4 baseline	Luke	$87,500 / month				Oct + Nov + Dec = $262,500 to make the $900K year.
+
+
+DEFINITIONS — the four that people argue about
+	These live HERE, not on a separate tab. A definition nobody can find is a definition nobody follows.
+
+OTIF	Orders completed this week whose ship or pickup date was ON OR BEFORE the due date the customer was given when the order was approved.
+	A due date MOVED after approval counts as LATE. Telling the customer first is good manners — it is not on-time.
+	WHY THIS MATTERS: OTIF read exactly 100.0% for ten straight weeks in Q3 while misprints hit 149 and 73. A number that cannot fail is not a number.
+	If this reads 100% for four straight weeks again, the definition is still wrong and it becomes an Issue.
+
+MISPRINTS	Pieces scrapped or reprinted, all decoration methods, divided by total imprints that week. BOTH numbers get recorded.
+	The old target of ‘under 2’ was against 4,571 imprints a week — that is 0.04%, which nobody has ever hit and nobody was trying to.
+	Q3 reality: the 149 week was 2.9% and the 73 week was 1.4%. 1.5% is a real target that can be beaten and can be missed.
+
+MONDAY OVERLOAD COUNT	Days in the COMING week where any production lane is scheduled above 100% of its 8-hour capacity, read Monday 8:00am.
+	The block sweep already prints this as DAILY LOAD. Nobody types anything. Baseline Sept 29: Tue EMB 384%, Wed SP 217%, Fri EMB 144% = 3.
+	This is the one thing only the Planner can do. A robot can place a block. It cannot decide Wednesday will not fit.
+
+PROACTIVE ORDER COMMUNICATION	Approved orders that got a customer touch BEFORE production started, divided by all orders approved that week.
+	Q3 captured a COUNT (1, 2, 4, 4) against a metric defined as a PERCENT. Those are different things. This quarter it is a percent.
+
+
+WHAT CAME OFF THE BOARD, AND WHY
+Outbound contacts made (25/wk)	REMOVED. Clint has not held that job since July. The number ran 7 → 1 measuring work nobody was asked to do.
+First meetings booked (3/wk)	REMOVED for the same reason. Reinstate it the day a Sales seat is filled, not before.
+Total AR $	MOVED to Monthly Pulse. It does not move meaningfully week to week.
+AR over 60 days	MOVED to Monthly Pulse. Ran 3–7% for ten weeks. Permanently green is clutter.
+Cash balance	MOVED to Monthly Pulse as part of M7. NOTE: if cash drops below $35,000, it comes straight back on the weekly board.
+
+WHAT WENT ON, AND WHY
+Monday overload count	The Planner seat had no measurable. Now it has one, and it is machine-read.
+Next-day screens ready	The handoff from the week to the day. Reported by the person who is hurt when it is missed.
+Goods staged for next day	The entire structural change this quarter. It was not measured anywhere.
+Reorder & reactivation contacts	Half the 3-year plan is accounts we already have. Nothing measured it.
+Misprints as a PERCENT	A count without a denominator cannot be compared week to week when volume swings 3,024 to 6,346.
+
+
+L10 DISCIPLINE
+1	Every Monday, the owner reports their own number. Not Luke reading them out.
+2	Missing data is an Issue. ‘I didn’t get to it’ is a status, not a number.
+3	Two reds in a row goes to the Issues List with an owner and a date.
+4	Read LAST 4, not this week. One bad week is weather. Four is climate.
+5	Do not discuss numbers during Scorecard review. Flag them and move on. Discussion happens in IDS.

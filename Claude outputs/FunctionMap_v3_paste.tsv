@@ -1,0 +1,116 @@
+FUNCTION MAP
+Every function the business performs, mapped to a seat. This is the SOURCE OF TRUTH the Accountability Chart is built from.
+VERSION 3.0  ·  SEPTEMBER 29, 2026  ·  OWNER: LUKE BLIGH  ·  supersedes v2.2 (July 2026)
+
+WHEN A SEAT QUESTION COMES UP, CHECK THIS MAP FIRST. SEATS ARE CLUSTERS OF FUNCTIONS, NOT JOB TITLES.
+If a function has two owners, it is not owned. If a function has no owner, it is not happening.
+
+SEAT CODES USED IN THE TARGET SEAT COLUMN
+VIS	Visionary — Luke
+INT	Integrator — Luke (interim)
+S/M	Sales / Marketing — Luke → Carrie (target)
+CS	Customer Success — Clint
+PLAN	OPS — Planner — Richie   (the WEEK: schedule, art, pre-press)
+EXEC	OPS — Executioner — Justin   (the DAY: run the schedule, goods, staging, QC)
+PRINT	Print Production — Tom · Jerry
+EMB	EMB & DTF Production — Bryan
+F&R	Fulfilment & Reclaim — Kim
+FIN	Finance / Admin — Luke (Mechelle · S. Roman)
+OUT	Outsourced partner
+
+#	Category	Function	Current Owner	Target Seat	Status	Change since v2.2
+
+REVENUE GENERATION
+1.0	REVENUE	Outbound prospecting	Nobody	S/M	DORMANT — was Clint, his time is now Customer Success	CHANGED — no longer Clint's
+2.0	REVENUE	Inbound lead handling	Clint	CS	Working	CHANGED — single owner, was three people
+3.0	REVENUE	Quoting — sales deals	Luke, Mechelle	S/M	Working	
+4.0	REVENUE	Quoting — reorders and inbound	Clint, Mechelle	CS	Working	CHANGED — CX seat was never hired; it is Clint's
+5.0	REVENUE	Direct account management	Luke, Clint	S/M + CS	Working	
+6.0	REVENUE	Contract account management (UGP etc.)	Luke	S/M	Working	
+7.0	REVENUE	Marketing strategy	Luke + Seafoam	S/M	TBD	
+8.0	REVENUE	Marketing execution	Seafoam	OUT	TBD	
+9.0	REVENUE	Sales operations — CRM and pipeline	Luke	S/M	NOT RUNNING — CRM tool not settled	CHANGED — was Clint
+9.1	REVENUE	Pricing matrices and quote accuracy	Luke	S/M	Working — +7% / +8-10% effective Nov 1	NEW
+9.2	REVENUE	Reactivation of lapsed direct accounts	Nobody	S/M	BROKEN — the $105,437 fall list has no owner	NEW — largest unowned number in the business
+
+CUSTOMER-FACING
+10.0	CUSTOMER	Order intake after quote approval	Clint, Mechelle	CS	Working	
+11.0	CUSTOMER	Quote-to-order conversion	Luke, Clint	S/M + CS	Working	
+12.0	CUSTOMER	Proactive communication during production	Clint	CS	IMPROVING — was the single biggest gap	CHANGED — real owner, was 'Luke interim'
+13.0	CUSTOMER	Issue resolution	Clint	CS	So-so — Luke still the escalation path	CHANGED
+14.0	CUSTOMER	Reorder triggering — relationship, not automation	Luke, Mailchimp	CS	BROKEN — not sincere	
+14.1	CUSTOMER	Clearing ORDER ON HOLD	Clint	CS	RULE: only CX clears it, and only after the customer has been told	NEW
+
+CREATIVE / PRE-PRODUCTION
+15.0	CREATIVE	Art creation	Richie	PLAN	Fine, not top notch	
+16.0	CREATIVE	Art preparation — vector, separations	Richie	PLAN	Works, but Richie is pulled in many directions	
+17.0	CREATIVE	Mockup and proof generation	Richie	PLAN	Works — wish it were faster	
+18.0	CREATIVE	Screen burning and film output	Richie	PLAN	REVERSED — stays with Richie	CHANGED — v2.2 moved this to Justin. Cancelled.
+19.0	CREATIVE	Embroidery digitizing	Outsourced	OUT	Works	
+20.0	CREATIVE	DTF file preparation	Richie	PLAN	Was a pain point for Luke	CHANGED — off Luke
+20.1	CREATIVE	Managing the art partners as capacity (GxS, STLCE, Fusion, Quality Punch)	Richie	PLAN	NEW FUNCTION — routes, specs, QC, escalation	NEW
+20.2	CREATIVE	Screens burned and racked for the NEXT DAY before leaving	Richie	PLAN	THE measurable for the Planner seat — see below	NEW
+
+PRODUCTION
+21.0	PRODUCTION	Production plan — build the WEEK off the Printavo calendar	Richie	PLAN	UNDER TEST — keys handed over late Sept	CHANGED — this is the Planner seat's core job
+22.0	PRODUCTION	Production schedule — run the DAY against the plan	Justin	EXEC	Working in practice, never named until now	CHANGED — this is the Planner/Executioner split
+22.1	PRODUCTION	Overload calls — what moves when the week will not fit	Richie	PLAN	NOT HAPPENING — currently escalates to Luke	NEW
+23.0	PRODUCTION	Materials procurement	Mechelle	FIN	Works; needs better comms on complex orders	
+24.0	PRODUCTION	Receiving	Justin	EXEC	Working	CHANGED — was 'Richie transitioning to Justin'. Done.
+24.1	PRODUCTION	Goods count-in to standard	Justin · crew	EXEC	Under 300 pcs = exact count. 300+ = packing slip count.	NEW — Core Process #1, in use, never written down
+24.2	PRODUCTION	Staging goods by order for the next day	Justin · Tom · Jerry · Kim	EXEC	CONFIRMED with the crew Sept 2026 — part of the shift	NEW — the function the whole S&R debate was about
+24.3	PRODUCTION	Goods Accounted For — task visibility in Printavo	Justin	EXEC	ACTION: move the task from the 4 Pre-Pro lists to Sourcing at QUOTE APPROVED	NEW
+25.0	PRODUCTION	Screen printing operation	Tom, Jerry	PRINT	Efficiencies to gain	CHANGED — Ian removed
+26.0	PRODUCTION	Embroidery operation	Bryan	EMB	Learning, slow, cares. Line loses $5,298/yr at current rate.	
+27.0	PRODUCTION	DTF operation — pressing; transfers outsourced	Bryan	EMB	Filler now, growing. Carries the EMB line.	
+27.1	PRODUCTION	Sew-out approvals	Bryan	EMB	RULE: a declined sew-out is a digitizing fault until proven otherwise	NEW
+28.0	PRODUCTION	Quality control — at stage	Each operator	PRINT / EMB / F&R	Each operator owns their own stage and their own misprint count	CHANGED — 'decentralized' was a way of saying nobody
+29.0	PRODUCTION	QC gate — final clearance before boxing	Justin	EXEC	The concurrency problem: this is what gets dropped when he is also catching	CHANGED — Ian removed
+29.1	PRODUCTION	Misprint count and the Imprint Log	Each operator → Justin	EXEC	Feeds the Scorecard. Combined Misprint + Imprint Log now one tab.	NEW
+30.0	PRODUCTION	Reclaim and screen prep	Kim	F&R	Working	CHANGED — single owner, was Kim + Justin
+31.0	PRODUCTION	Equipment maintenance — press	Justin	EXEC	Working	
+31.1	PRODUCTION	Equipment maintenance — EMB and DTF press	Bryan	EMB	Working	NEW
+31.2	PRODUCTION	Production block integrity — the calendar is complete	Justin	EXEC	AUTOMATED — sweep fixed Sept 22. Slack alert on fetch failures.	NEW
+
+FULFILMENT
+32.0	FULFILMENT	Catching at the dryer	Kim	F&R	Working	CHANGED — was Ian
+32.1	FULFILMENT	Folding, bagging, boxing to standard	Kim	F&R	Working	CHANGED — was Ian
+32.2	FULFILMENT	Count-out accuracy — out must match in	Kim	F&R	NOT MEASURED	NEW
+33.0	FULFILMENT	Shipping — carriers, labels, EasyPost	Justin	EXEC	Transitioning — EasyPost automation in progress	
+34.0	FULFILMENT	Local delivery and pickup coordination	Mechelle, Printavo	CS	Works	
+35.0	FULFILMENT	Returns and corrections	Clint	CS	Reactive only	CHANGED — was Luke
+
+BACK OFFICE / FINANCE
+36.0	FINANCE	Bookkeeping	S. Roman	OUT	Works	
+37.0	FINANCE	Accounts receivable	Luke, Mechelle	FIN	Fine — 2.2 weeks of cash on hand, so it matters	CHANGED — was CX
+38.0	FINANCE	Accounts payable	Mechelle, Luke	FIN	Works	
+39.0	FINANCE	Cash management	Luke	FIN	Works — Dec low point modeled at $33,044	
+40.0	FINANCE	Payroll	Luke	FIN	Works	
+41.0	FINANCE	Tax compliance	Luke + CPA	FIN	Works	
+42.0	FINANCE	Financial reporting	Luke + S. Roman	FIN	Works	
+42.1	FINANCE	Cost per imprint — monthly labour allocation	Luke	FIN	METHOD: monthly ADP pull against the Imprint Log, not weekly	NEW
+42.2	FINANCE	HR — onboarding, handbook, safety	Luke	FIN	NOT DOCUMENTED	NEW
+
+STRATEGIC / OWNER
+43.0	STRATEGIC	Vision and direction	Luke	VIS	Works	
+44.0	STRATEGIC	Capital allocation	Luke	VIS	Works	
+45.0	STRATEGIC	Hiring at leadership level	Luke	VIS	TBD — Carrie is the live one	
+46.0	STRATEGIC	Culture and the core value — WE GIVE A DAMN	Luke	VIS	Improving — inherited team, Clint is the living example	
+47.0	STRATEGIC	Top-client relationships	Luke	VIS	Works	
+48.0	STRATEGIC	Strategic vendor and supplier relationships	Luke	VIS	Works	
+48.1	STRATEGIC	Runs the Leadership L10 and the Rock process	Luke	INT	Starting Q4	NEW
+48.2	STRATEGIC	Harmonises sales and production — what is sold can be made when promised	Luke	INT	This is the seat the whole system is built to fill	NEW
+
+
+COUNT: 68 functions. 6 outsourced. 62 internal, clustered into 10 internal seats.
+v2.2 had 48 functions and 6 seats. The 20 additions are not new work — they are work that was already happening with nobody's name on it.
+
+
+WHAT CHANGED FROM v2.2 — READ THIS BEFORE YOU PRESENT
+1	Ian is gone. He owned 3 functions on the old map (25.0 training, 29.0 QC gate, 32.0 packing). All three are re-homed — QC to Justin, packing and catching to Kim.
+2	Screen burning stays with Richie. v2.2 was moving it to Justin. That move is cancelled — it belongs with pre-press, not the floor.
+3	Production scheduling split in two. 21.0 is the WEEK (Richie). 22.0 is the DAY (Justin). This is the Planner / Executioner structure and it is the single biggest change on the map.
+4	The CX seat was never hired and is not coming. Clint holds Customer Success. Every 'CX (Luke interim)' line now has a real name.
+5	Staging and count-in appear on the map for the first time (24.1, 24.2). They were the subject of an entire quarter's debate and were not on the source of truth.
+6	Shipping & Receiving as an open hire is removed. The work is 24.1–24.3 under the Executioner, staffed from the 53 hrs/week of existing crew headroom.
+7	Reactivation of lapsed accounts (9.2) is now on the map with NOBODY in the owner column. That is deliberate. $105,437 is sitting there.

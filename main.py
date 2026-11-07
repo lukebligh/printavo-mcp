@@ -4224,6 +4224,7 @@ def _fetch_orders_in_status(status_name: str) -> dict:
             "nick": (n.get("nickname") or "(no nickname)")[:40],
             "company": (c.get("customer") or {}).get("companyName") or c.get("fullName") or "—",
             "prod": _parse_dt(n.get("startAt")),
+            "contact": c,
         })
     return {"orders": out}
 
@@ -6885,6 +6886,230 @@ def supplier_cogs_preview(days: int = 35) -> str:
     if errs:
         out += ["", "ERRORS:"] + [f"  {x}" for x in errs]
     return "\n".join(out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GOODS STATUS → PRODUCTION NOTES (Luke, Nov 6 2026)
+#  Orders in VERIFY GOODS / DIRECT - WAITING ON GOODS get an auto-maintained
+#  "— GOODS (auto …) —" block in their production note from SanMar + S&S
+#  (status, ship date, est. arrival, tracking, items by size, backorders).
+#  The rest of the note is never touched. Exceptions (backorder/short, hold,
+#  late vs production date, no PO found) DM Clint + Mechelle + Luke ONCE each.
+#  Runs weekdays ~8:05, 12:05, 16:05 CT (SanMar asks ≤3 status checks/day/PO).
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    from suppliers import goods as _goods
+except Exception as _e:  # pragma: no cover
+    _goods = None
+    _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | goods: {_e!r}"
+
+GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+GOODS_NOTES_HOURS_CT = [int(h) for h in os.environ.get("GOODS_NOTES_HOURS_CT", "8,12,16").split(",") if h.strip()]
+GOODS_ALERT_USERS = os.environ.get("GOODS_ALERT_USERS", "U07VDHDSMUJ,U07VDET3XEX,U0504FSDYB0")  # Clint, Mechelle, Luke
+_GOODS_STATUSES = ("VERIFY GOODS", "DIRECT - WAITING ON GOODS")
+
+
+def _goods_json(name, default):
+    p = f"/data/{name}" if os.path.isdir("/data") else ""
+    if not p or not os.path.exists(p):
+        return default
+    try:
+        return json.load(open(p))
+    except Exception:
+        return default
+
+
+def _goods_json_save(name, obj):
+    if os.path.isdir("/data"):
+        try:
+            with open(f"/data/{name}", "w") as fh:
+                json.dump(obj, fh)
+        except Exception as e:
+            print(f"[GOODS] could not save {name}: {e}", flush=True)
+
+
+def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
+    if _goods is None or _sanmar is None or _ss is None:
+        raise RuntimeError(f"supplier modules failed to load: {_SANMAR_IMPORT_ERR}")
+    orders = []
+    for st in _GOODS_STATUSES:
+        q = _fetch_orders_in_status(st)
+        if "error" in q:
+            raise RuntimeError(f"{st}: {q['error']}")
+        for o in q["orders"]:
+            o["status"] = st
+            orders.append(o)
+    if only_order:
+        orders = [o for o in orders if str(o["vid"]) == str(only_order).strip()]
+    errors = []
+    try:
+        open_map = {}
+        for s in _sanmar.order_status("allOpen", product_detail=True):
+            open_map.setdefault(s["po"].strip().upper(), []).append(s)
+    except Exception as e:
+        open_map, _ = {}, errors.append(f"SanMar open orders: {e}")
+    try:
+        ss_orders = _ss.orders_recent()
+    except Exception as e:
+        ss_orders, _ = [], errors.append(f"S&S orders: {e}")
+    cache = _goods_json("goods_po_cache.json", {})
+    today = _central_now().date()
+    results = []
+    for o in orders:
+        vid = str(o["vid"])
+        if _cogs_is_contract_customer({"contact": o.get("contact") or {}}):
+            continue                                     # contract goods are customer-supplied
+        lines, infos = [], []
+        try:
+            sm_pos = _sanmar.find_pos(vid)
+        except Exception as e:
+            sm_pos, _ = [], errors.append(f"#{vid} SanMar PO lookup: {e}")
+        for po in sm_pos:
+            key = po.strip().upper()
+            status = open_map.get(key, [])
+            c = cache.get(key) or {}
+            if c.get("final"):
+                ships, invs = c.get("ships", []), c.get("invs", [])
+            else:
+                ships, invs = [], []
+                try:
+                    if not status or any(s["status"].lower() != "received" and s["status"].lower() != "confirmed"
+                                         for s in status):
+                        ships = _sanmar.shipments(po=po)
+                    if ships:
+                        invs = _sanmar.invoices_by_po(po)
+                except Exception as e:
+                    errors.append(f"#{vid} \"{po}\": {e}")
+                if ships and not status:                 # not open any more and shipped → frozen
+                    cache[key] = {"ships": ships, "invs": invs, "final": bool(invs)}
+            sec, info = _goods.sanmar_po_section(po, status, ships, invs)
+            lines += sec
+            infos.append((po, info))
+        for so in ss_orders:
+            if vid in _scogs.order_numbers(str(so.get("poNumber") or "")):
+                sec, info = _goods.ss_po_section(so)
+                lines += sec
+                infos.append((str(so.get("poNumber")), info))
+        has_po = bool(infos)
+        prod = o["prod"].date() if o.get("prod") else None
+        exc = _goods.exceptions_for(vid, prod, infos, has_po, today=today)
+        block = None
+        if has_po:
+            stamp = _central_now().strftime("%m/%d %-I:%M%p").lower()
+            block = "\n".join([f"— GOODS (auto · {stamp}) —"] + lines + [_goods.END])
+        results.append({"vid": vid, "status": o["status"], "nick": o["nick"], "prod": prod,
+                        "block": block, "exceptions": exc})
+    _goods_json_save("goods_po_cache.json", cache)
+
+    written, unchanged = [], 0
+    for r in results:
+        if not r["block"]:
+            continue
+        internal_id, otype, err = _find_order(r["vid"])
+        if not internal_id:
+            errors.append(f"#{r['vid']}: {err}")
+            continue
+        time.sleep(PAGE_DELAY_S)
+        cur = query_printavo(f"query($id: ID!) {{ {otype}(id: $id) {{ productionNote }} }}", {"id": internal_id})
+        note = ((cur.get(otype) or {}).get("productionNote") or "") if "error" not in cur else None
+        if note is None:
+            errors.append(f"#{r['vid']}: could not read production note")
+            continue
+        new_body = "\n".join(r["block"].splitlines()[1:])
+        if _goods.block_body(note) == new_body:
+            unchanged += 1
+            continue
+        r["new_note"] = _goods.merge_block(note, r["block"])
+        if dry_run:
+            continue
+        field = "quoteUpdate" if otype == "quote" else "invoiceUpdate"
+        res = query_printavo(f"""mutation($id: ID!, $note: String) {{
+            {field}(id: $id, input: {{ productionNote: $note }}) {{ id productionNote }} }}""",
+            {"id": internal_id, "note": r["new_note"]})
+        saved = (res.get(field) or {}).get("productionNote", "") if "error" not in res else ""
+        if _goods.END in saved and strip_ok(saved, note):
+            written.append(r["vid"])
+        else:
+            errors.append(f"#{r['vid']}: note write did not verify ({res.get('error', 'mismatch')})")
+    return {"results": results, "written": written, "unchanged": unchanged, "errors": errors}
+
+
+def strip_ok(saved: str, before: str) -> bool:
+    """The non-GOODS part of the note must survive the write unchanged."""
+    return _goods.strip_block(saved) == _goods.strip_block(before)
+
+
+def _goods_notes_text(rep: dict, dry_run: bool) -> str:
+    out = [("[DRY RUN — nothing written] " if dry_run else "") +
+           f"GOODS NOTES · {len(rep['results'])} orders in VERIFY GOODS / DIRECT - WAITING ON GOODS · "
+           f"{'would update' if dry_run else 'updated'} {len([r for r in rep['results'] if r.get('new_note')]) if dry_run else len(rep['written'])}"
+           f" · unchanged {rep['unchanged']}"]
+    for r in rep["results"]:
+        out.append(f"\n#{r['vid']} · {r['status']} · {r['nick']} · prod {r['prod'] or '—'}")
+        out.append(r["block"] if r["block"] else "  (no SanMar / S&S PO found — note not touched)")
+        for _k, t in r["exceptions"]:
+            out.append(f"  🔔 {t}")
+    if rep["errors"]:
+        out.append("\nERRORS:\n" + "\n".join(f"  {e}" for e in rep["errors"]))
+    return "\n".join(out)
+
+
+@mcp.tool()
+def goods_notes_run(dry_run: bool = True, order: str = "") -> str:
+    """Refresh the auto GOODS section of production notes for orders in VERIFY GOODS /
+    DIRECT - WAITING ON GOODS from SanMar + S&S. dry_run (default TRUE) previews only.
+    order: limit to one Printavo order #. The weekday schedule writes for real."""
+    try:
+        rep = _goods_notes_impl(dry_run=dry_run, only_order=order)
+    except Exception as e:
+        return f"Goods notes failed: {e}"
+    return _goods_notes_text(rep, dry_run)
+
+
+def _goods_send_exceptions(rep: dict):
+    seen = _goods_json("goods_alerts_seen.json", {})
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+    seen = {k: v for k, v in seen.items() if v >= cutoff}
+    new = [(k, t) for r in rep["results"] for k, t in r["exceptions"] if k not in seen]
+    if new:
+        text = "🚚 *Goods alerts* — needs a look:\n" + "\n".join(f"• {t}" for _k, t in new)
+        res = _post_cogs_dm(text, recipients=GOODS_ALERT_USERS)
+        print(f"[GOODS] alerts sent: {len(new)} {res}", flush=True)
+        now = datetime.now(timezone.utc).isoformat()
+        for k, _t in new:
+            seen[k] = now
+    _goods_json_save("goods_alerts_seen.json", seen)
+
+
+_last_goods_run = None
+
+
+def run_goods_notes_scheduler():
+    global _last_goods_run
+    while True:
+        try:
+            now_ct = _central_now()
+            slot = f"{now_ct.date()}-{now_ct.hour}"
+            if (GOODS_NOTES_ENABLED and now_ct.weekday() < 5 and now_ct.hour in GOODS_NOTES_HOURS_CT
+                    and 5 <= now_ct.minute < 20 and _last_goods_run != slot):
+                _last_goods_run = slot
+                try:
+                    rep = _goods_notes_impl(dry_run=False)
+                    _goods_send_exceptions(rep)
+                    print(f"[GOODS] updated {len(rep['written'])}, unchanged {rep['unchanged']}, "
+                          f"errors {rep['errors'][:3]}", flush=True)
+                    if rep["errors"]:
+                        _post_cogs_dm("⚠️ Goods notes run had errors:\n" + "\n".join(rep["errors"][:10]),
+                                      recipients="U0504FSDYB0")
+                except Exception as e:
+                    print(f"[GOODS] run failed: {e}", flush=True)
+                    _post_cogs_dm(f"⚠️ Goods notes run failed: {e}", recipients="U0504FSDYB0")
+        except Exception as e:
+            print(f"[GOODS] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
+threading.Thread(target=run_goods_notes_scheduler, daemon=True).start()
 
 
 @mcp.tool()

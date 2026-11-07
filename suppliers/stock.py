@@ -122,7 +122,7 @@ def sanmar_side(style, color):
         sz = norm_size(r["size"])
         if True:
             by.setdefault(r["color"], {})[sz] = {
-                "stock": r["total"], "top": _near("SanMar", r["warehouses"]),
+                "stock": r["total"], "top": _near("SanMar", r["warehouses"]), "whs": r["warehouses"],
                 "price": prices.get((_cn(r["color"]), sz)) or prices.get(("sk:" + _sk(r["color"]), sz))}
     picked = _best(picked, by)
     return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked, "by": by,
@@ -156,7 +156,7 @@ def ss_side(style, color, brand=""):
             if not whs and (i.get("warehouses") or []):
                 continue
             rows[sz] = {"stock": sum(q for _n, q in whs) if whs else int(i.get("qty") or 0),
-                        "price": price, "top": _near("S&S", whs)}
+                        "price": price, "top": _near("S&S", whs), "whs": whs}
     by = {c: r for c, r in by.items() if r}
     colors = sorted(by) or colors
     picked = _best([c for c in picked if c in by], by)

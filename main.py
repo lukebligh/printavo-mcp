@@ -7226,6 +7226,146 @@ def blank_check(style: str, color: str = "", sizes: str = "", brand: str = "", s
         return f"Blank check failed: {e}"
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO-ORDERING BLANKS — SHADOW MODE (Luke, Nov 7 2026)
+#  Builds the SanMar/S&S POs we WOULD place; places nothing. DMs Luke only.
+#  Spec: project doc claude/Auto_Ordering_Design_Nov2026.md. Logic: suppliers/ordering.py
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    from suppliers import ordering as _ordering
+except Exception as _e:  # pragma: no cover
+    _ordering = None
+    _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | ordering: {_e!r}"
+
+ORDER_SHADOW_ENABLED = os.environ.get("ORDER_SHADOW_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+# 10:30 = SanMar (11:00 cutoff) + S&S; 14:15 = S&S only (3:00 cutoff), anything new since 10:30.
+ORDER_BUILD_TIMES_CT = os.environ.get("ORDER_BUILD_TIMES_CT", "10:30=ALL,14:15=S&S")
+ORDER_SHADOW_USERS = os.environ.get("ORDER_SHADOW_USERS", "U0504FSDYB0")   # Luke only while in shadow
+_ORDER_QUEUE_STATUSES = ("ORDER GOODS",) + _GOODS_ALERT_STATUSES
+
+
+def _printavo_items_by_id(internal_id: str) -> list:
+    time.sleep(PAGE_DELAY_S)
+    r = query_printavo(f'''query {{ o: invoice(id: "{internal_id}") {{
+        lineItemGroups(first: 25) {{ nodes {{ lineItems(first: 50) {{ nodes {{
+            itemNumber color sizes {{ size count }} }} }} }} }} }} }}''')
+    out = []
+    for g in ((r.get("o") or {}).get("lineItemGroups") or {}).get("nodes") or []:
+        for li in (g.get("lineItems") or {}).get("nodes") or []:
+            out.append({"style": li.get("itemNumber") or "", "color": li.get("color") or "",
+                        "sizes": {s.get("size"): s.get("count") or 0 for s in (li.get("sizes") or [])}})
+    return out
+
+
+def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> dict:
+    if _ordering is None or _stock is None or _sanmar is None or _ss is None:
+        raise RuntimeError(f"supplier modules failed to load: {_SANMAR_IMPORT_ERR}")
+    today = _central_now().date()
+    queue = []
+    for st in _ORDER_QUEUE_STATUSES:
+        q = _fetch_orders_in_status(st)
+        if "error" in q:
+            if "not found in Printavo" in q["error"]:
+                continue
+            raise RuntimeError(f"{st}: {q['error']}")
+        for o in q["orders"]:
+            if _cogs_is_contract_customer({"contact": o.get("contact") or {}}):
+                continue
+            o["status"] = st
+            queue.append(o)
+    ss_orders_with_po = set()
+    try:
+        for po in _ss.recent_pos():
+            ss_orders_with_po.update(_scogs.order_numbers(po))
+    except Exception as e:
+        print(f"[ORDER] S&S PO list failed: {e}", flush=True)
+    needs = []
+    for o in queue:
+        vid = str(o["vid"])
+        try:
+            if _sanmar.find_pos(vid) or vid in ss_orders_with_po:
+                continue                                  # already ordered
+        except Exception:
+            pass
+        needs.append(o)
+    seen = _goods_json("order_first_seen.json", {})
+    first_seen = {}
+    for o in needs:
+        vid = str(o["vid"])
+        seen.setdefault(vid, today.isoformat())
+        first_seen[vid] = datetime.fromisoformat(seen[vid]).date()
+    if record_seen:
+        live = {str(o["vid"]) for o in needs}
+        cutoff = (today - timedelta(days=30)).isoformat()
+        _goods_json_save("order_first_seen.json",
+                         {k: v for k, v in seen.items() if k in live or v >= cutoff})
+    cache = _ordering.StyleCache()
+    orders = []
+    with _stock._LOCK:
+        for o in needs:
+            items = _printavo_items_by_id(o["id"]) if o.get("id") else _printavo_order_items(o["vid"])
+            lines = [m for m in (_ordering.match_line(i, cache) for i in items) if m]
+            if not lines:
+                continue
+            orders.append({"vid": o["vid"], "nick": o["nick"], "company": o["company"],
+                           "prod": o["prod"].date() if o.get("prod") else None, "lines": lines,
+                           "status": o["status"]})
+        result = _ordering.plan(orders, today, first_seen, supplier_filter or None)
+    result["queue"] = len(needs)
+    return result
+
+
+@mcp.tool()
+def order_build_preview(supplier: str = "") -> str:
+    """SHADOW MODE — places nothing. The SanMar / S&S POs the shop WOULD place right now
+    for direct orders at ORDER GOODS or later with no supplier PO yet: supplier choice,
+    combining (own PO >= $200, pooled, ride-along, 2-business-day max, prod-date override),
+    held orders, and lines flagged for a human. supplier: "SanMar" or "S&S" to limit."""
+    try:
+        r = _order_build_impl(supplier_filter=supplier.strip(), record_seen=False)
+    except Exception as e:
+        return f"Order build failed: {e}"
+    return _ordering.render(r, f"🧪 SHADOW ORDER BUILD — nothing placed · {r['queue']} orders need goods")
+
+
+_last_order_build = None
+
+
+def run_order_shadow_scheduler():
+    global _last_order_build
+    slots = []
+    for part in ORDER_BUILD_TIMES_CT.split(","):
+        if "=" in part:
+            t, which = part.split("=", 1)
+            h, m = (int(x) for x in t.strip().split(":"))
+            slots.append((h, m, which.strip()))
+    while True:
+        try:
+            now_ct = _central_now()
+            mins = now_ct.hour * 60 + now_ct.minute
+            for h, m, which in slots:
+                slot = f"{now_ct.date()}-{h:02d}{m:02d}"
+                if (ORDER_SHADOW_ENABLED and now_ct.weekday() < 5 and not _is_us_federal_holiday(now_ct)
+                        and 0 <= mins - (h * 60 + m) < 15 and _last_order_build != slot):
+                    _last_order_build = slot
+                    try:
+                        r = _order_build_impl("" if which == "ALL" else which, record_seen=True)
+                        label = "SanMar + S&S" if which == "ALL" else which
+                        text = _ordering.render(
+                            r, f"🧪 *SHADOW order build {now_ct:%-I:%M %p}* ({label}) — nothing was placed. "
+                               f"Compare with what Mechelle orders today · {r['queue']} orders need goods")
+                        _post_cogs_dm(text[:39000], recipients=ORDER_SHADOW_USERS)
+                    except Exception as e:
+                        print(f"[ORDER] shadow build failed: {e}", flush=True)
+                        _post_cogs_dm(f"⚠️ Shadow order build failed: {e}", recipients="U0504FSDYB0")
+        except Exception as e:
+            print(f"[ORDER] scheduler error: {e}", flush=True)
+        time.sleep(120)
+
+
+threading.Thread(target=run_order_shadow_scheduler, daemon=True).start()
+
+
 @mcp.tool()
 def sanmar_related(style: str) -> str:
     """SanMar's own related styles for a product (Substitutable / Common Grouping /

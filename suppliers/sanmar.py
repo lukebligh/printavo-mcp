@@ -403,3 +403,21 @@ def health():
         return "SanMar reachable but returned no pricing for PC61 White M."
     x = r[0]
     return f"SanMar OK — PC61 White M: your price {_money(x['my_price'])} (case {_money(x['case'])})."
+
+
+def normalized_invoices(start, end):
+    """Invoices with lines in a date range, in the shared supplier shape used by cogs.py."""
+    def f(x):
+        try:
+            return float(x or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    out = []
+    for inv in invoices_by_date(start, end):
+        lines = [{"style": li["style"], "brand": "", "color": li["color"], "size": li["size"],
+                  "qty": f(li["qty"]), "unit": f(li["unit"]), "amount": f(li["amount"])}
+                 for li in inv["lines"]]
+        out.append({"vendor": "SanMar", "invoice": inv["invoice"], "date": inv["date"],
+                    "po": inv["po"], "goods": f(inv["subtotal"]), "freight": f(inv["freight"]),
+                    "tax": f(inv["tax"]), "total": f(inv["total"]), "lines": lines})
+    return out

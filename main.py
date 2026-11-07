@@ -6674,6 +6674,128 @@ def sanmar_packing_slip(lpn: str) -> str:
     return _sanmar_run(run)
 
 
+try:
+    from suppliers import cogs as _scogs, ss as _ss
+except Exception as _e:  # pragma: no cover
+    _scogs = _ss = None
+    _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | cogs/ss: {_e!r}"
+
+
+def _printavo_order_items(visual_id: str) -> list:
+    """[{style, color, sizes{size: qty}}] for one Printavo order (for combined-PO splits)."""
+    internal_id, otype, err = _find_order(str(visual_id))
+    if not internal_id:
+        return []
+    time.sleep(PAGE_DELAY_S)
+    r = query_printavo(f'''query {{ o: {otype}(id: "{internal_id}") {{
+        lineItemGroups(first: 25) {{ nodes {{ lineItems(first: 50) {{ nodes {{
+            itemNumber color sizes {{ size count }} }} }} }} }} }} }}''')
+    out = []
+    for g in ((r.get("o") or {}).get("lineItemGroups") or {}).get("nodes") or []:
+        for li in (g.get("lineItems") or {}).get("nodes") or []:
+            out.append({"style": li.get("itemNumber") or "", "color": li.get("color") or "",
+                        "sizes": {s.get("size"): s.get("count") or 0 for s in (li.get("sizes") or [])}})
+    return out
+
+
+def _supplier_cogs(start: str, end: str):
+    """Pull SanMar + S&S invoices in [start, end] and allocate to orders."""
+    invs, errs = [], []
+    try:
+        invs += _sanmar.normalized_invoices(start, end)
+    except Exception as e:
+        errs.append(f"SanMar: {e}")
+    try:
+        invs += _ss.invoices_by_date(start, end)
+    except Exception as e:
+        errs.append(f"S&S: {e}")
+    cache = {}
+
+    def items(o):
+        if o not in cache:
+            cache[o] = _printavo_order_items(o)
+        return cache[o]
+    per_order, flags, skipped = _scogs.allocate(invs, items)
+    return per_order, flags, skipped, errs, invs
+
+
+@mcp.tool()
+def supplier_cogs_preview(days: int = 35) -> str:
+    """DRY RUN — writes nothing. For every Direct row on Daily Sales in the last `days`,
+    compares: current sheet COGS (col F), Mechelle's Printavo expenses, and blank-goods
+    COGS computed from SanMar + S&S invoices (matched by order # in the PO; combined
+    POs split line by line). Proposed new COGS = supplier invoices + Printavo expenses,
+    unless the expenses look like a duplicate of the invoice."""
+    if _sanmar is None or _scogs is None:
+        return f"Supplier module failed to load: {_SANMAR_IMPORT_ERR}"
+    tab = f"'{COGS_SHEET_TAB}'"
+    colB = _sheets_get([f"{tab}!B1:B3000"])[0]
+    last = max((i + 1 for i, r in enumerate(colB) if r and str(r[0]).strip()), default=0)
+    lo = max(2, last - 400)
+    vals, rcol = _sheets_get([f"{tab}!A{lo}:F{last}", f"{tab}!R{lo}:R{last}"])
+
+    def cell(rows, i, j):
+        row = rows[i] if i < len(rows) else []
+        return row[j] if j < len(row) else None
+    cutoff = (_central_now() - timedelta(days=days)).date()
+    rows = []
+    for i in range(last - lo, -1, -1):
+        d = _cogs_date(cell(vals, i, 0))
+        if d is not None and d < cutoff:
+            break
+        inv = str(cell(vals, i, 1) or "").strip()
+        if inv and str(cell(rcol, i, 0) or "").strip() == "Direct" and (_cogs_num(cell(vals, i, 3)) or 0) > 0:
+            rows.append({"row": lo + i, "inv": inv, "job": str(cell(vals, i, 2) or "")[:28],
+                         "f": _cogs_num(cell(vals, i, 5)) or 0.0})
+    start = (cutoff - timedelta(days=21)).isoformat()
+    end = _central_now().date().isoformat()
+    per_order, flags, skipped, errs, invs = _supplier_cogs(start, end)
+    exp = {}
+    ids = [r["inv"] for r in rows]
+    for k in range(0, len(ids), 25):
+        for res in _invoice_expenses_impl(",".join(ids[k:k + 25])):
+            exp[res["visual_id"]] = float(res.get("cogs") or 0) if res.get("found") else None
+    out = [f"SUPPLIER COGS PREVIEW — {len(rows)} Direct rows since {cutoff} | "
+           f"{len(invs)} supplier invoices {start}..{end} — DRY RUN, nothing written", ""]
+    out.append(f"{'ord':>5} {'job':28} {'sheet F':>9} {'prtv exp':>9} {'invoice':>9} {'proposed':>9}  note")
+    tot = {"sheet": 0.0, "prop": 0.0}
+    for r in sorted(rows, key=lambda x: x["inv"]):
+        sup = (per_order.get(r["inv"]) or {}).get("cogs", 0.0)
+        e = exp.get(r["inv"])
+        note, prop = "", None
+        if sup and e:
+            if abs(e - sup) <= max(5.0, 0.20 * sup):
+                prop, note = sup, "expense ≈ invoice → treat as duplicate, use invoice"
+            else:
+                prop, note = round(sup + e, 2), "invoice + expense (check: promo/other vendor?)"
+        elif sup:
+            prop = sup
+        elif e:
+            prop, note = e, "no supplier invoice — Printavo expense"
+        else:
+            note = "NO COGS from either source"
+        if prop is not None and abs(prop - r["f"]) > 1:
+            note = (note + " | " if note else "") + f"Δ {prop - r['f']:+,.2f}"
+        tot["sheet"] += r["f"]
+        tot["prop"] += prop or r["f"]
+        out.append(f"{r['inv']:>5} {r['job']:28} {r['f']:>9,.2f} {(e if e is not None else 0):>9,.2f} "
+                   f"{sup:>9,.2f} {(prop if prop is not None else 0):>9,.2f}  {note}")
+    out += ["", f"TOTAL sheet ${tot['sheet']:,.2f} → proposed ${tot['prop']:,.2f} "
+                f"(Δ {tot['prop'] - tot['sheet']:+,.2f})"]
+    row_ids = {r["inv"] for r in rows}
+    other = sorted(o for o in per_order if o not in row_ids)
+    if other:
+        out += ["", "Invoiced to orders NOT among these Direct rows (contract/older/not on sheet): "
+                + ", ".join(f"{o} ${per_order[o]['cogs']:,.2f}" for o in other)]
+    if flags:
+        out += ["", "SPLIT / MATCH FLAGS:"] + [f"  {x}" for x in flags]
+    if skipped:
+        out += ["", "SKIPPED (no order # in PO):"] + [f"  {x}" for x in skipped]
+    if errs:
+        out += ["", "ERRORS:"] + [f"  {x}" for x in errs]
+    return "\n".join(out)
+
+
 @mcp.tool()
 def sanmar_health_check() -> str:
     """Confirms the SanMar API login works (prices one PC61)."""

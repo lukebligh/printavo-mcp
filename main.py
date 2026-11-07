@@ -7627,6 +7627,39 @@ async def _weblead_route(request):
 
 
 @mcp.tool()
+def website_lead_delete_test(visual_id: str, confirm: bool = False) -> str:
+    """Delete a TEST web-lead quote (and its customer, only if that quote was the customer's
+    only order). Guarded: the quote must be a $0 Quote whose nickname contains 'web lead'.
+    confirm=False only shows what would be deleted."""
+    r = query_printavo("""query($q: String) { quotes(first: 5, query: $q) { nodes {
+        id visualId nickname total contact { id fullName email customer { id companyName orderCount } } } } }""",
+        {"q": str(visual_id)}, allow_partial=True)
+    if "error" in r:
+        return f"API Error: {r['error']}"
+    q = next((n for n in ((r.get("quotes") or {}).get("nodes") or []) if str(n.get("visualId")) == str(visual_id)), None)
+    if not q:
+        return f"Quote #{visual_id} not found (only quotes can be deleted here)."
+    if "web lead" not in (q.get("nickname") or "").lower() or float(q.get("total") or 0) != 0:
+        return f"Refused: #{visual_id} ('{q.get('nickname')}', ${q.get('total')}) is not a $0 web-lead quote."
+    cu = ((q.get("contact") or {}).get("customer")) or {}
+    drop_cust = bool(cu.get("id")) and (cu.get("orderCount") or 0) <= 1
+    plan = (f"Quote #{visual_id} '{q.get('nickname')}' — delete. Customer '{cu.get('companyName')}' "
+            f"(orders: {cu.get('orderCount')}) — {'delete' if drop_cust else 'KEEP (has other orders)'}.")
+    if not confirm:
+        return "DRY RUN\n" + plan
+    out = [plan]
+    d = query_printavo("mutation($id: ID!) { quoteDelete(id: $id) { id } }", {"id": q["id"]})
+    out.append(f"Quote deleted: {'OK' if 'error' not in d else d['error']}")
+    if drop_cust and "error" not in d:
+        time.sleep(PAGE_DELAY_S)
+        d = query_printavo("mutation($id: ID!) { customerDelete(id: $id) { id } }", {"id": cu["id"]})
+        out.append(f"Customer deleted: {'OK' if 'error' not in d else d['error']}")
+    seen = _goods_json("weblead_seen.json", {})
+    _goods_json_save("weblead_seen.json", {k: v for k, v in seen.items() if str(v) != str(visual_id)})
+    return "\n".join(out)
+
+
+@mcp.tool()
 def website_lead_test(payload_json: str, dry_run: bool = True, force: bool = False, cleanup: bool = False) -> str:
     """Test the website-lead → Printavo intake with a JSON form payload (keys like name,
     company, email, phone, interested_in, need_by, quantity, details, file_upload).

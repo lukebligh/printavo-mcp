@@ -57,6 +57,9 @@ def _sizes(items):
         g[(st, co)][sz] = g[(st, co)].get(sz, 0) + q
     out = []
     for (st, co), sz in g.items():
+        if not co:                                    # not invoiced yet → no color/size detail
+            out.append(f"  {st}: {int(sum(sz.values()))} pcs (sizes show once SanMar invoices)")
+            continue
         ks = sorted(sz, key=lambda k: (order.index(k) if k in order else 99, k))
         out.append(f"  {st} {co}: " + " ".join(f"{k}{int(sz[k]) if float(sz[k]).is_integer() else sz[k]}" for k in ks))
     return out
@@ -94,7 +97,7 @@ def sanmar_po_section(po, status, ships, invs):
         items = []
         for b in ships:
             for i in b["items"]:
-                stl, co, sz = names.get(i["part_id"], (i["style"], f"#{i['part_id']}", ""))
+                stl, co, sz = names.get(i["part_id"], (i["style"], "", ""))
                 items.append((stl, co, sz, float(i["qty"] or 0)))
         lines += _sizes(items)
     else:

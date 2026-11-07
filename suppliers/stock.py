@@ -45,6 +45,21 @@ def _pick_colors(colors, want):
     return exact or sorted(c for c in colors if w in _cn(c))
 
 
+# Closest to St. Louis first — that's what decides transit (1 day from Cincinnati / Lockport IL).
+_NEAR = {"SanMar": ["Cincinnati", "Minneapolis", "Dallas", "Richmond", "Robbinsville", "Jacksonville"],
+         "S&S": ["IL", "KS", "KY", "TX", "OH", "PA", "GA", "NV"]}
+
+
+def _near(supplier, whs):
+    """-> (name, qty) for the nearest warehouse holding stock."""
+    have = {n: q for n, q in whs if q}
+    for n in _NEAR[supplier]:
+        for k, q in have.items():
+            if k.lower().startswith(n.lower()):
+                return k, q
+    return max(have.items(), key=lambda x: x[1]) if have else None
+
+
 def _money(x):
     return f"${x:,.2f}"
 
@@ -70,9 +85,8 @@ def sanmar_side(style, color):
     for r in inv:
         if r["color"] in picked[:1]:
             sz = norm_size(r["size"])
-            whs = sorted(r["warehouses"], key=lambda w: -w[1])
             rows[sz] = {"stock": r["total"], "price": prices.get((_cn(r["color"]), sz)),
-                        "top": whs[0] if whs and whs[0][1] else None}
+                        "top": _near("SanMar", r["warehouses"])}
     return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked, "rows": rows}
 
 
@@ -88,10 +102,8 @@ def ss_side(style, color, brand=""):
             sz = norm_size(i.get("sizeName"))
             price = next((float(i[f]) for f in ("customerPrice", "salePrice", "casePrice", "piecePrice")
                           if isinstance(i.get(f), (int, float)) and i[f] > 0), None)
-            whs = sorted(((w.get("warehouseAbbr") or "?", int(w.get("qty") or 0))
-                          for w in (i.get("warehouses") or [])), key=lambda w: -w[1])
-            rows[sz] = {"stock": int(i.get("qty") or 0), "price": price,
-                        "top": whs[0] if whs and whs[0][1] else None}
+            whs = [(w.get("warehouseAbbr") or "?", int(w.get("qty") or 0)) for w in (i.get("warehouses") or [])]
+            rows[sz] = {"stock": int(i.get("qty") or 0), "price": price, "top": _near("S&S", whs)}
     styles = sorted({f"{i.get('brandName', '')} {i.get('styleName', '')}".strip() for i in items})
     return {"supplier": "S&S", "found": True, "colors": colors, "picked": picked, "rows": rows,
             "styles": styles}
@@ -139,7 +151,8 @@ def check(style, color="", sizes="", brand=""):
                 missing.append(z)
                 continue
             p = f"{_money(r['price'])} ea" if r["price"] else "price n/a"
-            top = f" · most at {r['top'][0]} ({r['top'][1]:,})" if r["top"] else ""
+            top = (f" · nearest {r['top'][0]} {r['top'][1]:,}{'+' if r['top'][1] == {'SanMar': 3000, 'S&S': 500}[s['supplier']] else ''}"
+                   if r["top"] else "")
             flag = ""
             if q:
                 if r["stock"] >= q:
@@ -164,5 +177,5 @@ def check(style, color="", sizes="", brand=""):
         out.append(line)
     elif verdicts:
         out.append("\n⚠ Neither supplier can fill the full size run in this color — split it or pick another color.")
-    out.append("Stock is live right now, not reserved. Our price = Est Merch account price (before freight).")
+    out.append("Stock is live right now, not reserved. Our price = Est Merch account price, before freight (free over $200 per supplier order).")
     return "\n".join(out)

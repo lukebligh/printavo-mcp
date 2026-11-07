@@ -36,13 +36,24 @@ def _cn(c):
     return re.sub(r"[^a-z0-9]", "", (c or "").lower())
 
 
+def _sk(c):
+    """Consonant skeleton — SanMar's stock feed abbreviates ('HunterGrn', 'Hthr Navy'):
+    'Hunter Green' and 'HunterGrn' both -> 'hntrgrn'."""
+    c = _cn(c)
+    return (c[:1] + re.sub(r"[aeiouy]", "", c[1:])) if c else ""
+
+
 def _pick_colors(colors, want):
-    """Exact (normalized) match wins; else every color containing the text."""
+    """Exact > contains > same skeleton > skeleton contains."""
     if not want:
         return sorted(colors)
-    w = _cn(want)
-    exact = [c for c in colors if _cn(c) == w]
-    return exact or sorted(c for c in colors if w in _cn(c))
+    w, ws = _cn(want), _sk(want)
+    for test in (lambda c: _cn(c) == w, lambda c: w in _cn(c),
+                 lambda c: _sk(c) == ws, lambda c: ws and ws in _sk(c)):
+        hit = sorted(c for c in colors if test(c))
+        if hit:
+            return hit
+    return []
 
 
 # Closest to St. Louis first — that's what decides transit (1 day from Cincinnati / Lockport IL).
@@ -77,6 +88,7 @@ def sanmar_side(style, color):
                 v = 0
             if v:
                 prices[(_cn(p["color"]), norm_size(p["size"]))] = v
+                prices.setdefault(("sk:" + _sk(p["color"]), norm_size(p["size"])), v)
     except Exception:
         pass
     colors = sorted({r["color"] for r in inv})
@@ -85,13 +97,21 @@ def sanmar_side(style, color):
     for r in inv:
         if r["color"] in picked[:1]:
             sz = norm_size(r["size"])
-            rows[sz] = {"stock": r["total"], "price": prices.get((_cn(r["color"]), sz)),
+            rows[sz] = {"stock": r["total"], "price": prices.get((_cn(r["color"]), sz)) or prices.get(("sk:" + _sk(r["color"]), sz)),
                         "top": _near("SanMar", r["warehouses"])}
     return {"supplier": "SanMar", "found": True, "colors": colors, "picked": picked, "rows": rows}
 
 
+# SanMar prefixes some outside brands; S&S lists them by the bare number.
+_SS_BRAND = {"BC": "BELLA + CANVAS", "NL": "Next Level", "CAR": "Carhartt", "CT": "Carhartt"}
+
+
 def ss_side(style, color, brand=""):
     items = _ss.products(f"{brand} {style}".strip())
+    m = re.match(r"^([A-Za-z]+)(\d.*)$", style)
+    if not items and m:
+        b = brand or _SS_BRAND.get(m.group(1).upper(), "")
+        items = _ss.products(f"{b} {m.group(2)}".strip())
     if not items:
         return {"supplier": "S&S", "found": False}
     colors = sorted({i.get("colorName") or "" for i in items})

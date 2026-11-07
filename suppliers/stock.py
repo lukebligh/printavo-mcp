@@ -152,9 +152,16 @@ def check(style, color="", sizes="", brand=""):
             out.append(f"\n{name}: '{style}' matches several styles — {', '.join(s['styles'][:6])}. Add brand=.")
             continue
         if not color or not s["picked"]:
-            why = "no color given" if not color else f"no color matches '{color}'"
-            out.append(f"\n{name}: {why} — {len(s['colors'])} colors: " + ", ".join(s["colors"][:40])
-                       + (" …" if len(s["colors"]) > 40 else ""))
+            if not color:
+                out.append(f"\n{name}: {len(s['colors'])} colors: " + ", ".join(s["colors"][:60])
+                           + (" …" if len(s["colors"]) > 60 else ""))
+                continue
+            words = [x for x in re.split(r"\W+", color.lower()) if len(x) > 2]
+            near = [c for c in s["colors"] if any(w in _cn(c) or _sk(w) in _sk(c) for w in words)]
+            out.append(f"\n{name}: no '{color}' in {style}. "
+                       + (f"Closest: {', '.join(near[:15])}." if near else f"{len(s['colors'])} colors — leave color blank to list them.")
+                       + (f" Heathers are often in the CVC version ({style}CVC)." if "heather" in color.lower()
+                          and not style.upper().endswith("CVC") else ""))
             continue
         clr = s["picked"][0]
         hdr = f"\n{name} — {clr}"

@@ -7589,6 +7589,25 @@ def _weblead_run(payload: dict):
                       recipients=WEBLEAD_NOTIFY + ",U0504FSDYB0")
 
 
+# WordPress only runs queued jobs (incl. WPForms webhooks: the owner email + this lead
+# intake) when someone loads a page — on a quiet site that's 10+ minutes. Poke wp-cron
+# every 2 minutes so leads land in ~2 (Luke's test Nov 7 took 10 min to reach Slack).
+WP_CRON_URL = os.environ.get("WP_CRON_URL", "https://estmerch.com/wp-cron.php?doing_wp_cron")
+
+
+def run_wp_cron_poker():
+    while True:
+        if WP_CRON_URL:
+            try:
+                httpx.get(WP_CRON_URL, timeout=20, headers={"User-Agent": "estmerch-automation/1.0"})
+            except Exception as e:
+                print(f"[WPCRON] {e}", flush=True)
+        time.sleep(120)
+
+
+threading.Thread(target=run_wp_cron_poker, daemon=True).start()
+
+
 @mcp.custom_route("/hooks/website-lead/{token}", methods=["POST"])
 async def _weblead_route(request):
     from starlette.responses import JSONResponse

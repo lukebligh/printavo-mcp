@@ -53,6 +53,7 @@ def _sizes(items):
     order = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL"]
     g = OrderedDict()
     for st, co, sz, q in items:
+        sz = {"XXL": "2XL", "XXXL": "3XL", "XXXXL": "4XL"}.get((sz or "").upper(), sz)
         g.setdefault((st, co), OrderedDict())
         g[(st, co)][sz] = g[(st, co)].get(sz, 0) + q
     out = []

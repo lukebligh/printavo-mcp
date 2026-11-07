@@ -4225,6 +4225,7 @@ def _fetch_orders_in_status(status_name: str) -> dict:
             "company": (c.get("customer") or {}).get("companyName") or c.get("fullName") or "—",
             "prod": _parse_dt(n.get("startAt")),
             "contact": c,
+            "id": n.get("id"),
         })
     return {"orders": out}
 
@@ -6998,11 +6999,19 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
                 if ships and not status:                 # not open any more and shipped → frozen
                     cache[key] = {"ships": ships, "invs": invs, "final": bool(invs)}
             sec, info = _goods.sanmar_po_section(po, status, ships, invs)
+            others = [x for x in _scogs.order_numbers(po) if x != vid]
+            if others and sec:
+                sec.insert(1, "  Combined PO with " + " ".join(f"#{x}" for x in others)
+                           + " — items below are the whole PO")
             lines += sec
             infos.append((po, info))
         for so in ss_orders:
             if vid in _scogs.order_numbers(str(so.get("poNumber") or "")):
                 sec, info = _goods.ss_po_section(so)
+                others = [x for x in _scogs.order_numbers(str(so.get("poNumber") or "")) if x != vid]
+                if others and sec:
+                    sec.insert(1, "  Combined PO with " + " ".join(f"#{x}" for x in others)
+                               + " — items below are the whole PO")
                 lines += sec
                 infos.append((str(so.get("poNumber")), info))
         has_po = bool(infos)
@@ -7014,14 +7023,17 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
             stamp = _central_now().strftime("%m/%d %-I:%M%p").lower()
             block = "\n".join([f"— GOODS (auto · {stamp}) —"] + lines + [_goods.END])
         results.append({"vid": vid, "status": o["status"], "nick": o["nick"], "prod": prod,
-                        "block": block, "exceptions": exc})
+                        "block": block, "exceptions": exc, "id": o.get("id")})
     _goods_json_save("goods_po_cache.json", cache)
 
     written, unchanged = [], 0
     for r in results:
         if not r["block"]:
             continue
-        internal_id, otype, err = _find_order(r["vid"])
+        if r.get("id"):                                  # came from the invoices-by-status query
+            internal_id, otype, err = r["id"], "invoice", None
+        else:
+            internal_id, otype, err = _find_order(r["vid"])
         if not internal_id:
             errors.append(f"#{r['vid']}: {err}")
             continue
@@ -7057,7 +7069,7 @@ def strip_ok(saved: str, before: str) -> bool:
 
 def _goods_notes_text(rep: dict, dry_run: bool) -> str:
     out = [("[DRY RUN — nothing written] " if dry_run else "") +
-           f"GOODS NOTES · {len(rep['results'])} orders in VERIFY GOODS / DIRECT - WAITING ON GOODS · "
+           f"GOODS NOTES · {len(rep['results'])} direct orders from art stage through production · "
            f"{'would update' if dry_run else 'updated'} {len([r for r in rep['results'] if r.get('new_note')]) if dry_run else len(rep['written'])}"
            f" · unchanged {rep['unchanged']}"]
     for r in rep["results"]:

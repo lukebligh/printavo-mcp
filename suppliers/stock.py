@@ -185,7 +185,7 @@ def check(style, color="", sizes="", brand=""):
                            + (" …" if len(s["colors"]) > 60 else ""))
                 continue
             words = [x for x in re.split(r"\W+", color.lower()) if len(x) > 2]
-            near = [c for c in s["colors"] if any(w in _cn(c) or _sk(w) in _sk(c) for w in words)]
+            near = [c for c in s["colors"] if any(w in _cn(c) or (len(w) >= 5 and _sk(w) in _sk(c)) for w in words)]
             out.append(f"\n{name}: no '{color}' in {style}. "
                        + (f"Closest: {', '.join(near[:15])}." if near else f"{len(s['colors'])} colors — leave color blank to list them.")
                        + (f" Heathers are often in the CVC version ({style}CVC)." if "heather" in color.lower()

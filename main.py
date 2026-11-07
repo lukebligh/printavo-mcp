@@ -4231,6 +4231,51 @@ def _fetch_orders_in_status(status_name: str) -> dict:
 
 
 def _goods_gate_lines(today_flags: list) -> list:
+    lines = _goods_gate_lines_core(today_flags)
+    try:
+        lines += _goods_late_lines()
+    except Exception as e:
+        print(f"[PROD PUSH] late-goods lines failed: {e}", flush=True)
+    return lines
+
+
+def _goods_late_lines() -> list:
+    """Luke, Nov 6: jobs in the next 3 business days whose goods aren't here yet, from the
+    last goods-notes pull (SanMar/S&S). Only orders still in the art stage / goods gate."""
+    st = _goods_json("goods_state.json", {})
+    if not st.get("orders") or _goods is None:
+        return []
+    today = _central_now().date()
+    horizon = _goods.add_business_days(today, 3)
+    rows = []
+    for vid, o in st["orders"].items():
+        if o["status"] not in _GOODS_ALERT_STATUSES or not o.get("prod"):
+            continue
+        prod = datetime.fromisoformat(o["prod"]).date()
+        if prod > horizon:
+            continue
+        why = []
+        if not o["pos"]:
+            why.append("no SanMar/S&S PO found")
+        for p in o["pos"]:
+            eta = datetime.fromisoformat(p["eta"]).date() if p.get("eta") else None
+            if p["backorder"] or p["hold"]:
+                why.append(f"\"{p['po']}\" {'BACKORDER' if p['backorder'] else 'ON HOLD'}")
+            elif not p["shipped"] and p["open"]:
+                why.append(f"\"{p['po']}\" not shipped yet")
+            elif eta and eta >= today:
+                why.append(f"\"{p['po']}\" arrives ~{eta:%a %m/%d}" + (" ⚠️ AFTER prod" if eta > prod else ""))
+        if why:
+            rows.append((prod, f"• #{vid} — {o['company']} — {o['nick']} — prod {prod:%a %m/%d}: "
+                               + "; ".join(why)))
+    if not rows:
+        return []
+    rows.sort()
+    return [f"\n🚚 *Goods not here yet — jobs in the next 3 business days* (as of {st.get('at', '?')}):"] \
+        + [r for _d, r in rows]
+
+
+def _goods_gate_lines_core(today_flags: list) -> list:
     """The goods-gate block for the daily post: today's jobs that have not
     cleared the gate, then Justin's VERIFY GOODS queue by production date."""
     lines = []
@@ -6896,7 +6941,7 @@ def supplier_cogs_preview(days: int = 35) -> str:
 #  (status, ship date, est. arrival, tracking, items by size, backorders).
 #  The rest of the note is never touched. Exceptions (backorder/short, hold,
 #  late vs production date, no PO found) DM Clint + Mechelle + Luke ONCE each.
-#  Runs weekdays ~8:05, 12:05, 16:05 CT (SanMar asks ≤3 status checks/day/PO).
+#  Runs weekdays 7:55, 12:05, 2:55 CT (SanMar asks ≤3 status checks/day/PO).
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     from suppliers import goods as _goods
@@ -6905,7 +6950,9 @@ except Exception as _e:  # pragma: no cover
     _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | goods: {_e!r}"
 
 GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "true").lower() not in ("0", "false", "no", "off")
-GOODS_NOTES_HOURS_CT = [int(h) for h in os.environ.get("GOODS_NOTES_HOURS_CT", "8,12,16").split(",") if h.strip()]
+# Luke, Nov 6: pulls at 7:55, 12:05, 2:55 CT (SanMar: ≤3 status checks/day/PO).
+GOODS_NOTES_TIMES_CT = [tuple(int(x) for x in t.split(":")) for t in
+                        os.environ.get("GOODS_NOTES_TIMES_CT", "07:55,12:05,14:55").split(",") if t.strip()]
 GOODS_ALERT_USERS = os.environ.get("GOODS_ALERT_USERS", "U07VDHDSMUJ,U07VDET3XEX,U0504FSDYB0")  # Clint, Mechelle, Luke
 # Luke, Nov 6: every DIRECT order past ORDER GOODS until it's done in production.
 # Alerts only while goods still matter (art stage → the goods gate); once an order is in
@@ -7023,8 +7070,19 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
             stamp = _central_now().strftime("%m/%d %-I:%M%p").lower()
             block = "\n".join([f"— GOODS (auto · {stamp}) —"] + lines + [_goods.END])
         results.append({"vid": vid, "status": o["status"], "nick": o["nick"], "prod": prod,
-                        "block": block, "exceptions": exc, "id": o.get("id")})
+                        "block": block, "exceptions": exc, "id": o.get("id"),
+                        "company": o.get("company"), "infos": infos})
     _goods_json_save("goods_po_cache.json", cache)
+    if not only_order:   # snapshot for the 7 AM #daily-schedule post
+        _goods_json_save("goods_state.json", {
+            "at": _central_now().strftime("%a %-I:%M%p").lower(),
+            "orders": {r["vid"]: {"status": r["status"], "nick": r["nick"], "company": r["company"],
+                                  "prod": r["prod"].isoformat() if r["prod"] else None,
+                                  "pos": [{"po": po, "shipped": i["shipped"], "open": i["open"],
+                                           "backorder": i["backorder"], "hold": i["hold"],
+                                           "eta": i["eta"].isoformat() if i["eta"] else None}
+                                          for po, i in r["infos"]]}
+                       for r in results}})
 
     written, unchanged = [], 0
     for r in results:
@@ -7117,9 +7175,10 @@ def run_goods_notes_scheduler():
     while True:
         try:
             now_ct = _central_now()
-            slot = f"{now_ct.date()}-{now_ct.hour}"
-            if (GOODS_NOTES_ENABLED and now_ct.weekday() < 5 and now_ct.hour in GOODS_NOTES_HOURS_CT
-                    and 5 <= now_ct.minute < 20 and _last_goods_run != slot):
+            mins = now_ct.hour * 60 + now_ct.minute
+            due = [f"{h:02d}:{m:02d}" for h, m in GOODS_NOTES_TIMES_CT if 0 <= mins - (h * 60 + m) < 15]
+            slot = f"{now_ct.date()}-{due[0]}" if due else None
+            if (GOODS_NOTES_ENABLED and now_ct.weekday() < 5 and slot and _last_goods_run != slot):
                 _last_goods_run = slot
                 try:
                     rep = _goods_notes_impl(dry_run=False)
@@ -7138,6 +7197,30 @@ def run_goods_notes_scheduler():
 
 
 threading.Thread(target=run_goods_notes_scheduler, daemon=True).start()
+
+
+try:
+    from suppliers import stock as _stock
+except Exception as _e:  # pragma: no cover
+    _stock = None
+    _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | stock: {_e!r}"
+
+
+@mcp.tool()
+def blank_check(style: str, color: str = "", sizes: str = "", brand: str = "") -> str:
+    """BEFORE QUOTING (Clint): live stock + Est Merch's price at SanMar AND S&S for one
+    blank, checked against the sizes the job needs, with the cheapest supplier that can
+    fill the whole run and the blank cost.
+    style: e.g. PC61, 5000, BC3001, ST350. color: plain words, partial OK ("forest",
+    "heather navy"). sizes: "S10 M30 L40 XL20 2XL10" (or "M L XL" for stock only).
+    brand: only if S&S says the style matches several brands (e.g. "Gildan").
+    Leave color blank to list the colors offered."""
+    if _stock is None:
+        return f"Blank check unavailable: {_SANMAR_IMPORT_ERR}"
+    try:
+        return _stock.check(style.strip(), color.strip(), sizes, brand.strip())
+    except Exception as e:
+        return f"Blank check failed: {e}"
 
 
 @mcp.tool()

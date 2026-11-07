@@ -92,3 +92,33 @@ def orders_recent():
     if r.status_code != 200:
         raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
     return r.json() or []
+
+
+def _get(path, params):
+    try:
+        r = httpx.get(f"{BASE}{path}", auth=_auth(), timeout=60, params={**params, "mediatype": "json"})
+    except httpx.HTTPError as e:
+        raise SSError(f"S&S unreachable: {e}")
+    if r.status_code == 404:
+        return []
+    if r.status_code != 200:
+        raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
+    return r.json() or []
+
+
+def products(style):
+    """Every SKU (color x size, stock by warehouse, our price) for a style. style may be
+    'Gildan 5000', a part number, or a bare style name ('5000' / 'BC3001'); a bare name
+    that exists under several brands returns all of them (caller asks for a brand)."""
+    items = _get("/products/", {"style": style})
+    if items:
+        return items
+    want = style.strip().lower()
+    hits = [s for s in _get("/styles/", {"search": style})
+            if str(s.get("styleName", "")).lower() == want
+            or f"{s.get('brandName', '')} {s.get('styleName', '')}".lower() == want
+            or str(s.get("partNumber", "")).lower() == want]
+    out = []
+    for s in hits[:4]:
+        out += _get("/products/", {"styleid": s.get("styleID")})
+    return out

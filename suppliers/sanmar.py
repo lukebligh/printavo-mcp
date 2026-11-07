@@ -320,10 +320,11 @@ def find_pos(ref):
         return []
     if not ref.isdigit():
         return [ref]
-    pat = re.compile(rf"^\s*#?{re.escape(ref)}(?!\d)")
+    # Anywhere in the PO, not touching other digits: combined POs read "7458 PiFi-7427 GOTR-Merch"
+    pat = re.compile(rf"(?<!\d){re.escape(ref)}(?!\d)")
     seen = {}
     for po in sorted(_known_pos()):
-        if pat.match(po):
+        if pat.search(po):
             seen.setdefault(po.strip().upper(), po.strip())   # SanMar returns the same PO in two casings
     return sorted(seen.values())
 

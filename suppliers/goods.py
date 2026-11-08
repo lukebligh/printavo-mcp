@@ -91,12 +91,15 @@ def sanmar_po_section(po, status, ships, invs):
         pcs = sum(int(float(i["qty"] or 0)) for b in ships for i in b["items"])
         label = "PARTIALLY SHIPPED" if "partial" in st else "SHIPPED"
         info["tracking"] = [t for t in by_trk if t]
+        info["carriers"] = {t: (b.get("carrier") or "") for t, b in by_trk.items() if t}
         trk = ", ".join(t for t in by_trk if t)
+        cars = {c.split()[0].upper() for c in info["carriers"].values() if c}
+        trk_label = "UPS" if cars <= {"UPS"} else "/".join(sorted(c.title() for c in cars))
         lines.append(f"SanMar \"{po}\": {label} {last_ship:%m/%d} from {(' '.join(origin.split()[:-1]).title() + ' ' + state).strip()} · "
                      f"{pcs} pcs, {len(ships)} box{'es' if len(ships) != 1 else ''} · "
                      f"est. arrival {info['eta']:%a %m/%d}" if last_ship else f"SanMar \"{po}\": {label}")
         if trk:
-            lines.append(f"  UPS: {trk}")
+            lines.append(f"  {trk_label}: {trk}")
         items = []
         for b in ships:
             for i in b["items"]:
@@ -128,6 +131,7 @@ def ss_po_section(o):
     info = {"shipped": shipped, "eta": eta, "backorder": "back" in st.lower(), "hold": "hold" in st.lower(),
             "open": not shipped, "canceled": "cancel" in st.lower(), "partial": False,
             "tracking": [t.strip() for t in str(o.get("trackingNumber") or "").replace(";", ",").split(",") if t.strip()]}
+    info["carriers"] = {t: str(o.get("shippingCarrier") or "") for t in info["tracking"]}
     head = f"S&S \"{o.get('poNumber')}\": {st.upper() or 'ORDERED'}"
     if _d(o.get("shipDate")) and shipped:
         head += f" {_d(o.get('shipDate')):%m/%d}"
@@ -135,7 +139,8 @@ def ss_po_section(o):
         head += f" · ETA {eta:%a %m/%d}"
     lines = [head]
     if o.get("trackingNumber"):
-        lines.append(f"  Tracking: {o['trackingNumber']}")
+        car = str(o.get("shippingCarrier") or "").strip()
+        lines.append(f"  {car + ' ' if car and car.upper() != 'UPS' else ''}Tracking: {o['trackingNumber']}")
     items = [(str(li.get("styleName") or ""), str(li.get("colorName") or ""), str(li.get("sizeName") or ""),
               float(li.get("qtyShipped") or li.get("qtyOrdered") or 0)) for li in (o.get("lines") or [])]
     lines += _sizes([i for i in items if i[3]])

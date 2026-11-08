@@ -7073,7 +7073,8 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
         all_in = None
         if has_po and _ups.enabled():
             try:
-                trk = _ups.track([t for _p, i in infos for t in (i.get("tracking") or [])])
+                trk = _ups.track([t for _p, i in infos for t in (i.get("tracking") or [])],
+                                 {t: c for _p, i in infos for t, c in (i.get("carriers") or {}).items()})
                 all_line, all_in = _ups.summary(infos, trk)
                 if all_line:
                     lines.insert(0, all_line)

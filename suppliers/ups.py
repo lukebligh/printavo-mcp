@@ -22,7 +22,54 @@ _tok = {"v": None, "exp": 0}
 
 
 def enabled():
+    return ups_enabled() or bool(os.environ.get("EASYPOST_API_KEY"))
+
+
+def ups_enabled():
     return bool(os.environ.get("UPS_CLIENT_ID") and os.environ.get("UPS_CLIENT_SECRET"))
+
+
+def _ep_carrier(c):
+    c = (c or "").lower()
+    for k, v in (("spee", "SpeeDee"), ("fedex", "FedEx"), ("usps", "USPS"), ("ontrac", "OnTrac"), ("ups", "UPS")):
+        if k in c:
+            return v
+    return None
+
+
+_EP_STATUS = {"delivered": True, "available_for_pickup": False, "in_transit": False, "out_for_delivery": False,
+              "pre_transit": False, "return_to_sender": False, "failure": False}
+
+
+def _easypost(n, carrier, ep_id=None):
+    """Non-UPS tracking (SpeeDee, FedEx…) via EasyPost trackers. -> (result|None, tracker_id)"""
+    key = os.environ.get("EASYPOST_API_KEY")
+    if not key:
+        return None, ep_id
+    try:
+        if ep_id:
+            r = httpx.get(f"https://api.easypost.com/v2/trackers/{ep_id}", auth=(key, ""), timeout=30)
+        else:
+            t = {"tracking_code": n}
+            if carrier:
+                t["carrier"] = carrier
+            r = httpx.post("https://api.easypost.com/v2/trackers", auth=(key, ""), timeout=30, json={"tracker": t})
+        if r.status_code not in (200, 201):
+            return None, ep_id
+        j = r.json()
+    except Exception:
+        return None, ep_id
+    st = str(j.get("status") or "")
+    if st not in _EP_STATUS:
+        return None, j.get("id") or ep_id
+    det = j.get("tracking_details") or []
+    when = None
+    if st == "delivered" and det:
+        dt = str(det[-1].get("datetime") or "")
+        when = f"{dt[:10]} {dt[11:16]}" if len(dt) >= 16 else dt[:10] or None
+    est = str(j.get("est_delivery_date") or "")[:10] or None
+    return ({"delivered": st == "delivered", "when": when, "expected": est,
+             "status": (j.get("carrier") or "") + " " + st.replace("_", " ")}, j.get("id") or ep_id)
 
 
 def is_ups(n):
@@ -84,20 +131,26 @@ def _save(c):
         pass
 
 
-def track(numbers):
+def track(numbers, carriers=None):
+    """carriers: optional {tracking: carrier text from the supplier}."""
     out = {}
+    carriers = {str(k).strip().upper(): v for k, v in (carriers or {}).items()}
     if not enabled():
         return {n: None for n in numbers}
     with _lock:
         cache = _load()
         now = time.time()
         for n in dict.fromkeys(str(x).strip().upper() for x in numbers if x):
-            if not is_ups(n):
-                out[n] = None
-                continue
             c = cache.get(n)
             if c and (c["r"] and c["r"]["delivered"] or now - c["t"] < CACHE_MIN * 60):
                 out[n] = c["r"]
+                continue
+            if not is_ups(n) or not ups_enabled():
+                res, ep_id = _easypost(n, _ep_carrier(carriers.get(n)) if not is_ups(n) else "UPS",
+                                       (c or {}).get("ep"))
+                out[n] = res
+                if res is not None or ep_id:
+                    cache[n] = {"t": now, "r": res, "ep": ep_id}
                 continue
             try:
                 r = httpx.get(f"{BASE}/api/track/v1/details/{n}", timeout=30,

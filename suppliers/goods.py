@@ -76,7 +76,8 @@ def sanmar_po_section(po, status, ships, invs):
     st = (status[0]["status"] if status else "").lower()
     issues = sorted({i for s in status for i in (s.get("issues") or []) + ([s["issue"]] if s.get("issue") else [])})
     info = {"shipped": bool(ships), "eta": None, "backorder": "backOrderHold" in issues,
-            "hold": "generalHold" in issues, "open": bool(status) and st not in ("complete", "canceled")}
+            "hold": "generalHold" in issues, "open": bool(status) and st not in ("complete", "canceled"),
+            "canceled": st == "canceled", "partial": "partial" in st, "tracking": []}
     lines = []
     if ships:
         by_trk = OrderedDict()
@@ -89,6 +90,7 @@ def sanmar_po_section(po, status, ships, invs):
             info["eta"] = add_business_days(last_ship, _TRANSIT.get(state, 3))
         pcs = sum(int(float(i["qty"] or 0)) for b in ships for i in b["items"])
         label = "PARTIALLY SHIPPED" if "partial" in st else "SHIPPED"
+        info["tracking"] = [t for t in by_trk if t]
         trk = ", ".join(t for t in by_trk if t)
         lines.append(f"SanMar \"{po}\": {label} {last_ship:%m/%d} from {(' '.join(origin.split()[:-1]).title() + ' ' + state).strip()} · "
                      f"{pcs} pcs, {len(ships)} box{'es' if len(ships) != 1 else ''} · "
@@ -108,6 +110,7 @@ def sanmar_po_section(po, status, ships, invs):
     for s in status:
         short = [l for l in s["lines"] if l["ordered"] and float(l["shipped"] or 0) < float(l["ordered"] or 0)]
         if short and ships:
+            info["partial"] = True
             lines.append("  Not shipped yet: " + ", ".join(
                 f"{' '.join(x for x in names.get(l['part_id'], (l['style'], '', '')) if x)} "
                 f"{int(float(l['ordered']) - float(l['shipped'] or 0))}" for l in short[:12]))
@@ -123,7 +126,8 @@ def ss_po_section(o):
     shipped = bool(o.get("trackingNumber")) or st.lower() in ("shipped", "invoiced", "complete", "completed")
     eta = _d(o.get("expectedDeliveryDate"))
     info = {"shipped": shipped, "eta": eta, "backorder": "back" in st.lower(), "hold": "hold" in st.lower(),
-            "open": not shipped}
+            "open": not shipped, "canceled": "cancel" in st.lower(), "partial": False,
+            "tracking": [t.strip() for t in str(o.get("trackingNumber") or "").replace(";", ",").split(",") if t.strip()]}
     head = f"S&S \"{o.get('poNumber')}\": {st.upper() or 'ORDERED'}"
     if _d(o.get("shipDate")) and shipped:
         head += f" {_d(o.get('shipDate')):%m/%d}"
@@ -142,6 +146,7 @@ def ss_po_section(o):
             f"{li.get('styleName')} {li.get('colorName')} {li.get('sizeName')} "
             f"{int(float(li.get('qtyOrdered') or 0) - float(li.get('qtyShipped') or 0))}" for li in short[:12]))
         info["backorder"] = True
+        info["partial"] = True
     if info["backorder"]:
         lines.append("  ⚠ BACKORDER / SHORT at S&S")
     return lines, info

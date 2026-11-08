@@ -6945,11 +6945,19 @@ def supplier_cogs_preview(days: int = 35) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     from suppliers import goods as _goods
+    from suppliers import ups as _ups
 except Exception as _e:  # pragma: no cover
     _goods = None
     _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | goods: {_e!r}"
 
 GOODS_NOTES_ENABLED = os.environ.get("GOODS_NOTES_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+# Auto status moves from UPS delivery data (needs UPS_CLIENT_ID/SECRET):
+#   VERIFY GOODS -> DIRECT - WAITING ON GOODS when a box is still out / a PO hasn't shipped (once per order)
+#   DIRECT - WAITING ON GOODS -> VERIFY GOODS when every box shows DELIVERED
+GOODS_STATUS_FLIP_ENABLED = os.environ.get("GOODS_STATUS_FLIP_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+GOODS_FLIP_NOTIFY = os.environ.get("GOODS_FLIP_NOTIFY", "U0504FSDYB0")  # Luke while it beds in
+_VERIFY_GOODS = ("VERIFY GOODS", "559939")
+_DIRECT_WAITING = ("DIRECT - WAITING ON GOODS", "559940")
 # Luke, Nov 6: pulls at 7:55, 12:05, 2:55 CT (SanMar: ≤3 status checks/day/PO).
 GOODS_NOTES_TIMES_CT = [tuple(int(x) for x in t.split(":")) for t in
                         os.environ.get("GOODS_NOTES_TIMES_CT", "07:55,12:05,14:55").split(",") if t.strip()]
@@ -7062,6 +7070,15 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
                 lines += sec
                 infos.append((str(so.get("poNumber")), info))
         has_po = bool(infos)
+        all_in = None
+        if has_po and _ups.enabled():
+            try:
+                trk = _ups.track([t for _p, i in infos for t in (i.get("tracking") or [])])
+                all_line, all_in = _ups.summary(infos, trk)
+                if all_line:
+                    lines.insert(0, all_line)
+            except Exception as e:
+                errors.append(f"#{vid} UPS: {e}")
         prod = o["prod"].date() if o.get("prod") else None
         exc = (_goods.exceptions_for(vid, prod, infos, has_po, today=today)
                if o["status"] in _GOODS_ALERT_STATUSES else [])
@@ -7071,13 +7088,14 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
             block = "\n".join([f"— GOODS (auto · {stamp}) —"] + lines + [_goods.END])
         results.append({"vid": vid, "status": o["status"], "nick": o["nick"], "prod": prod,
                         "block": block, "exceptions": exc, "id": o.get("id"),
-                        "company": o.get("company"), "infos": infos})
+                        "company": o.get("company"), "infos": infos, "all_in": all_in})
     _goods_json_save("goods_po_cache.json", cache)
     if not only_order:   # snapshot for the 7 AM #daily-schedule post
         _goods_json_save("goods_state.json", {
             "at": _central_now().strftime("%a %-I:%M%p").lower(),
             "orders": {r["vid"]: {"status": r["status"], "nick": r["nick"], "company": r["company"],
                                   "prod": r["prod"].isoformat() if r["prod"] else None,
+                                  "all_in": r.get("all_in"),
                                   "pos": [{"po": po, "shipped": i["shipped"], "open": i["open"],
                                            "backorder": i["backorder"], "hold": i["hold"],
                                            "eta": i["eta"].isoformat() if i["eta"] else None}
@@ -7117,7 +7135,45 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
             written.append(r["vid"])
         else:
             errors.append(f"#{r['vid']}: note write did not verify ({res.get('error', 'mismatch')})")
-    return {"results": results, "written": written, "unchanged": unchanged, "errors": errors}
+    flips = _goods_status_flips(results, dry_run, errors)
+    return {"results": results, "written": written, "unchanged": unchanged, "errors": errors, "flips": flips}
+
+
+def _goods_status_flips(results, dry_run, errors):
+    """UPS-driven gate moves. Never touches anything outside VERIFY GOODS / DIRECT - WAITING ON GOODS."""
+    if not (GOODS_STATUS_FLIP_ENABLED and _ups.enabled()):
+        return []
+    done = _goods_json("goods_flips.json", {})
+    flips = []
+    for r in results:
+        st, a = r["status"], r.get("all_in")
+        if st == _VERIFY_GOODS[0] and a is False and not done.get(r["vid"], {}).get("to_wait"):
+            target, why = _DIRECT_WAITING, "goods not all delivered yet"
+        elif st == _DIRECT_WAITING[0] and a is True:
+            target, why = _VERIFY_GOODS, "UPS shows every box delivered — count it in"
+        else:
+            continue
+        f = {"vid": r["vid"], "nick": r["nick"], "from": st, "to": target[0], "why": why}
+        if not dry_run:
+            iid = r.get("id")
+            if not iid:
+                iid, _t, err = _find_order(r["vid"])
+            res = query_printavo("""mutation($p: ID!, $s: ID!) { statusUpdate(parentId: $p, statusId: $s) {
+                ... on Invoice { id } } }""", {"p": iid, "s": target[1]}) if iid else {"error": "not found"}
+            if "error" in res:
+                errors.append(f"#{r['vid']}: status move failed ({res['error']})")
+                continue
+            d = done.setdefault(r["vid"], {})
+            d["to_wait" if target is _DIRECT_WAITING else "to_verify"] = _central_now().isoformat()
+            time.sleep(PAGE_DELAY_S)
+        flips.append(f)
+    if not dry_run:
+        _goods_json_save("goods_flips.json", done)
+        if flips and GOODS_FLIP_NOTIFY:
+            _post_cogs_dm("🔁 *Goods status moves*\n" + "\n".join(
+                f"• #{f['vid']} {f['nick']}: {f['from']} → *{f['to']}* ({f['why']})" for f in flips),
+                recipients=GOODS_FLIP_NOTIFY)
+    return flips
 
 
 def strip_ok(saved: str, before: str) -> bool:
@@ -7135,6 +7191,11 @@ def _goods_notes_text(rep: dict, dry_run: bool) -> str:
         out.append(r["block"] if r["block"] else "  (no SanMar / S&S PO found — note not touched)")
         for _k, t in r["exceptions"]:
             out.append(f"  🔔 {t}")
+    if rep.get("flips"):
+        out.append(f"\nSTATUS MOVES ({'would make' if dry_run else 'made'}):")
+        out += [f"  #{f['vid']} {f['nick']}: {f['from']} → {f['to']} ({f['why']})" for f in rep["flips"]]
+    elif not _ups.enabled():
+        out.append("\n(UPS tracking not connected — no ALL GOODS line, no status moves)")
     if rep["errors"]:
         out.append("\nERRORS:\n" + "\n".join(f"  {e}" for e in rep["errors"]))
     return "\n".join(out)

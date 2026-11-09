@@ -7481,8 +7481,15 @@ def _goods_status_flips(results, dry_run, errors):
             res = query_printavo("""mutation($p: ID!, $s: ID!) { statusUpdate(parentId: $p, statusId: $s) {
                 ... on Invoice { id } } }""", {"p": iid, "s": target[1]}) if iid else {"error": "not found"}
             if "error" in res:
-                if "Not found" in str(res["error"]):   # deleted order still in Printavo's index
-                    print(f"[GOODS] #{r['vid']} gone (deleted?) — skipped", flush=True)
+                if "Not found" in str(res["error"]):
+                    # Printavo's API refuses status changes on some orders (seen on InkSoft store orders,
+                    # e.g. #7447). Tell Luke once; the team flips it by hand.
+                    d = done.setdefault(r["vid"], {})
+                    key = f"blocked_{target[1]}"
+                    if not d.get(key):
+                        d[key] = _central_now().isoformat()
+                        flips.append({**f, "to": target[0] + " — FLIP BY HAND",
+                                      "why": why + "; Printavo won't let the system move this order"})
                 else:
                     errors.append(f"#{r['vid']}: status move failed ({res['error']})")
                 continue

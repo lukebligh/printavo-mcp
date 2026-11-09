@@ -7098,6 +7098,11 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "", statuses=None)
                 infos.append((str(so.get("poNumber")), info))
         has_po = bool(infos)
         all_in = None
+        if has_po and o.get("id"):
+            try:   # combined POs: only count the boxes holding THIS order's blanks (Luke, Nov 9 — #7480)
+                _goods_scope_boxes(infos, _printavo_items_by_id(o["id"]), parts_cache)
+            except Exception as e:
+                errors.append(f"#{vid} box scoping: {e}")
         if has_po and _ups.enabled():
             try:
                 trk = _ups.track([t for _p, i in infos for t in (i.get("tracking") or [])],
@@ -7191,6 +7196,46 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "", statuses=None)
     return {"results": results, "written": written, "unchanged": unchanged, "errors": errors, "flips": flips}
 
 
+def _goods_scope_boxes(infos, own_items, parts_cache):
+    """A shared SanMar PO (other jobs' blanks on it, with or without their order #s) ships in several
+    boxes. Keep only the boxes that hold this order's style+color, so 'ALL GOODS' means this job's
+    goods. Can't tell → leave every box in."""
+    want = {}
+    for li in own_items or []:
+        if _pocheck.real_style(li.get("style")):
+            want.setdefault(_pocheck.core(li["style"]), set()).add(li.get("color") or "")
+    if not want:
+        return
+    for _po, i in infos:
+        bp = i.get("box_parts") or {}
+        if not bp:
+            continue
+
+        def mine(style, pid, i=i):
+            cs = _pocheck.core(style)
+            if cs not in want:
+                return False
+            col = ((i.get("names") or {}).get(pid) or (None, None, None))[1]
+            if not col and style:
+                col = _pocheck.sanmar_parts(style, parts_cache).get(pid, ("", ""))[0]
+            if not col:
+                return True
+            return any(not c or _stock._pick_colors([col], c) for c in want[cs])
+
+        rel = [t for t, parts in bp.items() if any(mine(st, pid) for st, pid in parts)]
+        if not rel:
+            continue
+        others = [t for t in (i.get("tracking") or []) if t not in rel]
+        if others:
+            i["all_tracking"], i["tracking"], i["other_boxes"] = i["tracking"], rel, len(others)
+        if i.get("partial") and i.get("status_lines"):
+            short = [l for l in i["status_lines"]
+                     if float(l.get("shipped") or 0) < float(l.get("ordered") or 0)
+                     and mine(l.get("style") or "", l.get("part_id") or "")]
+            if not short:
+                i["partial"] = False           # what's still unshipped isn't this order's
+
+
 def _goods_po_check(vid, internal_id, infos):
     """-> (issues, total_pcs) or None. Needs = every Printavo order on the PO(s); only this order's
     own styles can be flagged 'not on any PO'."""
@@ -7264,6 +7309,7 @@ def _set_status_by_id(r, status_tuple, errors):
 # (UPS/EasyPost only — no extra SanMar calls). Justin's VERIFY GOODS text then means "it's here".
 GOODS_ROUTE_ENABLED = os.environ.get("GOODS_ROUTE_ENABLED", "true").lower() not in ("0", "false", "no", "off")
 _ART_APPROVED = "ART APPROVED"
+_ROUTED = {}
 
 
 def _route_art_approved(dry_run: bool = False) -> dict:
@@ -7275,17 +7321,28 @@ def _route_art_approved(dry_run: bool = False) -> dict:
     rep = _goods_notes_impl(dry_run=dry_run, statuses=(_ART_APPROVED,))
     by_vid = {r["vid"]: r for r in rep["results"]}
     moves, errors = [], list(rep["errors"])
+    now = time.time()
     for o in q["orders"]:
         vid = str(o["vid"])
+        if now - _ROUTED.get(vid, 0) < 1800:
+            continue                          # Printavo's status filter can lag — don't route twice
         r = by_vid.get(vid) or {"vid": vid, "id": o.get("id"), "nick": o.get("nick") or o.get("nickname") or ""}
-        if vid in by_vid and r.get("infos") and r.get("all_in") is False:
-            target, why = _DIRECT_WAITING, "goods still on the way"
-        elif vid in by_vid:
-            target, why = _VERIFY_GOODS, ("all goods delivered" if r.get("all_in") else
-                                          "no trackable SanMar/S&S goods — check by hand")
-        else:
+        # Rule (Luke, Nov 9): a direct order only reaches VERIFY GOODS once its goods are confirmed here.
+        if _cogs_is_contract_customer({"contact": o.get("contact") or {}}):
             target, why = _VERIFY_GOODS, "contract — check goods by hand"
+        elif r.get("all_in") is True:
+            target, why = _VERIFY_GOODS, "all goods delivered"
+        elif not r.get("infos"):
+            target, why = _DIRECT_WAITING, ("no SanMar/S&S PO — order the goods, or move it to VERIFY GOODS "
+                                            "by hand when they're here (other vendor / customer-supplied)")
+        elif r.get("all_in") is False:
+            target, why = _DIRECT_WAITING, "goods still on the way"
+        else:
+            target, why = _DIRECT_WAITING, ("a box can't be tracked — move it to VERIFY GOODS by hand "
+                                            "when it's here")
         if dry_run or _set_status_by_id(r, target, errors):
+            if not dry_run:
+                _ROUTED[vid] = now
             moves.append({"vid": vid, "nick": r.get("nick") or "", "from": _ART_APPROVED, "to": target[0], "why": why})
     if not dry_run:
         _goods_send_exceptions(rep)

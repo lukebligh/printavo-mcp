@@ -171,6 +171,9 @@ def track(numbers, carriers=None):
 def summary(po_infos, results):
     """po_infos: [(po, info)] with info['tracking'], info['shipped'], info['partial'], info['canceled'].
     -> (line or None, all_in True/False/None)"""
+    extra = sum(int(i.get("other_boxes") or 0) for _p, i in po_infos)
+    tail = (f" · {extra} other box{'es' if extra != 1 else ''} on the shared PO aren't this order's"
+            if extra else "")
     pending_po = [po for po, i in po_infos
                   if not i.get("canceled") and (not i.get("shipped") or i.get("partial"))]
     trks = [t.strip().upper() for _, i in po_infos for t in (i.get("tracking") or []) if t]
@@ -188,7 +191,8 @@ def summary(po_infos, results):
             w = _dt.strftime("%a %m/%d ") + _dt.strftime("%-I:%M%p").lower()
         except ValueError:
             w = last
-        return f"✅ ALL GOODS DELIVERED ({len(got)} of {len(trks)} boxes)" + (f" · last {w}" if w else ""), True
+        return (f"✅ ALL GOODS DELIVERED ({len(got)} of {len(trks)} boxes)" + (f" · last {w}" if w else "")
+                + tail), True
     parts = [f"{len(got)} of {len(trks)} boxes delivered"] if trks else []
     exp = [known[t]["expected"] for t in out_ if known[t]["expected"]]
     if exp:
@@ -198,4 +202,4 @@ def summary(po_infos, results):
     if unk:
         parts.append(f"{len(unk)} box{'es' if len(unk) != 1 else ''} not trackable")
     all_in = False if (pending_po or out_) else None
-    return "⏳ ALL GOODS: " + " · ".join(parts), all_in
+    return "⏳ ALL GOODS: " + " · ".join(parts) + tail, all_in

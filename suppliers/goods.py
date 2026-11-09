@@ -91,6 +91,13 @@ def sanmar_po_section(po, status, ships, invs):
         pcs = sum(int(float(i["qty"] or 0)) for b in ships for i in b["items"])
         label = "PARTIALLY SHIPPED" if "partial" in st else "SHIPPED"
         info["tracking"] = [t for t in by_trk if t]
+        info["box_parts"] = {}
+        for b in ships:
+            if b.get("tracking"):
+                info["box_parts"].setdefault(b["tracking"], []).extend(
+                    (i.get("style") or "", i.get("part_id") or "") for i in b.get("items") or [])
+        info["names"] = dict(names)
+        info["status_lines"] = [l for st_ in status for l in (st_.get("lines") or [])]
         info["carriers"] = {t: (b.get("carrier") or "") for t, b in by_trk.items() if t}
         trk = ", ".join(t for t in by_trk if t)
         cars = {c.split()[0].upper() for c in info["carriers"].values() if c}

@@ -3,3 +3,5 @@ httpx
 tzdata
 google-auth
 requests
+fpdf2
+beautifulsoup4

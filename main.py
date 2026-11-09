@@ -6371,6 +6371,126 @@ def import_email_attachments(visual_id: str, mailbox: str, message_ref: str,
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SANMAR SPEC SHEETS → production files (Luke, Nov 9 2026)
+# One "Spec Sheet + Measurements" PDF per SanMar style on the order, built from
+# sanmar.com's spec page (suppliers/specsheet.py), parked behind the same
+# tokenized /intake-file/ link as email attachments, handed to Printavo.
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from suppliers import specsheet as _specsheet
+except Exception as _e:
+    _specsheet = None
+    print(f"[SPECSHEET] import failed: {_e}", flush=True)
+
+
+def _park_file(name: str, blob: bytes, content_type: str, visual_id: str) -> str:
+    """Stage bytes under INTAKE_DIR and return the public URL Printavo pulls from."""
+    tok = _secrets.token_urlsafe(32)
+    folder = os.path.join(INTAKE_DIR, tok)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, name), "wb") as f:
+        f.write(blob)
+    with open(os.path.join(folder, "_meta.json"), "w") as f:
+        json.dump({"filename": name, "content_type": content_type,
+                   "exp": time.time() + INTAKE_LINK_TTL_S, "visual_id": visual_id}, f)
+    return f"{_intake_base_url()}/intake-file/{tok}/{_urlquote(name)}"
+
+
+@mcp.tool()
+def sanmar_spec_sheets(visual_id: str, dry_run: bool = False, skip_existing: bool = True) -> str:
+    """
+    Add a SanMar "Spec Sheet + Measurements" PDF for every line item on a Printavo order or quote
+    to its Production Files — one PDF per SanMar style (named <STYLE>_SanMar_Spec_Sheet.pdf).
+    visual_id:     Printavo order/quote number (e.g. "7492")
+    dry_run:       list what would be added without touching Printavo
+    skip_existing: skip a style whose PDF is already on the order
+    Style comes from the item # field, else style-looking text in the description (contract orders).
+    Non-SanMar items (S&S-only styles, promo, fees) are reported, not guessed.
+    """
+    if _specsheet is None:
+        return "ERROR: spec sheet module failed to load — check the server log"
+    internal_id, order_type, err = _find_order(visual_id)
+    if err:
+        return f"ERROR: {err}"
+    time.sleep(PAGE_DELAY_S)
+    r = query_printavo(f"""query($id: ID!) {{ o: {order_type}(id: $id) {{
+        productionFiles(first: 100) {{ nodes {{ name }} }}
+        lineItemGroups(first: 25) {{ nodes {{ lineItems(first: 50) {{ nodes {{
+            itemNumber description }} }} }} }} }} }}""", {"id": internal_id})
+    if "error" in r:
+        return f"ERROR reading #{visual_id}: {r['error']}"
+    node = r.get("o") or {}
+    have = {(f.get("name") or "").lower() for f in (node.get("productionFiles") or {}).get("nodes") or []}
+
+    lines_in = []
+    for g in (node.get("lineItemGroups") or {}).get("nodes") or []:
+        for li in (g.get("lineItems") or {}).get("nodes") or []:
+            item, desc = (li.get("itemNumber") or "").strip(), (li.get("description") or "").strip()
+            if item or desc:
+                lines_in.append((item, desc))
+    if not lines_in:
+        return f"#{visual_id}: no line items"
+
+    _intake_cleanup()
+    done_styles, added, skipped, misses, failed = set(), [], [], [], []
+    for item, desc in lines_in:
+        cands = (_photos.candidates(item, desc) if _photos else []) or ([item.upper()] if item else [])
+        label = item or desc[:40]
+        hit = None
+        for c in cands:
+            if c in done_styles:
+                hit = "dup"
+                break
+            fname = f"{c}_SanMar_Spec_Sheet.pdf"
+            if skip_existing and fname.lower() in have:
+                skipped.append(f"{c} (already on order)")
+                done_styles.add(c)
+                hit = "dup"
+                break
+            try:
+                if dry_run:
+                    _specsheet.find_product(c)
+                    added.append(f"{fname} [dry run]")
+                    done_styles.add(c)
+                    hit = "ok"
+                    break
+                fname, pdf_bytes, title = _specsheet.spec_pdf(c)
+            except _specsheet.SpecError:
+                continue
+            except Exception as e:
+                failed.append(f"{c}: {e}")
+                hit = "err"
+                break
+            done_styles.add(c)
+            hit = "ok"
+            try:
+                url = _park_file(fname, pdf_bytes, "application/pdf", visual_id)
+            except Exception as e:
+                failed.append(f"{c}: staging {e}")
+                break
+            time.sleep(PAGE_DELAY_S)
+            res = query_printavo("""mutation($p: ID!, $u: String!) {
+                productionFileCreate(parentId: $p, publicFileUrl: $u) { id name } }""",
+                                 {"p": internal_id, "u": url})
+            if "error" in res:
+                failed.append(f"{c}: Printavo {res['error']}")
+            else:
+                pf = res.get("productionFileCreate") or {}
+                added.append(f"{pf.get('name', fname)} — {title}")
+            break
+        if hit is None:
+            misses.append(label)
+
+    out = [("[DRY RUN — nothing added] " if dry_run else "")
+           + f"#{visual_id} SanMar spec sheets: {len(added)} added, {len(skipped)} already there, "
+           + f"{len(misses)} not SanMar, {len(failed)} failed"]
+    for lab, items in (("ADDED", added), ("ALREADY THERE", skipped),
+                       ("NOT A SANMAR STYLE", misses), ("FAILED", failed)):
+        out += [f"{lab}: {x}" for x in items]
+    return "\n".join(out)
+
+
 
 @mcp.tool()
 def set_production_note(visual_id: str, note: str, append: bool = True) -> str:

@@ -23,7 +23,14 @@ _GENERIC = {"SCRN", "SP", "EMB", "DTF", "PROMO", "SETUP", "SET", "ART", "SHIP", 
 
 
 def norm_size(s):
+    """Printavo keys look like 'size_2xl' / 'size_yl' / 'size_other'; suppliers say '2XL' / 'L' / 'OSFA'.
+    Youth sizes compare as the plain size — the style itself is the youth style."""
     s = re.sub(r"[\s\-]", "", str(s or "").upper())
+    s = re.sub(r"^SIZE_?", "", s)
+    s = {"OTHER": "OSFA"}.get(s, s)
+    m = re.fullmatch(r"Y(XS|S|M|L|XL)", s)
+    if m:
+        s = m.group(1)
     return _SIZE.get(s, s)
 
 
@@ -160,4 +167,4 @@ def compare(needs, have, own_styles=None):
         else:
             issues.append(f"{label}: order needs {_q(n)}, PO has {_q(h)} ({_q(h - n)} over)")
     total = sum(need_by.values())
-    return issues, total, unknown
+    return list(dict.fromkeys(issues)), total, unknown

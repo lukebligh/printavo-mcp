@@ -7279,6 +7279,9 @@ def _delivery_sweep(dry_run: bool = False) -> dict:
     state = (_goods_json("goods_state.json", {}) or {}).get("orders") or {}
     q = _fetch_orders_in_status(_DIRECT_WAITING[0])
     if "error" in q:
+        time.sleep(3)
+        q = _fetch_orders_in_status(_DIRECT_WAITING[0])
+    if "error" in q:
         raise RuntimeError(q["error"])
     moves, errors = [], []
     for o in q["orders"]:

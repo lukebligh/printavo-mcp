@@ -39,7 +39,8 @@ def _skey(s):
 _ABBR = {"ht": "heather", "htr": "heather", "hthr": "heather", "hth": "heather", "athl": "athletic",
          "dk": "dark", "lt": "light", "vtg": "vintage", "nvy": "navy", "grn": "green", "bl": "blue",
          "gry": "grey", "gray": "grey", "prpl": "purple", "blk": "black", "wht": "white", "org": "orange",
-         "ylw": "yellow", "chrcl": "charcoal", "roy": "royal", "elec": "electric", "trbl": "triblend"}
+         "ylw": "yellow", "chrcl": "charcoal", "roy": "royal", "elec": "electric", "trbl": "triblend",
+         "gn": "green", "rd": "red", "bk": "black", "frst": "forest", "mrn": "maroon", "slvr": "silver"}
 
 
 def _cn(c):

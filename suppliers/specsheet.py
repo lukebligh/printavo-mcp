@@ -2,7 +2,8 @@
 
 style number → SanMar product page (findProducts.json, needs a browsing session + CSRF token or
 SanMar's firewall rejects it) → /p/<code>/specSheetMeasurements (plain server-rendered HTML) →
-a one-to-two page PDF built here with fpdf2. SanMar's own "Create a PDF" button only works for a
+a one-to-two page PDF built here with fpdf2. Styles SanMar doesn't carry fall back to
+the S&S API (styles + specs + product images). SanMar's own "Create a PDF" button only works for a
 signed-in sanmar.com user, so we build our own from the same page content.
 """
 import io
@@ -81,7 +82,8 @@ def fetch_spec(code: str) -> dict:
     title = soup.select_one(".product-name-title")
     if not title:
         raise SpecError("spec page has no product title")
-    spec = {"title": _clean(title.get_text()), "url": f"{BASE}/p/{code}/specSheetMeasurements"}
+    spec = {"title": _clean(title.get_text()), "url": f"{BASE}/p/{code}/specSheetMeasurements",
+            "source": "SanMar"}
     photo = soup.select_one(".product-picture img")
     spec["photo"] = _abs(photo["src"]) if photo and photo.get("src") else ""
     spec["sketches"] = []
@@ -227,15 +229,103 @@ def build_pdf(spec: dict, style: str) -> bytes:
     pdf.set_y(pdf.h - 30)
     pdf.set_font("Helvetica", "", 7)
     pdf.set_text_color(130, 130, 130)
-    pdf.cell(W, 10, f"Source: SanMar {style} - {spec['url']}", align="L")
+    pdf.cell(W, 10, f"Source: {spec.get('source', 'SanMar')} {style} - {spec['url']}", align="L")
     return bytes(pdf.output())
 
 
-def spec_pdf(style: str):
-    """style → (filename, pdf_bytes, title). Raises SpecError."""
+def sanmar_spec_pdf(style: str):
+    """style → (filename, pdf_bytes, title). Raises SpecError when SanMar doesn't carry it."""
     code, st, _name = find_product(style)
     spec = fetch_spec(code)
     # Spec page titles end with the style (". CP90") — anything else means the lookup landed wrong.
     if not spec["title"].upper().rstrip(". ").endswith(st.upper()):
         raise SpecError(f"{st}: spec page is for '{spec['title']}'")
     return f"{st}_SanMar_Spec_Sheet.pdf", build_pdf(spec, st), spec["title"]
+
+
+spec_pdf = sanmar_spec_pdf   # back-compat with the first version
+
+
+# ── S&S Activewear fallback (styles + specs + products from the S&S API) ─────
+SS_SITE = "https://www.ssactivewear.com/"
+
+
+def _ss_pick_style(style: str, description: str = ""):
+    """→ (styleID, products for that style). One brand only: a bare style shared by several
+    brands is settled by the brand named in the line description, else it's ambiguous."""
+    from . import ss as _ss
+    items = _ss.products(style) or []
+    by_id = {}
+    for it in items:
+        by_id.setdefault(it.get("styleID"), []).append(it)
+    by_id.pop(None, None)
+    if not by_id:
+        raise SpecError(f"{style} not found at S&S")
+    if len(by_id) > 1:
+        desc = (description or "").lower()
+        hit = [sid for sid, its in by_id.items() if (its[0].get("brandName") or "").lower() in desc]
+        if len(hit) != 1:
+            brands = ", ".join(sorted({its[0].get("brandName") or "?" for its in by_id.values()}))
+            raise SpecError(f"{style} is several S&S styles ({brands}) - name the brand on the line")
+        return hit[0], by_id[hit[0]]
+    sid = next(iter(by_id))
+    return sid, by_id[sid]
+
+
+def _ss_img(path: str) -> str:
+    if not path:
+        return ""
+    return path if path.startswith("http") else SS_SITE + path.lstrip("/")
+
+
+def ss_spec_pdf(style: str, description: str = "", color: str = ""):
+    """style → (filename, pdf_bytes, title) built from the S&S API. Raises SpecError."""
+    from . import ss as _ss
+    sid, prods = _ss_pick_style(style, description)
+    st_rows = _ss._get(f"/styles/{sid}", {}) or []
+    st_row = st_rows[0] if isinstance(st_rows, list) and st_rows else (st_rows if isinstance(st_rows, dict) else {})
+    brand = _clean(st_row.get("brandName") or prods[0].get("brandName") or "")
+    sname = _clean(st_row.get("styleName") or prods[0].get("styleName") or style).upper()
+    title = _clean(st_row.get("title") or "")
+    spec = {"title": _clean(f"{brand} {title}. {sname}" if title else f"{brand} {sname}"),
+            "url": f"{SS_SITE}p/{brand.lower().replace(' ', '_')}/{sname.lower()}", "source": "S&S Activewear",
+            "intro": [], "bullets": [], "care": "", "tables": [], "notes": [], "sketches": []}
+    soup = BeautifulSoup(st_row.get("description") or "", "html.parser")
+    spec["bullets"] = [_clean(li.get_text()) for li in soup.find_all("li") if _clean(li.get_text())]
+    for li in soup.find_all(["ul", "ol"]):
+        li.decompose()
+    rest = _clean(soup.get_text(" "))
+    if rest:
+        spec["intro"].append(rest)
+
+    # Photo: the line's color if S&S has it, else the first color with a front image.
+    want = (color or "").strip().lower()
+    with_img = [p for p in prods if p.get("colorFrontImage")]
+    pick = next((p for p in with_img if want and (p.get("colorName") or "").lower() == want), None) \
+        or next((p for p in with_img if want and want in (p.get("colorName") or "").lower()), None) \
+        or (with_img[0] if with_img else {})
+    spec["photo"] = _ss_img(pick.get("colorFrontImage") or st_row.get("styleImage") or "")
+    for key, cap in (("colorBackImage", "back"), ("colorSideImage", "side")):
+        if pick.get(key):
+            spec["sketches"].append((_ss_img(pick[key]), cap))
+
+    # Measurements: S&S /specs rows are (sizeName, specName, value) — pivot to SanMar's layout.
+    rows = []
+    for params in ({"style": sid}, {"styleid": sid}):
+        try:
+            rows = [r for r in (_ss._get("/specs/", params) or []) if str(r.get("styleID")) == str(sid)]
+        except Exception:
+            rows = []
+        if rows:
+            break
+    if rows:
+        sizes = [z for z, _o in sorted({(r.get("sizeName"), r.get("sizeOrder") or "") for r in rows},
+                                       key=lambda t: str(t[1]))]
+        names = []
+        for r in rows:
+            if r.get("specName") not in names:
+                names.append(r.get("specName"))
+        val = {(r.get("specName"), r.get("sizeName")): _clean(str(r.get("value") or "")) for r in rows}
+        spec["tables"].append(([""] + [_clean(z) for z in sizes],
+                               [[_clean(n)] + [val.get((n, z), "") for z in sizes] for n in names]))
+    return f"{sname}_SS_Spec_Sheet.pdf", build_pdf(spec, sname), spec["title"]

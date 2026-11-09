@@ -7474,7 +7474,10 @@ def _goods_status_flips(results, dry_run, errors):
             res = query_printavo("""mutation($p: ID!, $s: ID!) { statusUpdate(parentId: $p, statusId: $s) {
                 ... on Invoice { id } } }""", {"p": iid, "s": target[1]}) if iid else {"error": "not found"}
             if "error" in res:
-                errors.append(f"#{r['vid']}: status move failed ({res['error']})")
+                if "Not found" in str(res["error"]):   # deleted order still in Printavo's index
+                    print(f"[GOODS] #{r['vid']} gone (deleted?) — skipped", flush=True)
+                else:
+                    errors.append(f"#{r['vid']}: status move failed ({res['error']})")
                 continue
             d = done.setdefault(r["vid"], {})
             d["to_wait" if target is _DIRECT_WAITING else "to_verify"] = _central_now().isoformat()

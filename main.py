@@ -212,7 +212,25 @@ def fetch_all_statuses() -> dict:
         }
     }
     """
-    return paginate(q, connection_path=("statuses",))
+    now = time.time()
+    c = _STATUS_CACHE
+    if c["r"] and now - c["t"] < 1800:
+        return c["r"]
+    r = paginate(q, connection_path=("statuses",))
+    n = len(r.get("nodes") or []) if "error" not in r else 0
+    total = r.get("totalNodes") or 0
+    complete = "error" not in r and n and (not total or n >= total) and n >= c["n"] - 2
+    if complete:
+        c.update({"r": r, "t": now, "n": n})
+        return r
+    # partial / failed page walk — a missing status must never silently drop orders
+    if c["r"] and now - c["t"] < 6 * 3600:
+        print(f"[STATUSES] partial fetch ({n}/{total or '?'}) — using cached list of {c['n']}", flush=True)
+        return c["r"]
+    return r if "error" in r else {"error": f"status list incomplete ({n} of {total or '?'})"}
+
+
+_STATUS_CACHE = {"r": None, "t": 0, "n": 0}
 
 
 # ── DECORATION TYPE HELPERS ───────────────────────────────────────────────────

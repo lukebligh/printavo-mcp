@@ -172,7 +172,8 @@ def summary(po_infos, results):
     """po_infos: [(po, info)] with info['tracking'], info['shipped'], info['partial'], info['canceled'].
     -> (line or None, all_in True/False/None)"""
     extra = sum(int(i.get("other_boxes") or 0) for _p, i in po_infos)
-    tail = (f" · {extra} other box{'es' if extra != 1 else ''} on the shared PO aren't this order's"
+    tail = (f" · {extra} other box{'es' if extra != 1 else ''} on the shared PO "
+            f"{'are' if extra != 1 else 'is'}n't this order's"
             if extra else "")
     pending_po = [po for po, i in po_infos
                   if not i.get("canceled") and (not i.get("shipped") or i.get("partial"))]

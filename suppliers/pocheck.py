@@ -150,6 +150,15 @@ def compare(needs, have, own_styles=None):
             if co:
                 k = (cs, co, sz)
                 have_by[k] = have_by.get(k, 0) + q
+    # One-size lines (Printavo "other") vs a supplier size like "M/L" or "S/M": compare totals only
+    for cs_co in {(k[0], k[1]) for k in need_by}:
+        nsz = {k[2] for k in need_by if (k[0], k[1]) == cs_co}
+        if nsz == {"OSFA"}:
+            hk = [k for k in have_by if (k[0], k[1]) == cs_co]
+            if hk:
+                need_by[(cs_co[0], cs_co[1], "OSFA")] = need_by.pop((cs_co[0], cs_co[1], "OSFA"))
+                tot = sum(have_by.pop(k) for k in hk)
+                have_by[(cs_co[0], cs_co[1], "OSFA")] = tot
     styles_needed = {k[0] for k in need_by}
     for k in sorted(set(need_by) | set(have_by)):
         if k[0] not in styles_needed:

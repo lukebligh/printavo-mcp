@@ -7132,7 +7132,11 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "", statuses=None)
         block = None
         if has_po:
             stamp = _central_now().strftime("%m/%d %-I:%M%p").lower()
-            block = "\n".join([f"— GOODS (auto · {stamp}) —"] + lines + [_goods.END])
+            # Printavo collapses single line breaks in production notes → blank line between
+            # lines; indented detail lines become bullets (Luke, Nov 9: "kinda a run-on sentence").
+            pretty = [("• " + l.strip().lstrip("•").strip()) if l.startswith("  ") else l.strip()
+                      for l in lines if l.strip()]
+            block = "\n\n".join([f"— GOODS (auto · {stamp}) —"] + pretty + [_goods.END])
         results.append({"vid": vid, "status": o["status"], "nick": o["nick"], "prod": prod,
                         "block": block, "exceptions": exc, "id": o.get("id"),
                         "company": o.get("company"), "infos": infos, "all_in": all_in,

@@ -106,7 +106,7 @@ def sanmar_po_section(po, status, ships, invs):
                      f"{pcs} pcs, {len(ships)} box{'es' if len(ships) != 1 else ''} · "
                      f"est. arrival {info['eta']:%a %m/%d}" if last_ship else f"SanMar \"{po}\": {label}")
         if trk:
-            lines.append(f"  {trk_label}: {trk}")
+            lines.append(f"  {trk_label} tracking: {trk}")
         items = []
         for b in ships:
             for i in b["items"]:

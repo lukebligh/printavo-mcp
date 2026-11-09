@@ -7428,6 +7428,155 @@ def run_order_shadow_scheduler():
 threading.Thread(target=run_order_shadow_scheduler, daemon=True).start()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Blank product photos → production files (Luke, Nov 8). Every order (direct AND
+# contract, invoices and quotes) from MOCK-UP REQUESTED through PRE-PRO gets the
+# front/back flat photo of each blank (style + color) from SanMar, else S&S.
+# Direct: style in the item # field. Contract: style in the line item description.
+# Each photo is added once per order; anything already there is left alone.
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from suppliers import photos as _photos
+except Exception as _e:
+    _photos = None
+    print(f"[PHOTOS] import failed: {_e}", flush=True)
+
+PHOTOS_ENABLED = os.environ.get("PHOTOS_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+PHOTOS_EVERY_MIN = int(os.environ.get("PHOTOS_EVERY_MIN", "60"))
+_PHOTO_STATUSES = ["MOCK-UP REQUESTED", "QUOTE APPROVED", "ORDER GOODS", "CONTRACT - WAITING ON ARTWORK",
+                   "PROOF REQUESTED", "ART APPROVAL SENT", "ARTWORK DECLINED", "ART APPROVED", "VERIFY GOODS",
+                   "CONTRACT - WAITING ON GOODS", "DIRECT - WAITING ON GOODS", "SP - PRE-PRO",
+                   "EMB - ORDER DIGITIZING", "EMB - PRE-PRO", "DTF - ORDER TRANSFER", "DTF - PRE-PRO",
+                   "STORE - PRE PRO"]
+_PHOTOS_MAX_PER_ORDER = 12
+
+
+def _photo_orders(only_order: str = "") -> list:
+    sres = fetch_all_statuses()
+    if "error" in sres:
+        raise RuntimeError(sres["error"])
+    live = {_norm_status(x["name"]): (x["id"], x["name"]) for x in sres["nodes"]}
+    ids = {live[_norm_status(n)][0]: live[_norm_status(n)][1] for n in _PHOTO_STATUSES if _norm_status(n) in live}
+    out = []
+    for field in ("invoices", "quotes"):
+        q = f"""query($first: Int, $after: String, $statusIds: [ID!]) {{
+            {field}(first: $first, after: $after, statusIds: $statusIds) {{
+                pageInfo {{ hasNextPage endCursor }}
+                nodes {{ id visualId nickname status {{ id name }} }} }} }}"""
+        r = paginate(q, {"statusIds": list(ids)}, connection_path=(field,))
+        if "error" in r:
+            raise RuntimeError(f"{field}: {r['error']}")
+        for n in r["nodes"]:
+            if (n.get("status") or {}).get("id") not in ids:
+                continue
+            if only_order and str(n.get("visualId")) != str(only_order):
+                continue
+            out.append({"id": n["id"], "vid": str(n["visualId"]), "nick": n.get("nickname") or "",
+                        "status": n["status"]["name"], "type": field[:-1]})
+    return out
+
+
+def _photos_impl(dry_run: bool = True, only_order: str = "") -> dict:
+    if _photos is None:
+        raise RuntimeError("photos module failed to load")
+    cache = _goods_json("photo_lookup_cache.json", {})
+    done = _goods_json("photos_done.json", {})
+    results, errors = [], []
+    for o in _photo_orders(only_order):
+        time.sleep(PAGE_DELAY_S)
+        r = query_printavo(f"""query($id: ID!) {{ o: {o['type']}(id: $id) {{
+            productionFiles(first: 100) {{ nodes {{ name }} }}
+            lineItemGroups(first: 25) {{ nodes {{ lineItems(first: 50) {{ nodes {{
+                itemNumber description color }} }} }} }} }} }}""", {"id": o["id"]})
+        if "error" in r:
+            errors.append(f"#{o['vid']}: {r['error']}")
+            continue
+        node = r.get("o") or {}
+        have = {(f.get("name") or "").lower() for f in (node.get("productionFiles") or {}).get("nodes") or []}
+        mine = set(done.get(o["vid"], []))
+        adds, misses, seen = [], [], set()
+        for g in (node.get("lineItemGroups") or {}).get("nodes") or []:
+            for li in (g.get("lineItems") or {}).get("nodes") or []:
+                key = ((li.get("itemNumber") or "").strip().upper(), (li.get("color") or "").strip().lower(),
+                       (li.get("description") or "")[:60].strip().lower())
+                if key in seen or not (key[0] or key[2]):
+                    continue
+                seen.add(key)
+                try:
+                    hit = _photos.lookup(li.get("itemNumber"), li.get("description"), li.get("color"), cache)
+                except Exception as e:
+                    errors.append(f"#{o['vid']} lookup: {e}")
+                    hit = None
+                if not hit:
+                    misses.append((li.get("itemNumber") or (li.get("description") or "")[:40]).strip())
+                    continue
+                for u in hit["urls"]:
+                    fname = u.rsplit("/", 1)[-1].split("?")[0].lower()
+                    if u in mine or fname in have or u in [a[0] for a in adds]:
+                        continue
+                    adds.append((u, f"{hit['supplier']} {hit['style']} {hit['color']}"))
+        adds = adds[:max(0, _PHOTOS_MAX_PER_ORDER - len(mine))]
+        added = []
+        if not dry_run:
+            for u, label in adds:
+                time.sleep(PAGE_DELAY_S)
+                res = query_printavo("""mutation($p: ID!, $u: String!) {
+                    productionFileCreate(parentId: $p, publicFileUrl: $u) { id name } }""", {"p": o["id"], "u": u})
+                if "error" in res:
+                    errors.append(f"#{o['vid']}: add {u.rsplit('/', 1)[-1]} failed ({res['error']})")
+                    continue
+                added.append(u)
+                done.setdefault(o["vid"], []).append(u)
+        results.append({**o, "adds": adds, "added": added, "misses": misses})
+    _goods_json_save("photo_lookup_cache.json", cache)
+    if not dry_run:
+        _goods_json_save("photos_done.json", done)
+    return {"results": results, "errors": errors}
+
+
+@mcp.tool()
+def product_photos_run(dry_run: bool = True, order: str = "") -> str:
+    """Add blank product photos (front/back flats from SanMar, else S&S) to the production files of
+    orders and quotes from MOCK-UP REQUESTED through PRE-PRO — direct and contract. Style comes from
+    the item # field or, on contract orders, the line item description. dry_run (default TRUE)
+    previews. order: limit to one order #. Runs hourly on weekdays for real."""
+    try:
+        rep = _photos_impl(dry_run=dry_run, only_order=order)
+    except Exception as e:
+        return f"Product photos failed: {e}"
+    out = [("[DRY RUN — nothing added] " if dry_run else "") + f"PRODUCT PHOTOS · {len(rep['results'])} orders checked"]
+    for r in rep["results"]:
+        if not (r["adds"] or r["misses"]):
+            continue
+        out.append(f"\n#{r['vid']} · {r['status']} · {r['nick']}")
+        for u, label in r["adds"]:
+            out.append(f"  + {label}: {u.rsplit('/', 1)[-1]}")
+        if r["misses"]:
+            out.append("  ? no photo found for: " + ", ".join(m for m in r["misses"] if m))
+    if rep["errors"]:
+        out.append("\nERRORS:\n" + "\n".join(f"  {e}" for e in rep["errors"][:20]))
+    return "\n".join(out)
+
+
+def run_product_photos_scheduler():
+    last = None
+    while True:
+        try:
+            now = _central_now()
+            if (PHOTOS_ENABLED and now.weekday() < 5 and 7 <= now.hour < 18
+                    and (last is None or (now - last).total_seconds() >= PHOTOS_EVERY_MIN * 60)):
+                last = now
+                rep = _photos_impl(dry_run=False)
+                n = sum(len(r["added"]) for r in rep["results"])
+                print(f"[PHOTOS] added {n} files · errors {len(rep['errors'])}", flush=True)
+        except Exception as e:
+            print(f"[PHOTOS] run failed: {e}", flush=True)
+        time.sleep(120)
+
+
+threading.Thread(target=run_product_photos_scheduler, daemon=True).start()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WEBSITE LEAD → PRINTAVO (Luke, Nov 7 2026)
 #  WPForms webhook (Get a Quote + contact page) → new Printavo customer (or the

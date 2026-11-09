@@ -459,3 +459,26 @@ def related(style):
                 out.append((t, pid))
     _REL_CACHE[key] = (time.time(), out)
     return out
+
+
+# ─────────────────────────── Product images (SanMar product info) ───────────────────────────
+
+def product_images(style, color=""):
+    """-> list of {"color", "front_flat", "back_flat", "model", "product"} — one per color returned.
+    getProductInfoByStyleColorSize; color may be blank (all colors)."""
+    u, p = _creds()
+    body = (f"<impl:getProductInfoByStyleColorSize><arg0><style>{escape(style)}</style>"
+            f"<color>{escape(color)}</color><size></size></arg0><arg1><sanMarCustomerNumber>{_cust()}"
+            f"</sanMarCustomerNumber><sanMarUserName>{u}</sanMarUserName><sanMarUserPassword>{p}"
+            f"</sanMarUserPassword></arg1></impl:getProductInfoByStyleColorSize>")
+    root = _post("/SanMarWebService/SanMarProductInfoServicePort", body, IMPL_NS)
+    if root is None:
+        return []
+    out = {}
+    for r in _all(root, "listResponse"):
+        c = _t(r, "color") or _t(r, "catalogColor")
+        if c and c not in out:
+            out[c] = {"color": c, "catalog_color": _t(r, "catalogColor"), "front_flat": _t(r, "frontFlat"),
+                      "back_flat": _t(r, "backFlat"), "model": _t(r, "colorProductImage"),
+                      "product": _t(r, "productImage"), "brand": _t(r, "brandName")}
+    return list(out.values())

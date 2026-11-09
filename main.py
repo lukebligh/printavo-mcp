@@ -6946,6 +6946,7 @@ def supplier_cogs_preview(days: int = 35) -> str:
 try:
     from suppliers import goods as _goods
     from suppliers import ups as _ups
+    from suppliers import pocheck as _pocheck
 except Exception as _e:  # pragma: no cover
     _goods = None
     _SANMAR_IMPORT_ERR = (_SANMAR_IMPORT_ERR or "") + f" | goods: {_e!r}"
@@ -6996,11 +6997,12 @@ def _goods_json_save(name, obj):
             print(f"[GOODS] could not save {name}: {e}", flush=True)
 
 
-def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
+def _goods_notes_impl(dry_run: bool = True, only_order: str = "", statuses=None) -> dict:
     if _goods is None or _sanmar is None or _ss is None:
         raise RuntimeError(f"supplier modules failed to load: {_SANMAR_IMPORT_ERR}")
     orders = []
-    for st in _GOODS_STATUSES:
+    parts_cache = _pocheck._load()
+    for st in (statuses or _GOODS_STATUSES):
         q = _fetch_orders_in_status(st)
         if "error" in q:
             if "not found in Printavo" in q["error"]:      # a renamed status shouldn't kill the run
@@ -7054,6 +7056,11 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
                 if ships and not status:                 # not open any more and shipped → frozen
                     cache[key] = {"ships": ships, "invs": invs, "final": bool(invs)}
             sec, info = _goods.sanmar_po_section(po, status, ships, invs)
+            try:
+                info["have"] = _pocheck.sanmar_have(status, ships, invs, parts_cache)
+            except Exception as e:
+                info["have"], _ = None, errors.append(f"#{vid} PO check parts \"{po}\": {e}")
+            info["orders"] = _scogs.order_numbers(po)
             others = [x for x in _scogs.order_numbers(po) if x != vid]
             if others and sec:
                 sec.insert(1, "  Combined PO with " + " ".join(f"#{x}" for x in others)
@@ -7063,6 +7070,8 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
         for so in ss_orders:
             if vid in _scogs.order_numbers(str(so.get("poNumber") or "")):
                 sec, info = _goods.ss_po_section(so)
+                info["have"] = _pocheck.ss_have(so)
+                info["orders"] = _scogs.order_numbers(str(so.get("poNumber") or ""))
                 others = [x for x in _scogs.order_numbers(str(so.get("poNumber") or "")) if x != vid]
                 if others and sec:
                     sec.insert(1, "  Combined PO with " + " ".join(f"#{x}" for x in others)
@@ -7080,6 +7089,20 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
                     lines.insert(0, all_line)
             except Exception as e:
                 errors.append(f"#{vid} UPS: {e}")
+        po_issues = None
+        if has_po and o["status"] in _GOODS_ALERT_STATUSES and all(i.get("have") is not None for _p, i in infos):
+            try:
+                po_issues = _goods_po_check(vid, o.get("id"), infos)
+                if po_issues is not None:
+                    issues, total = po_issues
+                    at = 1 if lines and lines[0].startswith(("⏳", "✅")) else 0
+                    if issues:
+                        lines[at:at] = ["⚠ PO CHECK — doesn't match the order:"] + [f"  • {x}" for x in issues[:6]] + (
+                            [f"  • …and {len(issues) - 6} more"] if len(issues) > 6 else [])
+                    elif total:
+                        lines.insert(at, f"✓ PO matches the order ({int(total)} pcs)")
+            except Exception as e:
+                errors.append(f"#{vid} PO check: {e}")
         prod = o["prod"].date() if o.get("prod") else None
         exc = (_goods.exceptions_for(vid, prod, infos, has_po, today=today)
                if o["status"] in _GOODS_ALERT_STATUSES else [])
@@ -7089,19 +7112,29 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
             block = "\n".join([f"— GOODS (auto · {stamp}) —"] + lines + [_goods.END])
         results.append({"vid": vid, "status": o["status"], "nick": o["nick"], "prod": prod,
                         "block": block, "exceptions": exc, "id": o.get("id"),
-                        "company": o.get("company"), "infos": infos, "all_in": all_in})
+                        "company": o.get("company"), "infos": infos, "all_in": all_in,
+                        "po_issues": po_issues})
     _goods_json_save("goods_po_cache.json", cache)
-    if not only_order:   # snapshot for the 7 AM #daily-schedule post
-        _goods_json_save("goods_state.json", {
-            "at": _central_now().strftime("%a %-I:%M%p").lower(),
-            "orders": {r["vid"]: {"status": r["status"], "nick": r["nick"], "company": r["company"],
+    _pocheck._save(parts_cache)
+    if not only_order:   # snapshot for the 7 AM #daily-schedule post (+ the 30-min delivery sweep)
+        _snap = {r["vid"]: {"status": r["status"], "nick": r["nick"], "company": r["company"],
                                   "prod": r["prod"].isoformat() if r["prod"] else None,
                                   "all_in": r.get("all_in"),
+                                  "trk": [{"tracking": i.get("tracking") or [], "carriers": i.get("carriers") or {},
+                                           "shipped": i.get("shipped"), "partial": i.get("partial"),
+                                           "canceled": i.get("canceled")} for _po, i in r["infos"]],
                                   "pos": [{"po": po, "shipped": i["shipped"], "open": i["open"],
                                            "backorder": i["backorder"], "hold": i["hold"],
                                            "eta": i["eta"].isoformat() if i["eta"] else None}
                                           for po, i in r["infos"]]}
-                       for r in results}})
+                       for r in results}
+        if statuses:   # partial run (gate router) → merge, don't wipe the full snapshot
+            _old = _goods_json("goods_state.json", {}) or {}
+            _goods_json_save("goods_state.json", {"at": _old.get("at", ""),
+                                                  "orders": {**(_old.get("orders") or {}), **_snap}})
+        else:
+            _goods_json_save("goods_state.json", {"at": _central_now().strftime("%a %-I:%M%p").lower(),
+                                                  "orders": _snap})
 
     written, unchanged = [], 0
     for r in results:
@@ -7138,6 +7171,203 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "") -> dict:
             errors.append(f"#{r['vid']}: note write did not verify ({res.get('error', 'mismatch')})")
     flips = _goods_status_flips(results, dry_run, errors)
     return {"results": results, "written": written, "unchanged": unchanged, "errors": errors, "flips": flips}
+
+
+def _goods_po_check(vid, internal_id, infos):
+    """-> (issues, total_pcs) or None. Needs = every Printavo order on the PO(s); only this order's
+    own styles can be flagged 'not on any PO'."""
+    have = [h for _p, i in infos for h in (i.get("have") or [])]
+    if not have:
+        return None
+    order_nums = sorted({n for _p, i in infos for n in (i.get("orders") or [])} | {vid})
+    needs, own = [], set()
+    for n in order_nums:
+        iid = internal_id if n == vid and internal_id else None
+        if not iid:
+            iid, _t, _err = _find_order(n)
+        if not iid:
+            continue
+        for li in _printavo_items_by_id(iid):
+            for sz, q in (li.get("sizes") or {}).items():
+                if q:
+                    needs.append((li["style"], li["color"], sz, q))
+            if n == vid and _pocheck.real_style(li["style"]):
+                own.add(_pocheck.core(li["style"]))
+    if not needs:
+        return None
+    issues, total, unknown = _pocheck.compare(needs, have, own_styles=own)
+    if unknown and not issues:
+        return None
+    return issues, total
+
+
+GOODS_PO_CHECK_USERS = os.environ.get("GOODS_PO_CHECK_USERS", "U07VDET3XEX,U0504FSDYB0")  # Mechelle, Luke
+
+
+def _goods_send_po_issues(rep: dict):
+    seen = _goods_json("goods_pocheck_seen.json", {})
+    new = []
+    for r in rep["results"]:
+        pi = r.get("po_issues")
+        if not pi or not pi[0]:
+            continue
+        key = f"{r['vid']}|" + "|".join(sorted(pi[0]))
+        if key in seen:
+            continue
+        seen[key] = _central_now().isoformat()
+        pos = ", ".join(f'"{po}"' for po, _i in r["infos"])
+        new.append(f"*#{r['vid']} {r['nick']}* — PO {pos}\n" + "\n".join(f"   • {x}" for x in pi[0][:8]))
+    if new:
+        _post_cogs_dm("🧾 *PO check — what was ordered doesn't match the order*\n" + "\n".join(new)
+                      + "\n_Fix the PO with the supplier, or the order in Printavo, whichever is wrong._",
+                      recipients=GOODS_PO_CHECK_USERS)
+    _goods_json_save("goods_pocheck_seen.json", seen)
+
+
+def _set_status_by_id(r, status_tuple, errors):
+    iid = r.get("id")
+    if not iid:
+        iid, _t, _err = _find_order(r["vid"])
+    res = query_printavo("""mutation($p: ID!, $s: ID!) { statusUpdate(parentId: $p, statusId: $s) {
+        ... on Invoice { id } } }""", {"p": iid, "s": status_tuple[1]}) if iid else {"error": "not found"}
+    if "error" in res:
+        errors.append(f"#{r['vid']}: status move to {status_tuple[0]} failed ({res['error']})")
+        return False
+    time.sleep(PAGE_DELAY_S)
+    return True
+
+
+# ── Gate routing (Luke, Nov 8): Printavo's ART APPROVED → VERIFY GOODS automation is OFF.
+# Every ~10 min the server routes ART APPROVED orders:
+#   direct + goods still out (UPS/EasyPost)      → DIRECT - WAITING ON GOODS (no text to Justin yet)
+#   direct + all delivered / no PO / untrackable → VERIFY GOODS
+#   contract                                      → VERIFY GOODS (we can't see their goods)
+# Every 30 min, DIRECT - WAITING ON GOODS orders whose boxes all show delivered → VERIFY GOODS
+# (UPS/EasyPost only — no extra SanMar calls). Justin's VERIFY GOODS text then means "it's here".
+GOODS_ROUTE_ENABLED = os.environ.get("GOODS_ROUTE_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+_ART_APPROVED = "ART APPROVED"
+
+
+def _route_art_approved(dry_run: bool = False) -> dict:
+    q = _fetch_orders_in_status(_ART_APPROVED)
+    if "error" in q:
+        raise RuntimeError(q["error"])
+    if not q["orders"]:
+        return {"moves": [], "errors": []}
+    rep = _goods_notes_impl(dry_run=dry_run, statuses=(_ART_APPROVED,))
+    by_vid = {r["vid"]: r for r in rep["results"]}
+    moves, errors = [], list(rep["errors"])
+    for o in q["orders"]:
+        vid = str(o["vid"])
+        r = by_vid.get(vid) or {"vid": vid, "id": o.get("id"), "nick": o.get("nick") or o.get("nickname") or ""}
+        if vid in by_vid and r.get("infos") and r.get("all_in") is False:
+            target, why = _DIRECT_WAITING, "goods still on the way"
+        elif vid in by_vid:
+            target, why = _VERIFY_GOODS, ("all goods delivered" if r.get("all_in") else
+                                          "no trackable SanMar/S&S goods — check by hand")
+        else:
+            target, why = _VERIFY_GOODS, "contract — check goods by hand"
+        if dry_run or _set_status_by_id(r, target, errors):
+            moves.append({"vid": vid, "nick": r.get("nick") or "", "from": _ART_APPROVED, "to": target[0], "why": why})
+    if not dry_run:
+        _goods_send_exceptions(rep)
+        _goods_send_po_issues(rep)
+    return {"moves": moves, "errors": errors}
+
+
+def _delivery_sweep(dry_run: bool = False) -> dict:
+    state = (_goods_json("goods_state.json", {}) or {}).get("orders") or {}
+    q = _fetch_orders_in_status(_DIRECT_WAITING[0])
+    if "error" in q:
+        raise RuntimeError(q["error"])
+    moves, errors = [], []
+    for o in q["orders"]:
+        vid = str(o["vid"])
+        st = state.get(vid) or {}
+        infos = [("", i) for i in (st.get("trk") or [])]
+        if not infos:
+            continue
+        trk = _ups.track([t for _p, i in infos for t in i["tracking"]],
+                         {t: c for _p, i in infos for t, c in (i.get("carriers") or {}).items()})
+        line, all_in = _ups.summary(infos, trk)
+        if all_in is not True:
+            continue
+        r = {"vid": vid, "id": o.get("id"), "nick": o.get("nick") or ""}
+        if not dry_run:
+            if not _set_status_by_id(r, _VERIFY_GOODS, errors):
+                continue
+            _goods_replace_all_goods_line(o.get("id"), line, errors, vid)
+        moves.append({"vid": vid, "nick": r["nick"], "from": _DIRECT_WAITING[0], "to": _VERIFY_GOODS[0],
+                      "why": "UPS shows every box delivered — count it in"})
+    return {"moves": moves, "errors": errors}
+
+
+def _goods_replace_all_goods_line(internal_id, new_line, errors, vid):
+    cur = query_printavo("query($id: ID!) { invoice(id: $id) { productionNote } }", {"id": internal_id})
+    note = ((cur.get("invoice") or {}).get("productionNote") or "") if "error" not in cur else ""
+    if not note or "ALL GOODS" not in note:
+        return
+    new = re.sub(r"(?m)^[⏳✅] ALL GOODS.*$", new_line, note, count=1)
+    if new != note:
+        res = query_printavo("""mutation($id: ID!, $note: String) { invoiceUpdate(id: $id,
+            input: { productionNote: $note }) { id } }""", {"id": internal_id, "note": new})
+        if "error" in res:
+            errors.append(f"#{vid}: ALL GOODS line update failed ({res['error']})")
+
+
+def _post_moves(moves):
+    if moves and GOODS_FLIP_NOTIFY:
+        _post_cogs_dm("🔁 *Goods status moves*\n" + "\n".join(
+            f"• #{m['vid']} {m['nick']}: {m['from']} → *{m['to']}* ({m['why']})" for m in moves),
+            recipients=GOODS_FLIP_NOTIFY)
+
+
+def run_goods_gate_scheduler():
+    last_route = last_sweep = None
+    while True:
+        try:
+            now = _central_now()
+            if GOODS_ROUTE_ENABLED and _ups.enabled() and now.weekday() < 5 and 7 <= now.hour < 18:
+                if last_route is None or (now - last_route).total_seconds() >= 600:
+                    last_route = now
+                    try:
+                        r = _route_art_approved()
+                        _post_moves(r["moves"])
+                        if r["errors"]:
+                            print(f"[GATE] route errors {r['errors'][:3]}", flush=True)
+                    except Exception as e:
+                        print(f"[GATE] route failed: {e}", flush=True)
+                if last_sweep is None or (now - last_sweep).total_seconds() >= 1800:
+                    last_sweep = now
+                    try:
+                        r = _delivery_sweep()
+                        _post_moves(r["moves"])
+                    except Exception as e:
+                        print(f"[GATE] sweep failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[GATE] scheduler error: {e}", flush=True)
+        time.sleep(60)
+
+
+threading.Thread(target=run_goods_gate_scheduler, daemon=True).start()
+
+
+@mcp.tool()
+def goods_gate_run(dry_run: bool = True) -> str:
+    """Route ART APPROVED orders (direct + goods out → DIRECT - WAITING ON GOODS, else VERIFY GOODS)
+    and move DIRECT - WAITING ON GOODS orders whose boxes all show delivered to VERIFY GOODS.
+    dry_run (default TRUE) previews. Runs every 10 / 30 min on weekdays 7am–6pm for real."""
+    out = []
+    for name, fn in (("ART APPROVED routing", _route_art_approved), ("Delivery sweep", _delivery_sweep)):
+        try:
+            r = fn(dry_run=dry_run)
+        except Exception as e:
+            out.append(f"{name}: failed — {e}")
+            continue
+        out.append(f"{name}: {len(r['moves'])} {'would move' if dry_run else 'moved'}")
+        out += [f"  #{m['vid']} {m['nick']}: {m['from']} → {m['to']} ({m['why']})" for m in r["moves"]]
+        out += [f"  ⚠ {e}" for e in r["errors"][:10]]
+    return "\n".join(out)
 
 
 def _goods_status_flips(results, dry_run, errors):
@@ -7245,6 +7475,7 @@ def run_goods_notes_scheduler():
                 try:
                     rep = _goods_notes_impl(dry_run=False)
                     _goods_send_exceptions(rep)
+                    _goods_send_po_issues(rep)
                     print(f"[GOODS] updated {len(rep['written'])}, unchanged {rep['unchanged']}, "
                           f"errors {rep['errors'][:3]}", flush=True)
                     if rep["errors"]:
@@ -7442,12 +7673,10 @@ except Exception as _e:
     print(f"[PHOTOS] import failed: {_e}", flush=True)
 
 PHOTOS_ENABLED = os.environ.get("PHOTOS_ENABLED", "true").lower() not in ("0", "false", "no", "off")
-PHOTOS_EVERY_MIN = int(os.environ.get("PHOTOS_EVERY_MIN", "60"))
-_PHOTO_STATUSES = ["MOCK-UP REQUESTED", "QUOTE APPROVED", "ORDER GOODS", "CONTRACT - WAITING ON ARTWORK",
-                   "PROOF REQUESTED", "ART APPROVAL SENT", "ARTWORK DECLINED", "ART APPROVED", "VERIFY GOODS",
-                   "CONTRACT - WAITING ON GOODS", "DIRECT - WAITING ON GOODS", "SP - PRE-PRO",
-                   "EMB - ORDER DIGITIZING", "EMB - PRE-PRO", "DTF - ORDER TRANSFER", "DTF - PRE-PRO",
-                   "STORE - PRE PRO"]
+PHOTOS_EVERY_MIN = int(os.environ.get("PHOTOS_EVERY_MIN", "15"))
+# Only where a mockup/proof is actually being made (Luke, Nov 8). Store orders skipped — their
+# proofs come from the store.
+_PHOTO_STATUSES = ["MOCK-UP REQUESTED", "PROOF REQUESTED", "GXS - General - Request"]
 _PHOTOS_MAX_PER_ORDER = 12
 
 
@@ -7470,6 +7699,8 @@ def _photo_orders(only_order: str = "") -> list:
             if (n.get("status") or {}).get("id") not in ids:
                 continue
             if only_order and str(n.get("visualId")) != str(only_order):
+                continue
+            if "store merch" in (n.get("nickname") or "").lower():
                 continue
             out.append({"id": n["id"], "vid": str(n["visualId"]), "nick": n.get("nickname") or "",
                         "status": n["status"]["name"], "type": field[:-1]})
@@ -7514,7 +7745,8 @@ def _photos_impl(dry_run: bool = True, only_order: str = "") -> dict:
                     fname = u.rsplit("/", 1)[-1].split("?")[0].lower()
                     if u in mine or fname in have or u in [a[0] for a in adds]:
                         continue
-                    adds.append((u, f"{hit['supplier']} {hit['style']} {hit['color']}"))
+                    adds.append((u, f"{hit['supplier']} {hit['style']} {hit['color']}"
+                                    + (" (stand-in for TBD blank)" if hit.get("stand_in") else "")))
         adds = adds[:max(0, _PHOTOS_MAX_PER_ORDER - len(mine))]
         added = []
         if not dry_run:

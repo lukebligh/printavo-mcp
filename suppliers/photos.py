@@ -11,6 +11,13 @@ _GENERIC = {"SCRN", "SP", "EMB", "DTF", "PROMO", "SETUP", "SET", "ART", "DIGI", 
             "FREIGHT", "MISC", "TBD", "CUSTOM", "REPRINT", "SAMPLE", "FEE", "RUSH"}
 _PREFIX = (("next level", "NL"), ("bella", "BC"), ("district", "DT"), ("carhartt", "CT"))
 MISS_TTL_S = 7 * 86400
+# Undecided blanks ("TBD T-Shirt") get a stand-in so the mockup has something (Luke, Nov 8)
+_FALLBACK = ((re.compile(r"hood|hoody|hoodie"), "18500"),
+             (re.compile(r"t-?\s?shirt|\btees?\b"), "5000"))
+_BASIC = {"blue": "Royal", "red": "Red", "green": "Irish Green", "grey": "Sport Grey", "gray": "Sport Grey",
+          "black": "Black", "white": "White", "navy": "Navy", "purple": "Purple", "orange": "Orange",
+          "yellow": "Daisy", "pink": "Light Pink", "brown": "Dark Chocolate", "maroon": "Maroon",
+          "tan": "Sand", "khaki": "Sand", "gold": "Gold", "teal": "Jade Dome", "charcoal": "Charcoal"}
 
 
 class LookupError_(Exception):
@@ -91,9 +98,18 @@ def _ss_lookup(style, color, description):
     return {"supplier": "S&S", "style": style, "color": pick[0], "urls": urls} if urls else None
 
 
+def fallback(description):
+    d = (description or "").lower()
+    for rx, style in _FALLBACK:
+        if rx.search(d):
+            return style
+    return None
+
+
 def lookup(item_number, description, color, cache):
     """-> {"supplier","style","color","urls"} or None. cache: dict persisted by the caller.
-    Raises LookupError_ when a supplier call failed (nothing cached for that style)."""
+    Raises LookupError_ when a supplier call failed (nothing cached for that style).
+    No style found but the line is clearly a tee / hoodie → Gildan 5000 / 18500 in the nearest color."""
     now = time.time()
     failed = None
     for style in candidates(item_number, description):
@@ -112,6 +128,29 @@ def lookup(item_number, description, color, cache):
         if res:
             return res
         time.sleep(0.3)
+    fb = fallback(description)
+    if fb:
+        col = (color or "White").strip()
+        words = re.findall(r"[a-z]+", col.lower())
+        basic = _BASIC.get(_stock._cn(col)) or (_BASIC.get(words[-1]) if words else None)
+        order = (basic, col) if _stock._cn(col) in _BASIC else (col, basic)
+        for try_color in order + ("White",):
+            if not try_color:
+                continue
+            key = f"{fb}|{try_color.lower()}"
+            c = cache.get(key)
+            if isinstance(c, dict) and "urls" in c:
+                return {**c, "stand_in": True}
+            if isinstance(c, (int, float)) and now - c < MISS_TTL_S:
+                continue
+            try:
+                res = _from_sanmar(fb, try_color)
+            except LookupError_ as e:
+                failed = e
+                break
+            cache[key] = res if res else now
+            if res:
+                return {**res, "stand_in": True}
     if failed:
         raise failed
     return None

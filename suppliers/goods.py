@@ -9,7 +9,21 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta
 
 BEGIN, END = "— GOODS (auto", "— END GOODS —"
-_BLOCK_RE = re.compile(r"\n*— GOODS \(auto[^\n]*—.*?— END GOODS —\n*", re.S)
+_BLOCK_RE = re.compile(r"(?:\n|<div><br></div>)*(?:<div>)?— GOODS \(auto[^\n<]*—(?:</div>)?.*?"
+                       r"(?:<div>)?— END GOODS —(?:</div>)?\n*", re.S)
+_HTML_RE = re.compile(r"<(?:div|p|br)\b", re.I)
+
+
+def is_html(note):
+    """Printavo's rich-text editor stores notes as HTML (<div>…</div>); plain-text notes are text."""
+    return bool(_HTML_RE.search(note or ""))
+
+
+def to_html(block):
+    """Plain block (lines separated by blank lines) → one <div> per line, so an HTML note renders it
+    line by line instead of as one run-on paragraph."""
+    from html import escape
+    return "\n".join(f"<div>{escape(l, quote=False)}</div>" for l in block.split("\n\n") if l.strip())
 
 # UPS Ground business days from each SanMar origin to St. Louis (estimate).
 _TRANSIT = {"OH": 1, "MN": 2, "TX": 2, "VA": 2, "NJ": 2, "FL": 3, "AZ": 3, "NV": 4, "WA": 4}
@@ -22,7 +36,10 @@ def strip_block(note):
 def merge_block(note, block):
     """Replace (or append) the GOODS block; everything else in the note is kept."""
     rest = strip_block(note)
-    return (rest + "\n\n" + block).strip() if rest else block
+    if not rest:
+        return block
+    sep = "<div><br></div>\n" if block.startswith("<div>") else "\n\n"
+    return (rest + sep + block).strip()
 
 
 def block_body(note):
@@ -30,7 +47,11 @@ def block_body(note):
     m = _BLOCK_RE.search(note or "")
     if not m:
         return ""
-    return "\n".join(m.group(0).strip().splitlines()[1:])
+    blk = m.group(0)
+    i = blk.find("— GOODS (auto")
+    if blk[max(0, i - 5):i] == "<div>":
+        i -= 5
+    return "\n".join(blk[i:].strip().splitlines()[1:])
 
 
 def add_business_days(d, n):

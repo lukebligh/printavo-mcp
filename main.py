@@ -7180,6 +7180,8 @@ def _goods_notes_impl(dry_run: bool = True, only_order: str = "", statuses=None)
         if note is None:
             errors.append(f"#{r['vid']}: could not read production note")
             continue
+        if _goods.is_html(note):              # rich-text note → write the block as HTML lines
+            r["block"] = _goods.to_html(r["block"])
         new_body = "\n".join(r["block"].splitlines()[1:])
         if _goods.block_body(note) == new_body:
             unchanged += 1
@@ -7389,7 +7391,12 @@ def _goods_replace_all_goods_line(internal_id, new_line, errors, vid):
     note = ((cur.get("invoice") or {}).get("productionNote") or "") if "error" not in cur else ""
     if not note or "ALL GOODS" not in note:
         return
-    new = re.sub(r"(?m)^[⏳✅] ALL GOODS.*$", new_line, note, count=1)
+    if _goods.is_html(note):
+        from html import escape as _esc
+        new = re.sub(r"<div>[⏳✅] ALL GOODS.*?</div>", lambda m: f"<div>{_esc(new_line, quote=False)}</div>",
+                     note, count=1)
+    else:
+        new = re.sub(r"(?m)^[⏳✅] ALL GOODS.*$", lambda m: new_line, note, count=1)
     if new != note:
         res = query_printavo("""mutation($id: ID!, $note: String) { invoiceUpdate(id: $id,
             input: { productionNote: $note }) { id } }""", {"id": internal_id, "note": new})

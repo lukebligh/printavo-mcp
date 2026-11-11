@@ -7932,6 +7932,40 @@ def run_order_shadow_scheduler():
 threading.Thread(target=run_order_shadow_scheduler, daemon=True).start()
 
 
+@mcp.tool()
+def sanmar_po_test(lines_json: str, po_num: str, submit: bool = False, env: str = "edev") -> str:
+    """SanMar purchase order via web services. env 'edev' = SanMar's TEST environment (never filled).
+    lines_json: [{"style":"PC61","color":"Black","size":"L","qty":2}, ...]. Colors are matched to
+    SanMar's own color names and sent with inventoryKey + sizeIndex. submit=False runs
+    getPreSubmitInfo (stock check only); submit=True places the PO. Production (env='prod') is
+    refused until auto-ordering is switched on."""
+    if env != "edev" and os.environ.get("SANMAR_PO_PROD_ENABLED", "false").lower() != "true":
+        return "Refused: production PO submission is not switched on (SANMAR_PO_PROD_ENABLED)."
+    try:
+        raw = json.loads(lines_json)
+        lines, notes = [], []
+        for l in raw:
+            keys = _sanmar.part_keys(l["style"], "")
+            colors = sorted({c for c, _z in keys})
+            pick = _stock._pick_colors(colors, l.get("color", "")) if l.get("color") else []
+            if not pick:
+                return f"No SanMar color match for {l['style']} '{l.get('color')}'. Options: {', '.join(colors[:15])}"
+            k = keys.get((pick[0], str(l["size"]).upper()))
+            if not k:
+                return (f"No size {l['size']} for {l['style']} {pick[0]}. Sizes: "
+                        + ", ".join(sorted({z for c, z in keys if c == pick[0]})))
+            lines.append({"style": l["style"], "color": pick[0], "size": str(l["size"]).upper(),
+                          "qty": int(l["qty"]), "inventoryKey": k[0], "sizeIndex": k[1]})
+            notes.append(f"  {l['style']} {pick[0]} {str(l['size']).upper()} ×{int(l['qty'])}  (key {k[0]}/{k[1]})")
+        method = "submitPO" if submit else "getPreSubmitInfo"
+        r = _sanmar.po_call(method, po_num, lines, env=env, email="sales@estmerch.com")
+    except Exception as e:
+        return f"SanMar PO failed: {e}"
+    out = [f"{env.upper()} · {method} · PO \"{po_num}\" → {'OK' if r['ok'] else 'ERROR'}: {r['message']}"] + notes
+    out += [f"  ↳ {d['style']} {d['color']} {d['size']}: {d['message']}" for d in r["lines"] if d["message"]]
+    return "\n".join(out)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Blank product photos → production files (Luke, Nov 8). Every order (direct AND
 # contract, invoices and quotes) from MOCK-UP REQUESTED through PRE-PRO gets the

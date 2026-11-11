@@ -64,13 +64,13 @@ def _kids(el, name):
     return [c for c in list(el) if _local(c.tag) == name]
 
 
-def _post(path, body, ns_decl, timeout=60):
+def _post(path, body, ns_decl, timeout=60, base=None):
     env = ('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
            f'{ns_decl}><soapenv:Header/><soapenv:Body>{body}</soapenv:Body></soapenv:Envelope>')
     last = None
     for attempt in range(2):
         try:
-            r = httpx.post(BASE + path, content=env.encode("utf-8"), timeout=timeout,
+            r = httpx.post((base or BASE) + path, content=env.encode("utf-8"), timeout=timeout,
                            headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": ""})
             break
         except httpx.HTTPError as e:
@@ -482,3 +482,74 @@ def product_images(style, color=""):
                       "back_flat": _t(r, "backFlat"), "model": _t(r, "colorProductImage"),
                       "product": _t(r, "productImage"), "brand": _t(r, "brandName")}
     return list(out.values())
+
+
+
+# ─────────────────────────── Purchase orders (SanMar standard PO service) ───────────────────────────
+# EDEV = SanMar's test environment (orders are never filled). Production is a separate switch.
+PO_BASES = {"edev": "https://edev-ws.sanmar.com:8080", "prod": "https://ws.sanmar.com:8080"}
+SHIP_TO = {"shipTo": "ESTABLISHED MERCH", "attention": "ESTABLISHED MERCH",
+           "shipAddress1": "1920 S VANDEVENTER AVE", "shipAddress2": "", "shipCity": "ST LOUIS",
+           "shipState": "MO", "shipZip": "63110", "shipMethod": "UPS", "residence": "N"}
+PO_NUM_MAX = 28
+
+
+def _po_creds(env):
+    if env == "edev":
+        u = os.environ.get("SANMAR_EDEV_USERNAME", "").strip()
+        p = os.environ.get("SANMAR_EDEV_PASSWORD", "").strip()
+        if not u or not p:
+            raise SanMarError("SanMar EDEV credentials not configured (SANMAR_EDEV_USERNAME / _PASSWORD).")
+        return escape(u), escape(p)
+    return _creds()
+
+
+def part_keys(style, color):
+    """-> {(color, size): (inventoryKey, sizeIndex)} from pricing — the IDs SanMar recommends on POs."""
+    u, p = _creds()
+    body = (f"<impl:getPricing><arg0><style>{escape(style)}</style><color>{escape(color)}</color>"
+            f"<size></size></arg0><arg1><sanMarCustomerNumber>{_cust()}</sanMarCustomerNumber>"
+            f"<sanMarUserName>{u}</sanMarUserName><sanMarUserPassword>{p}</sanMarUserPassword></arg1>"
+            f"</impl:getPricing>")
+    root = _post("/SanMarWebService/SanMarPricingServicePort", body, IMPL_NS)
+    out = {}
+    for i in (_all(root, "listResponse") if root is not None else []):
+        if _t(i, "inventoryKey") and _t(i, "sizeIndex"):
+            out[(_t(i, "color"), _t(i, "size").upper())] = (_t(i, "inventoryKey"), _t(i, "sizeIndex"))
+    return out
+
+
+def _po_body(method, po_num, lines, email, u, p):
+    if not po_num or len(po_num) > PO_NUM_MAX or "," in po_num:
+        raise SanMarError(f"PO number must be 1–{PO_NUM_MAX} characters, no commas: {po_num!r}")
+    head = "".join(f"<{k}>{escape(v)}</{k}>" for k, v in SHIP_TO.items())
+    det = "".join(
+        "<webServicePoDetailList>"
+        f"<inventoryKey>{escape(str(l.get('inventoryKey') or ''))}</inventoryKey>"
+        f"<sizeIndex>{escape(str(l.get('sizeIndex') or ''))}</sizeIndex>"
+        f"<style>{escape(l['style'])}</style><color>{escape(l.get('color') or '')}</color>"
+        f"<size>{escape(l.get('size') or '')}</size><quantity>{int(l['qty'])}</quantity><whseNo/>"
+        "</webServicePoDetailList>" for l in lines)
+    return (f"<web:{method}><arg0>{head}<notes/><poNum>{escape(po_num)}</poNum>"
+            f"<shipEmail>{escape(email or '')}</shipEmail><department/>{det}</arg0>"
+            f"<arg1><sanMarCustomerNumber>{_cust()}</sanMarCustomerNumber><sanMarUserName>{u}</sanMarUserName>"
+            f"<sanMarUserPassword>{p}</sanMarUserPassword></arg1></web:{method}>")
+
+
+def po_call(method, po_num, lines, env="edev", email=""):
+    """method: 'getPreSubmitInfo' (stock check, places nothing) or 'submitPO'.
+    lines: [{style, color, size, qty, inventoryKey?, sizeIndex?}]"""
+    if method not in ("getPreSubmitInfo", "submitPO"):
+        raise SanMarError("bad PO method")
+    if env not in PO_BASES:
+        raise SanMarError("env must be edev or prod")
+    u, p = _po_creds(env)
+    root = _post("/SanMarWebService/SanMarPOServicePort", _po_body(method, po_num, lines, email, u, p),
+                 WEB_NS, timeout=90, base=PO_BASES[env])
+    if root is None:
+        raise SanMarError("SanMar PO service returned nothing")
+    err = (_t(root, "errorOccurred") or _t(root, "errorOccured")).lower() == "true"
+    det = [{"style": _t(d, "style"), "color": _t(d, "color"), "size": _t(d, "size"),
+            "qty": _t(d, "quantity"), "whse": _t(d, "whseNo"), "message": _t(d, "message")}
+           for d in _all(root, "webServicePoDetailList")]
+    return {"ok": not err, "message": _t(root, "message"), "lines": det}

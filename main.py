@@ -7845,7 +7845,7 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             ss_orders_with_po.update(_scogs.order_numbers(po))
     except Exception as e:
         print(f"[ORDER] S&S PO list failed: {e}", flush=True)
-    needs = []
+    needs, tag_skipped = [], []
     for o in queue:
         vid = str(o["vid"])
         try:
@@ -7853,6 +7853,9 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
                 continue                                  # already ordered
         except Exception:
             pass
+        if o.get("id") and _order_has_skip_tag(o["id"]):
+            tag_skipped.append(vid)                       # #nogoods: customer-supplied / other vendor
+            continue
         needs.append(o)
     seen = _goods_json("order_first_seen.json", {})
     first_seen = {}
@@ -7878,7 +7881,26 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
                            "status": o["status"]})
         result = _ordering.plan(orders, today, first_seen, supplier_filter or None)
     result["queue"] = len(needs)
+    result["tag_skipped"] = tag_skipped
     return result
+
+
+# Direct orders whose blanks are customer-supplied or come from another vendor: tag them in Printavo
+# with #nogoods and auto-ordering never touches them (Luke, Nov 10).
+ORDER_SKIP_TAGS = {t.strip().lower().lstrip("#") for t in os.environ.get("ORDER_SKIP_TAGS", "nogoods").split(",")
+                   if t.strip()}
+
+
+def _order_has_skip_tag(internal_id) -> bool:
+    time.sleep(PAGE_DELAY_S)
+    r = query_printavo("query($id: ID!) { invoice(id: $id) { tags } }", {"id": internal_id})
+    tags = ((r.get("invoice") or {}).get("tags") or []) if "error" not in r else []
+    return any(str(t).strip().lower().lstrip("#") in ORDER_SKIP_TAGS for t in tags)
+
+
+def _order_skip_note(r) -> str:
+    sk = r.get("tag_skipped") or []
+    return ("\n_Skipped — tagged #nogoods: " + ", ".join(f"#{v}" for v in sk) + "_") if sk else ""
 
 
 @mcp.tool()
@@ -7891,7 +7913,7 @@ def order_build_preview(supplier: str = "") -> str:
         r = _order_build_impl(supplier_filter=supplier.strip(), record_seen=False)
     except Exception as e:
         return f"Order build failed: {e}"
-    return _ordering.render(r, f"🧪 SHADOW ORDER BUILD — nothing placed · {r['queue']} orders need goods")
+    return _ordering.render(r, f"🧪 SHADOW ORDER BUILD — nothing placed · {r['queue']} orders need goods") + _order_skip_note(r)
 
 
 _last_order_build = None
@@ -7919,7 +7941,7 @@ def run_order_shadow_scheduler():
                         label = "SanMar + S&S" if which == "ALL" else which
                         text = _ordering.render(
                             r, f"🧪 *SHADOW order build {now_ct:%-I:%M %p}* ({label}) — nothing was placed. "
-                               f"Compare with what Mechelle orders today · {r['queue']} orders need goods")
+                               f"Compare with what Mechelle orders today · {r['queue']} orders need goods") + _order_skip_note(r)
                         _post_cogs_dm(text[:39000], recipients=ORDER_SHADOW_USERS)
                     except Exception as e:
                         print(f"[ORDER] shadow build failed: {e}", flush=True)

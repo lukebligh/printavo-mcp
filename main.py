@@ -8186,49 +8186,78 @@ def _ord_po_now(p):
     return " · ".join(out)
 
 
-def _ord_check_skips(ts, p, now) -> bool:
-    """Reply to `skip #NNNN` / `unskip #NNNN` in a post's thread as soon as it's seen."""
+def _ord_verb(t):
+    if re.search(r"\bunskip\b|\badd\b.*\bback\b", t, re.I):
+        return "unskip"
+    if re.search(r"\bskip\b", t, re.I):
+        return "skip"
+    return None
+
+
+def _ord_apply(ts, p, verb, nums, now):
+    """Apply skip/unskip to one open post; update the post. -> numbers that were in it."""
+    vids = {o["vid"] for po in p["pos"] for o in po["orders"]}
+    hit = [n for n in nums if n in vids]
+    if not hit:
+        return []
+    skips = set(p.get("skips") or [])
+    (skips.update if verb == "skip" else skips.difference_update)(hit)
+    p["skips"] = sorted(skips)
+    sk = p["skips"]
+    banner = (f"✏️ *Updated {now:%-I:%M %p} — skipped: {', '.join('#' + v for v in sk)}* · now {_ord_po_now(p)}\n\n"
+              if sk else "")
+    _ord_update(ts, banner + p.get("text", ""))
+    return hit
+
+
+def _ord_ack(user, verb, hit, miss, reply_ts, props_hit):
+    name = ORDER_APPROVERS.get(user, "")
+    if hit:
+        did = "removed from" if verb == "skip" else "added back to"
+        now_txt = "\n".join(f"{p['supplier']}: {_ord_po_now(p)}" for p in props_hit)
+        msg = (f"👍 Got it, {name} — {', '.join('#' + n for n in hit)} {did} the open order.\n"
+               f"Now: {now_txt}\n✅ the order post to place it.")
+    else:
+        msg = "I didn't find that order # on an open order post. Use `skip #7467` or `unskip #7467`."
+    if miss and hit:
+        msg += f"\n(Not on an open post: {', '.join('#' + n for n in miss)})"
+    _ord_post(msg, thread_ts=reply_ts)
+
+
+def _ord_handle_msg(m, props, now, only_ts=None) -> bool:
+    """A skip/unskip message — in a post's thread (only_ts) or anywhere in the channel."""
+    if m.get("bot_id") or m.get("subtype") or not m.get("user"):
+        return False
+    t = m.get("text") or ""
+    verb = _ord_verb(t)
+    if not verb:
+        return False
+    reply_ts = m.get("thread_ts") or m["ts"]
+    if m["user"] not in ORDER_APPROVERS:
+        _ord_post(f"Only {', '.join(ORDER_APPROVERS.values())} can change an order.", thread_ts=reply_ts)
+        return False
+    nums = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", t)
+    hit, props_hit = [], []
+    for ts, p in props.items():
+        if p.get("status") != "pending" or (only_ts and ts != only_ts):
+            continue
+        h = _ord_apply(ts, p, verb, nums, now)
+        if h:
+            hit += [n for n in h if n not in hit]
+            props_hit.append(p)
+    _ord_ack(m["user"], verb, hit, [n for n in nums if n not in hit], reply_ts, props_hit)
+    return True
+
+
+def _ord_check_skips(ts, p, props, now) -> bool:
+    """skip / unskip replies in a post's thread, answered as soon as they're seen."""
     rep = _slack("conversations.replies", {"channel": ORDER_CHANNEL, "ts": ts, "limit": 200}, get=True)
     last = float(p.get("reply_ts") or ts)
     msgs = sorted((m for m in rep.get("messages") or [] if float(m["ts"]) > last), key=lambda m: float(m["ts"]))
-    if not msgs:
-        return False
-    vids = {o["vid"] for po in p["pos"] for o in po["orders"]}
     for m in msgs:
         p["reply_ts"] = m["ts"]
-        if m.get("bot_id") or m.get("subtype") or not m.get("user"):
-            continue
-        t = m.get("text") or ""
-        if re.search(r"\bunskip\b|\badd\b.*\bback\b", t, re.I):
-            verb = "unskip"
-        elif re.search(r"\bskip\b", t, re.I):
-            verb = "skip"
-        else:
-            continue
-        if m["user"] not in ORDER_APPROVERS:
-            _ord_post(f"Only {', '.join(ORDER_APPROVERS.values())} can change this order.", thread_ts=ts)
-            continue
-        nums = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", t)
-        hit = [n for n in nums if n in vids]
-        miss = [n for n in nums if n not in vids]
-        skips = set(p.get("skips") or [])
-        (skips.update if verb == "skip" else skips.difference_update)(hit)
-        p["skips"] = sorted(skips)
-        name = ORDER_APPROVERS[m["user"]]
-        if hit:
-            did = "removed from" if verb == "skip" else "added back to"
-            msg = (f"👍 Got it, {name} — {', '.join('#' + n for n in hit)} {did} this order.\n"
-                   f"Now: {_ord_po_now(p)}\n✅ the main post to place it.")
-        else:
-            msg = "I didn't find an order # to change. Use `skip #7467` or `unskip #7467`."
-        if miss:
-            msg += f"\n(Not in this post: {', '.join('#' + n for n in miss)})"
-        _ord_post(msg, thread_ts=ts)
-        sk = p.get("skips") or []
-        banner = (f"✏️ *Updated {now:%-I:%M %p} — skipped: {', '.join('#' + v for v in sk)}* · now {_ord_po_now(p)}\n\n"
-                  if sk else "")
-        _ord_update(ts, banner + p.get("text", ""))
-    return True
+        _ord_handle_msg(m, props, now, only_ts=ts)
+    return bool(msgs)
 
 
 def _order_poll_once():
@@ -8236,6 +8265,11 @@ def _order_poll_once():
     with _ORDER_LOCK:
         ctl = _goods_json("order_control.json", {})
         # 1) Luke's kill switch: `pause ordering` / `resume ordering` typed in the channel
+        if not ctl.get("skip_v2"):
+            ctl["skip_v2"] = True
+            open_ts = [ts for ts, p in _ord_load().items() if p.get("status") == "pending"]
+            if open_ts:
+                ctl["hist_ts"] = min(open_ts)
         if not ctl.get("hist_ts"):
             ctl["hist_ts"] = f"{time.time():.6f}"
         else:
@@ -8249,6 +8283,10 @@ def _order_poll_once():
                     continue
                 t = (m.get("text") or "").strip().lower()
                 if "pause ordering" not in t and "resume ordering" not in t:
+                    if _ord_verb(t):
+                        props = _ord_load()
+                        if _ord_handle_msg(m, props, now):
+                            _ord_save(props)
                     continue
                 if m["user"] not in ORDER_PAUSE_USERS:
                     _ord_post("Only Luke can pause or resume ordering.", thread_ts=m["ts"])
@@ -8279,7 +8317,7 @@ def _order_poll_once():
                 continue
             if st == "pending":
                 try:
-                    if _ord_check_skips(ts, p, now):
+                    if _ord_check_skips(ts, p, props, now):
                         changed = True
                         _ord_save(props)
                 except Exception as e:

@@ -157,7 +157,8 @@ def ss_side(style, color, brand=""):
             if not whs and (i.get("warehouses") or []):
                 continue
             rows[sz] = {"stock": sum(q for _n, q in whs) if whs else int(i.get("qty") or 0),
-                        "price": price, "top": _near("S&S", whs), "whs": whs}
+                        "price": price, "top": _near("S&S", whs), "whs": whs,
+                        "sku": i.get("sku") or i.get("skuID_Master") or ""}
     by = {c: r for c, r in by.items() if r}
     colors = sorted(by) or colors
     picked = _best([c for c in picked if c in by], by)

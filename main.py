@@ -7805,7 +7805,7 @@ except Exception as _e:  # pragma: no cover
 
 ORDER_SHADOW_ENABLED = os.environ.get("ORDER_SHADOW_ENABLED", "true").lower() not in ("0", "false", "no", "off")
 # 10:30 = SanMar (11:00 cutoff) + S&S; 14:15 = S&S only (3:00 cutoff), anything new since 10:30.
-ORDER_BUILD_TIMES_CT = os.environ.get("ORDER_BUILD_TIMES_CT", "10:30=ALL,14:15=S&S")
+ORDER_BUILD_TIMES_CT = os.environ.get("ORDER_BUILD_TIMES_CT", "10:30=SanMar,14:15=S&S")
 ORDER_SHADOW_USERS = os.environ.get("ORDER_SHADOW_USERS", "U0504FSDYB0")   # Luke only while in shadow
 _ORDER_QUEUE_STATUSES = ("ORDER GOODS",) + _GOODS_ALERT_STATUSES
 
@@ -7876,7 +7876,8 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             lines = [m for m in (_ordering.match_line(i, cache) for i in items) if m]
             if not lines:
                 continue
-            orders.append({"vid": o["vid"], "nick": o["nick"], "company": o["company"],
+            orders.append({"vid": o["vid"], "id": o.get("id"), "sig": _order_sig(items),
+                           "nick": o["nick"], "company": o["company"],
                            "prod": o["prod"].date() if o.get("prod") else None, "lines": lines,
                            "status": o["status"]})
         result = _ordering.plan(orders, today, first_seen, supplier_filter or None)
@@ -7918,6 +7919,369 @@ def order_build_preview(supplier: str = "") -> str:
 
 _last_order_build = None
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO-ORDERING — ✅ APPROVAL IN #goods-orders (Luke, Nov 12 2026)
+#  Spec: project doc claude/Auto_Ordering_Updates_Nov2026.md ("Updates Nov 11–12").
+#  ORDER_MODE: shadow = DM Luke only (old) · test = post + ✅ + submit to SanMar EDEV / S&S test orders
+#  (nothing ships) · live = real POs (SanMar also needs SANMAR_PO_PROD_ENABLED, S&S ORDER_SS_LIVE_ENABLED).
+#  The server polls the post for a ✅ from an approver every ~45s; no Claude session is involved.
+# ═══════════════════════════════════════════════════════════════════════════════
+ORDER_MODE = os.environ.get("ORDER_MODE", "test").strip().lower()
+ORDER_CHANNEL = os.environ.get("ORDER_CHANNEL", "C0CHCAD1CH2")             # #goods-orders (private)
+ORDER_APPROVERS = dict(p.split(":", 1) for p in os.environ.get(
+    "ORDER_APPROVERS", "U0504FSDYB0:Luke,U07VDET3XEX:Mechelle,U07VDHDSMUJ:Clint").split(",") if ":" in p)
+ORDER_PAUSE_USERS = {u.strip() for u in os.environ.get("ORDER_PAUSE_USERS", "U0504FSDYB0").split(",") if u.strip()}
+ORDER_CUTOFFS_CT = dict(p.split("=", 1) for p in os.environ.get(
+    "ORDER_CUTOFFS_CT", "SanMar=11:00,S&S=15:00").split(",") if "=" in p)
+ORDER_SS_LIVE_ENABLED = os.environ.get("ORDER_SS_LIVE_ENABLED", "false").lower() == "true"
+_APPROVE_EMOJI = {"white_check_mark", "heavy_check_mark", "ballot_box_with_check"}
+_ORDER_LOCK = threading.RLock()
+
+
+def _slack(method, payload=None, get=False):
+    if not SLACK_BOT_TOKEN:
+        raise RuntimeError("SLACK_BOT_TOKEN not set")
+    h = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    if get:
+        r = httpx.get(f"https://slack.com/api/{method}", headers=h, params=payload or {}, timeout=20)
+    else:
+        r = httpx.post(f"https://slack.com/api/{method}", json=payload or {}, timeout=20,
+                       headers={**h, "Content-Type": "application/json; charset=utf-8"})
+    b = r.json() if r.status_code == 200 else {"ok": False, "error": f"HTTP {r.status_code}"}
+    if not b.get("ok"):
+        raise RuntimeError(f"Slack {method}: {b.get('error')}")
+    return b
+
+
+def _ord_post(text, thread_ts=None):
+    p = {"channel": ORDER_CHANNEL, "text": text[:39000], "unfurl_links": False, "unfurl_media": False}
+    if thread_ts:
+        p["thread_ts"] = thread_ts
+    return _slack("chat.postMessage", p)["ts"]
+
+
+def _ord_update(ts, text):
+    try:
+        _slack("chat.update", {"channel": ORDER_CHANNEL, "ts": ts, "text": text[:39000]})
+    except Exception as e:
+        print(f"[ORDER] could not update post {ts}: {e}", flush=True)
+
+
+def _order_sig(items) -> str:
+    rows = []
+    for i in items:
+        for z, q in (i.get("sizes") or {}).items():
+            if int(q or 0) > 0:
+                rows.append([str(i.get("style") or "").strip().upper(), str(i.get("color") or "").strip().lower(),
+                             str(z), int(q)])
+    return json.dumps(sorted(rows))
+
+
+def _order_snapshot(internal_id) -> dict:
+    """Live status, tags and line items for one order — re-checked right before every submit."""
+    time.sleep(PAGE_DELAY_S)
+    r = query_printavo('''query($id: ID!) { o: invoice(id: $id) { status { name } tags
+        lineItemGroups(first: 25) { nodes { lineItems(first: 50) { nodes {
+            itemNumber color sizes { size count } } } } } } }''', {"id": internal_id})
+    if "error" in r:
+        raise RuntimeError(r["error"])
+    o = r.get("o") or {}
+    items = []
+    for g in (o.get("lineItemGroups") or {}).get("nodes") or []:
+        for li in (g.get("lineItems") or {}).get("nodes") or []:
+            items.append({"style": li.get("itemNumber") or "", "color": li.get("color") or "",
+                          "sizes": {s.get("size"): s.get("count") or 0 for s in (li.get("sizes") or [])}})
+    return {"status": (o.get("status") or {}).get("name") or "", "tags": o.get("tags") or [], "items": items}
+
+
+def _ord_mode_banner():
+    if ORDER_MODE == "test":
+        return "🧪 *TEST — nothing will actually be ordered* (SanMar test system / S&S test orders).\n"
+    return ""
+
+
+def _ord_load():
+    return _goods_json("order_proposals.json", {})
+
+
+def _ord_save(props):
+    cutoff = (_central_now() - timedelta(days=21)).isoformat()
+    _goods_json_save("order_proposals.json", {k: v for k, v in props.items()
+                                               if v.get("created", "") >= cutoff or v.get("status") == "pending"})
+
+
+def _order_post_build(supplier, record_seen=True) -> str:
+    """Build the POs for one supplier, expire that supplier's older open post, post the new one."""
+    now = _central_now()
+    if _goods_json("order_control.json", {}).get("paused"):
+        _ord_post(f"⏸ Ordering is paused — the {now:%-I:%M %p} {supplier} build was skipped. "
+                  "Luke: type `resume ordering` here to turn it back on.")
+        return "paused"
+    r = _order_build_impl(supplier, record_seen=record_seen)
+    cut = ORDER_CUTOFFS_CT.get(supplier, "")
+    head = (f"{_ord_mode_banner()}*{supplier} order build — {now:%a %-m/%-d %-I:%M %p}* · "
+            f"{r['queue']} direct orders need goods")
+    if r["pos"]:
+        what = "this PO" if len(r["pos"]) == 1 else f"these {len(r['pos'])} POs"
+        head += (f"\n👉 *React ✅ to place {what}* — by {cut} for next-day delivery. "
+                 f"To drop an order first, reply in the thread: `skip #NNNN`. "
+                 f"Approvers: {', '.join(ORDER_APPROVERS.values())}.")
+    text = _ordering.render(r, head) + _order_skip_note(r)
+    with _ORDER_LOCK:
+        props = _ord_load()
+        for ts, p in props.items():
+            if p.get("supplier") == supplier and p.get("status") == "pending":
+                p["status"], p["expired_at"] = "expired", now.isoformat()
+                _ord_update(ts, f"⌛ *EXPIRED* — replaced by the {now:%a %-I:%M %p} build below. "
+                                f"Nothing was placed from this post.\n\n" + p.get("text", ""))
+        ts = _ord_post(text)
+        if r["pos"]:
+            props[ts] = {
+                "supplier": supplier, "mode": ORDER_MODE, "status": "pending", "created": now.isoformat(),
+                "text": text,
+                "pos": [{"po_number": po["po_number"], "why": po["why"], "total": po["total"],
+                         "nextday": all(opt["nextday"] for p in po["parts"] for _l, opt in p["lines"]),
+                         "orders": [{"vid": str(p["order"]["vid"]), "id": p["order"].get("id"),
+                                     "sig": p["order"].get("sig"),
+                                     "lines": [{"style": l["style"], "color": opt["color"], "need": l["need"],
+                                                "skus": opt.get("skus") or {}} for l, opt in p["lines"]]}
+                                    for p in po["parts"]]}
+                        for po in r["pos"]]}
+        _ord_save(props)
+    return text
+
+
+def _sanmar_po_lines(agg):
+    """agg {(style, color, size): qty} -> SanMar PO lines with inventoryKey + sizeIndex, or raise."""
+    out, keys_by_style = [], {}
+    for (style, color, size), qty in sorted(agg.items()):
+        keys = keys_by_style.get(style)
+        if keys is None:
+            keys = keys_by_style[style] = _sanmar.part_keys(style, "")
+        colors = sorted({c for c, _z in keys})
+        pc = color if color in colors else ((_stock._pick_colors(colors, color) or [None])[0])
+        if not pc:
+            raise RuntimeError(f"no SanMar color match for {style} '{color}'")
+        zmap = {_stock.norm_size(z): z for c, z in keys if c == pc}
+        z = zmap.get(_stock.norm_size(size))
+        if not z:
+            raise RuntimeError(f"no SanMar size {size} for {style} {pc}")
+        k = keys[(pc, z)]
+        out.append({"style": style, "color": pc, "size": z, "qty": int(qty),
+                    "inventoryKey": k[0], "sizeIndex": k[1]})
+    return out
+
+
+def _order_submit(ts, p) -> tuple:
+    """Re-check every order, then place each PO. -> (status, summary lines)."""
+    sup = p["supplier"]
+    skips = set()
+    try:
+        rep = _slack("conversations.replies", {"channel": ORDER_CHANNEL, "ts": ts, "limit": 200}, get=True)
+        for m in rep.get("messages") or []:
+            t = m.get("text") or ""
+            if m.get("ts") != ts and m.get("user") in ORDER_APPROVERS and re.search(r"\bskip\b", t, re.I):
+                skips.update(re.findall(r"(?<!\d)(\d{4,6})(?!\d)", t))
+    except Exception as e:
+        print(f"[ORDER] thread read failed: {e}", flush=True)
+    ss_ordered = set()
+    try:
+        for po in _ss.recent_pos():
+            ss_ordered.update(_scogs.order_numbers(po))
+    except Exception as e:
+        return "failed", [f"⚠️ Couldn't read S&S orders to check for duplicates ({e}) — nothing placed. React again to retry."]
+    queue_norm = {_norm_status(s) for s in _ORDER_QUEUE_STATUSES}
+    out, placed, failed = [], 0, 0
+    for po in p["pos"]:
+        kept = []
+        for o in po["orders"]:
+            vid = o["vid"]
+            why = None
+            if vid in skips:
+                why = "skipped in the thread"
+            else:
+                try:
+                    have = _sanmar.find_pos(vid)
+                except Exception:
+                    have = []
+                if have or vid in ss_ordered:
+                    why = f"already ordered ({have[0] if have else 'S&S PO'}) — not ordering twice"
+            if not why:
+                try:
+                    snap = _order_snapshot(o["id"])
+                    if _norm_status(snap["status"]) not in queue_norm:
+                        why = f"now in {snap['status']} — left out"
+                    elif any(str(t).strip().lower().lstrip("#") in ORDER_SKIP_TAGS for t in snap["tags"]):
+                        why = "tagged #nogoods — left out"
+                    elif _order_sig(snap["items"]) != o.get("sig"):
+                        why = "changed in Printavo since this post — it'll be in the next build"
+                except Exception as e:
+                    why = f"couldn't re-check it in Printavo ({str(e)[:80]}) — left out"
+            if why:
+                out.append(f"  • #{vid} dropped: {why}")
+            else:
+                kept.append(o)
+        if not kept:
+            out.append(f"• PO \"{po['po_number']}\": nothing left to place.")
+            continue
+        po_num = "-".join(o["vid"] for o in kept)
+        try:
+            if sup == "SanMar":
+                agg = {}
+                for o in kept:
+                    for l in o["lines"]:
+                        for z, q in l["need"].items():
+                            k = (l["style"], l["color"], z)
+                            agg[k] = agg.get(k, 0) + int(q)
+                lines = _sanmar_po_lines(agg)
+                if ORDER_MODE == "live":
+                    if os.environ.get("SANMAR_PO_PROD_ENABLED", "false").lower() != "true":
+                        raise RuntimeError("SanMar production ordering is not switched on (SANMAR_PO_PROD_ENABLED)")
+                    env = "prod"
+                else:
+                    env = "edev"
+                pre = _sanmar.po_call("getPreSubmitInfo", po_num, lines, env=env, email="sales@estmerch.com")
+                if not pre["ok"]:
+                    raise RuntimeError("stock check failed: " + (pre["message"] or "") + " " + "; ".join(
+                        f"{d['style']} {d['color']} {d['size']}: {d['message']}" for d in pre["lines"] if d["message"]))
+                res = _sanmar.po_call("submitPO", po_num, lines, env=env, email="sales@estmerch.com")
+                if not res["ok"]:
+                    raise RuntimeError(res["message"] or "SanMar returned an error")
+                where = "SanMar TEST system (nothing ships)" if env == "edev" else "SanMar"
+                out.append(f"• ✅ PO \"{po_num}\" placed with {where} — {sum(l['qty'] for l in lines)} pcs, "
+                           f"{len(lines)} lines. {res['message'] or ''}".rstrip())
+            else:
+                agg = {}
+                for o in kept:
+                    for l in o["lines"]:
+                        for z, q in l["need"].items():
+                            sku = (l.get("skus") or {}).get(z)
+                            if not sku:
+                                raise RuntimeError(f"no S&S SKU for {l['style']} {l['color']} {z}")
+                            agg[sku] = agg.get(sku, 0) + int(q)
+                test = ORDER_MODE != "live"
+                if not test and not ORDER_SS_LIVE_ENABLED:
+                    raise RuntimeError("S&S live ordering is not switched on (ORDER_SS_LIVE_ENABLED)")
+                ss_po = ("TEST-" + po_num) if test else po_num
+                res = _ss.place_order(ss_po, [{"sku": s, "qty": q} for s, q in agg.items()], test=test,
+                                      warehouses="IL,KS,KY" if po.get("nextday") else "",
+                                      email="" if test else "sales@estmerch.com")
+                if not res["ok"]:
+                    raise RuntimeError(res["message"])
+                nums = ", ".join(f"{x['orderNumber']} ({x['warehouse']}, ${x['total']:,.2f})" for x in res["orders"])
+                where = "as an S&S TEST order (created + cancelled, nothing ships)" if test else "with S&S"
+                out.append(f"• ✅ PO \"{ss_po}\" placed {where} — {sum(agg.values())} pcs · S&S order {nums}")
+            placed += 1
+        except Exception as e:
+            failed += 1
+            out.append(f"• ❌ PO \"{po_num}\" NOT placed: {str(e)[:300]}")
+    status = "submitted" if placed and not failed else ("partial" if placed else "failed")
+    return status, out
+
+
+def _order_poll_once():
+    now = _central_now()
+    with _ORDER_LOCK:
+        ctl = _goods_json("order_control.json", {})
+        # 1) Luke's kill switch: `pause ordering` / `resume ordering` typed in the channel
+        if not ctl.get("hist_ts"):
+            ctl["hist_ts"] = f"{time.time():.6f}"
+        else:
+            h = _slack("conversations.history", {"channel": ORDER_CHANNEL, "oldest": ctl["hist_ts"], "limit": 100}, get=True)
+            prev = float(ctl["hist_ts"])
+            for m in sorted(h.get("messages") or [], key=lambda m: float(m["ts"])):
+                if float(m["ts"]) <= prev:
+                    continue
+                ctl["hist_ts"] = m["ts"]
+                if m.get("bot_id") or m.get("subtype") or not m.get("user"):
+                    continue
+                t = (m.get("text") or "").strip().lower()
+                if "pause ordering" not in t and "resume ordering" not in t:
+                    continue
+                if m["user"] not in ORDER_PAUSE_USERS:
+                    _ord_post("Only Luke can pause or resume ordering.", thread_ts=m["ts"])
+                elif "pause ordering" in t:
+                    ctl["paused"] = True
+                    props = _ord_load()
+                    for ts, p in props.items():
+                        if p.get("status") == "pending":
+                            p["status"] = "expired"
+                            _ord_update(ts, "⏸ *CANCELLED — ordering paused.* Nothing was placed from this post.\n\n"
+                                        + p.get("text", ""))
+                    _ord_save(props)
+                    _ord_post("⏸ *Ordering PAUSED.* No builds will post and no ✅ will place anything until Luke "
+                              "types `resume ordering`. Open posts were cancelled.", thread_ts=m["ts"])
+                else:
+                    ctl["paused"] = False
+                    _ord_post("▶️ *Ordering resumed.* The next scheduled build will post as normal.", thread_ts=m["ts"])
+        _goods_json_save("order_control.json", ctl)
+        # 2) approvals, late ✅s on expired posts, cutoff reminders
+        props = _ord_load()
+        changed = False
+        for ts, p in props.items():
+            st = p.get("status")
+            created = datetime.fromisoformat(p["created"])
+            if st == "expired" and (p.get("late_told") or now - created > timedelta(days=3)):
+                continue
+            if st not in ("pending", "expired"):
+                continue
+            try:
+                rx = _slack("reactions.get", {"channel": ORDER_CHANNEL, "timestamp": ts, "full": "true"}, get=True)
+            except Exception as e:
+                print(f"[ORDER] reactions.get {ts}: {e}", flush=True)
+                continue
+            who = next((u for r_ in (rx.get("message") or {}).get("reactions") or []
+                        if r_.get("name", "").split("::")[0] in _APPROVE_EMOJI
+                        for u in r_.get("users") or [] if u in ORDER_APPROVERS), None)
+            if not who:
+                cut = ORDER_CUTOFFS_CT.get(p["supplier"])
+                if st == "pending" and cut and not p.get("reminded") and created.date() == now.date():
+                    hh, mm = (int(x) for x in cut.split(":"))
+                    left = hh * 60 + mm - (now.hour * 60 + now.minute)
+                    if 0 < left <= 10:
+                        p["reminded"] = changed = True
+                        _ord_post(f"⏰ {left} min to {p['supplier']}'s {cut} cutoff — ✅ the post above to place "
+                                  f"for next-day. " + " ".join(f"<@{u}>" for u in ORDER_APPROVERS), thread_ts=ts)
+                continue
+            if st == "expired":
+                p["late_told"] = changed = True
+                _ord_post(f"⌛ <@{who}> this post expired, so nothing was placed. Approve the newest "
+                          f"{p['supplier']} post instead.", thread_ts=ts)
+                continue
+            if ctl.get("paused"):
+                continue
+            # Mark before submitting: one submit per post, ever (SanMar has no cancel).
+            p["status"], p["approved_by"], p["approved_at"] = "submitting", who, now.isoformat()
+            _ord_save(props)
+            name = ORDER_APPROVERS.get(who, who)
+            try:
+                status, lines = _order_submit(ts, p)
+            except Exception as e:
+                status, lines = "failed", [f"⚠️ Submit crashed: {str(e)[:300]} — check {p['supplier']} before ordering by hand."]
+            p["status"], p["result"] = status, lines
+            changed = True
+            icon = {"submitted": "✅", "partial": "⚠️", "failed": "❌"}[status]
+            test = " (TEST — nothing ships)" if p.get("mode") == "test" else ""
+            _ord_post(f"{icon} Approved by {name} {now:%-I:%M %p}{test}:\n" + "\n".join(lines), thread_ts=ts)
+            label = {"submitted": "✅ *PLACED*", "partial": "⚠️ *PARTLY PLACED*", "failed": "❌ *NOT PLACED*"}[status]
+            _ord_update(ts, f"{label} — approved by {name} {now:%-I:%M %p}{test}. Details in thread.\n\n" + p.get("text", ""))
+        if changed:
+            _ord_save(props)
+
+
+@mcp.tool()
+def order_build_post(supplier: str = "SanMar") -> str:
+    """Run a blank-ordering build NOW for one supplier ("SanMar" or "S&S") and post it to #goods-orders
+    for ✅ approval. In ORDER_MODE=test an approved post goes to SanMar's TEST system / S&S test orders —
+    nothing ships. Replaces (expires) that supplier's previous open post."""
+    s = "S&S" if supplier.strip().lower() in ("s&s", "ss", "s and s") else "SanMar"
+    if ORDER_MODE == "shadow":
+        return "ORDER_MODE is shadow — approvals are off. Use order_build_preview."
+    try:
+        return _order_post_build(s, record_seen=False)
+    except Exception as e:
+        return f"Order build failed: {e}"
+
 
 def run_order_shadow_scheduler():
     global _last_order_build
@@ -7927,6 +8291,17 @@ def run_order_shadow_scheduler():
             t, which = part.split("=", 1)
             h, m = (int(x) for x in t.strip().split(":"))
             slots.append((h, m, which.strip()))
+    with _ORDER_LOCK:
+        props = _ord_load()
+        for ts, p in props.items():
+            if p.get("status") == "submitting":
+                p["status"] = "interrupted"
+                try:
+                    _ord_post("⚠️ The server restarted while placing this order. Check the supplier for the PO "
+                              "before anyone orders it by hand — it may or may not have gone through.", thread_ts=ts)
+                except Exception:
+                    pass
+        _ord_save(props)
     while True:
         try:
             now_ct = _central_now()
@@ -7937,18 +8312,24 @@ def run_order_shadow_scheduler():
                         and 0 <= mins - (h * 60 + m) < 15 and _last_order_build != slot):
                     _last_order_build = slot
                     try:
-                        r = _order_build_impl("" if which == "ALL" else which, record_seen=True)
-                        label = "SanMar + S&S" if which == "ALL" else which
-                        text = _ordering.render(
-                            r, f"🧪 *SHADOW order build {now_ct:%-I:%M %p}* ({label}) — nothing was placed. "
-                               f"Compare with what Mechelle orders today · {r['queue']} orders need goods") + _order_skip_note(r)
-                        _post_cogs_dm(text[:39000], recipients=ORDER_SHADOW_USERS)
+                        if ORDER_MODE == "shadow":
+                            r = _order_build_impl("" if which == "ALL" else which, record_seen=True)
+                            label = "SanMar + S&S" if which == "ALL" else which
+                            text = _ordering.render(
+                                r, f"🧪 *SHADOW order build {now_ct:%-I:%M %p}* ({label}) — nothing was placed. "
+                                   f"{r['queue']} orders need goods") + _order_skip_note(r)
+                            _post_cogs_dm(text[:39000], recipients=ORDER_SHADOW_USERS)
+                        else:
+                            for s in (("SanMar", "S&S") if which == "ALL" else (which,)):
+                                _order_post_build(s, record_seen=True)
                     except Exception as e:
-                        print(f"[ORDER] shadow build failed: {e}", flush=True)
-                        _post_cogs_dm(f"⚠️ Shadow order build failed: {e}", recipients="U0504FSDYB0")
+                        print(f"[ORDER] build failed: {e}", flush=True)
+                        _post_cogs_dm(f"⚠️ Order build ({which}) failed: {e}", recipients="U0504FSDYB0")
+            if ORDER_MODE != "shadow":
+                _order_poll_once()
         except Exception as e:
             print(f"[ORDER] scheduler error: {e}", flush=True)
-        time.sleep(120)
+        time.sleep(45)
 
 
 threading.Thread(target=run_order_shadow_scheduler, daemon=True).start()

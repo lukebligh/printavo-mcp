@@ -76,8 +76,44 @@ def recent_pos():
             continue
         if r.status_code != 200:
             raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
-        pos.update(str(o.get("poNumber") or "") for o in (r.json() or []) if o.get("poNumber"))
+        pos.update(str(o.get("poNumber") or "") for o in (r.json() or []) if o.get("poNumber") and _real(o))
     return pos
+
+
+def _real(o):
+    """Cancelled orders and auto-ordering TEST orders (testOrder=true creates then cancels an order)
+    must never count as 'goods ordered' anywhere (goods notes, ordering queue, COGS)."""
+    st = str(o.get("orderStatus") or "").lower()
+    po = str(o.get("poNumber") or "").strip().upper()
+    return "cancel" not in st and not po.startswith("TEST")
+
+
+SHIP_TO = {"customer": "ESTABLISHED MERCH", "attn": "", "address": "1920 S VANDEVENTER AVE",
+           "city": "ST LOUIS", "state": "MO", "zip": "63110", "residential": False}
+
+
+def place_order(po_number, lines, test=True, warehouses="", email=""):
+    """POST /v2/orders. lines: [{"sku": ..., "qty": n}]. test=True -> S&S validates, creates and
+    cancels it (nothing ships). warehouses: 'IL,KS,KY' to restrict auto-select (next-day).
+    -> {"ok", "message", "orders": [{orderNumber, warehouse, total}]}"""
+    body = {"shippingAddress": SHIP_TO, "shippingMethod": "1", "poNumber": po_number,
+            "emailConfirmation": email, "testOrder": bool(test), "autoselectWarehouse": True,
+            "AutoSelectWarehouse_Preference": "fewest", "autoselectWarehouse_Warehouses": warehouses,
+            "rejectLineErrors": True, "rejectLineErrors_Email": False,
+            "lines": [{"identifier": str(l["sku"]), "qty": int(l["qty"])} for l in lines]}
+    try:
+        r = httpx.post(f"{BASE}/orders/", auth=_auth(), json=body, timeout=120)
+    except httpx.HTTPError as e:
+        return {"ok": False, "message": f"S&S unreachable: {e}", "orders": []}
+    if r.status_code not in (200, 201):
+        return {"ok": False, "message": f"S&S HTTP {r.status_code}: {r.text[:300]}", "orders": []}
+    data = r.json() or []
+    if isinstance(data, dict):
+        data = data.get("orders") or data.get("Orders") or [data]
+    orders = [{"orderNumber": str(o.get("orderNumber") or ""), "warehouse": str(o.get("warehouseAbbr") or ""),
+               "total": _f(o.get("total")), "status": str(o.get("orderStatus") or "")} for o in data]
+    return {"ok": bool(orders), "message": "accepted" if orders else f"no order returned: {r.text[:200]}",
+            "orders": orders}
 
 
 def orders_recent():
@@ -91,7 +127,7 @@ def orders_recent():
         return []
     if r.status_code != 200:
         raise SSError(f"S&S HTTP {r.status_code}: {r.text[:200]}")
-    return r.json() or []
+    return [o for o in (r.json() or []) if _real(o)]
 
 
 def _get(path, params):

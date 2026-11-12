@@ -37,5 +37,16 @@ steps:
       - --add-volume-mount=volume=data,mount-path=/data
       - --env-vars-file=deploy/env.yaml
       - --set-secrets=PRINTAVO_TOKEN=PRINTAVO_TOKEN:latest,PIPEDRIVE_API_TOKEN=PIPEDRIVE_API_TOKEN:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest,CX_SLACK_WEBHOOK_URL=CX_SLACK_WEBHOOK_URL:latest,CX_BACKLOG_SLACK_WEBHOOK_URL=CX_BACKLOG_SLACK_WEBHOOK_URL:latest,ART_SLACK_WEBHOOK_URL=ART_SLACK_WEBHOOK_URL:latest,GOOGLE_SERVICE_ACCOUNT_JSON=GOOGLE_SERVICE_ACCOUNT_JSON:latest,SAGE_AUTH_KEY=SAGE_AUTH_KEY:latest,SSACTIVEWEAR_APIKEY=SSACTIVEWEAR_APIKEY:latest,MS_CLIENT_SECRET=MS_CLIENT_SECRET:latest,SANMAR_USERNAME=SANMAR_USERNAME:latest,SANMAR_PASSWORD=SANMAR_PASSWORD:latest,UPS_CLIENT_ID=UPS_CLIENT_ID:latest,UPS_CLIENT_SECRET=UPS_CLIENT_SECRET:latest,EASYPOST_API_KEY=EASYPOST_API_KEY:latest,SANMAR_EDEV_USERNAME=SANMAR_EDEV_USERNAME:latest,SANMAR_EDEV_PASSWORD=SANMAR_EDEV_PASSWORD:latest
+  # Old revisions keep running (min-instances=1) after a deploy, so every background job would run
+  # twice or more. Delete every revision except the one just deployed (Nov 12).
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        LATEST=$$(gcloud run services describe ${_SERVICE} --region=${_REGION} --format='value(status.latestReadyRevisionName)')
+        for r in $$(gcloud run revisions list --service=${_SERVICE} --region=${_REGION} --format='value(metadata.name)'); do
+          [ "$$r" = "$$LATEST" ] || gcloud run revisions delete "$$r" --region=${_REGION} --quiet || true
+        done
 images:
   - ${_IMAGE}

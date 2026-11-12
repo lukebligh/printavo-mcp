@@ -8232,6 +8232,10 @@ def _ord_handle_msg(m, props, now, only_ts=None) -> bool:
     verb = _ord_verb(t)
     if not verb:
         return False
+    done = _goods_json("order_handled.json", [])
+    if m["ts"] in done:
+        return False
+    _goods_json_save("order_handled.json", (done + [m["ts"]])[-300:])
     reply_ts = m.get("thread_ts") or m["ts"]
     if m["user"] not in ORDER_APPROVERS:
         _ord_post(f"Only {', '.join(ORDER_APPROVERS.values())} can change an order.", thread_ts=reply_ts)
@@ -8265,11 +8269,6 @@ def _order_poll_once():
     with _ORDER_LOCK:
         ctl = _goods_json("order_control.json", {})
         # 1) Luke's kill switch: `pause ordering` / `resume ordering` typed in the channel
-        if not ctl.get("skip_v2"):
-            ctl["skip_v2"] = True
-            open_ts = [ts for ts, p in _ord_load().items() if p.get("status") == "pending"]
-            if open_ts:
-                ctl["hist_ts"] = min(open_ts)
         if not ctl.get("hist_ts"):
             ctl["hist_ts"] = f"{time.time():.6f}"
         else:
@@ -8380,6 +8379,32 @@ def order_build_post(supplier: str = "SanMar") -> str:
         return f"Order build failed: {e}"
 
 
+_MY_REV = os.environ.get("K_REVISION", "local")
+
+
+def _rev_num(r):
+    m = re.search(r"-(\d{5})-", r or "")
+    return int(m.group(1)) if m else 0
+
+
+def _order_is_leader() -> bool:
+    """Heartbeat per revision in /data/leader; act only if no newer revision is alive (< 3 min)."""
+    d = "/data/leader"
+    if not os.path.isdir("/data"):
+        return True
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(f"{d}/{_MY_REV}", "w") as fh:
+            fh.write(str(time.time()))
+        mine, now = _rev_num(_MY_REV), time.time()
+        for f in os.listdir(d):
+            if _rev_num(f) > mine and now - os.path.getmtime(f"{d}/{f}") < 180:
+                return False
+    except Exception as e:
+        print(f"[ORDER] leader check: {e}", flush=True)
+    return True
+
+
 def run_order_shadow_scheduler():
     global _last_order_build
     slots = []
@@ -8388,8 +8413,9 @@ def run_order_shadow_scheduler():
             t, which = part.split("=", 1)
             h, m = (int(x) for x in t.strip().split(":"))
             slots.append((h, m, which.strip()))
+    time.sleep(60)   # let a newer revision's heartbeat land before deciding anything
     with _ORDER_LOCK:
-        props = _ord_load()
+        props = _ord_load() if _order_is_leader() else {}
         for ts, p in props.items():
             if p.get("status") == "submitting":
                 p["status"] = "interrupted"
@@ -8400,6 +8426,10 @@ def run_order_shadow_scheduler():
                     pass
         _ord_save(props)
     while True:
+        if not _order_is_leader():
+            print(f"[ORDER] {_MY_REV} is not the newest revision — ordering idle", flush=True)
+            time.sleep(120)
+            continue
         try:
             now_ct = _central_now()
             mins = now_ct.hour * 60 + now_ct.minute

@@ -8042,6 +8042,7 @@ def _order_post_build(supplier, record_seen=True) -> str:
                 "pos": [{"po_number": po["po_number"], "why": po["why"], "total": po["total"],
                          "nextday": all(opt["nextday"] for p in po["parts"] for _l, opt in p["lines"]),
                          "orders": [{"vid": str(p["order"]["vid"]), "id": p["order"].get("id"),
+                                     "total": p.get("total"),
                                      "sig": p["order"].get("sig"),
                                      "lines": [{"style": l["style"], "color": opt["color"], "need": l["need"],
                                                 "skus": opt.get("skus") or {}} for l, opt in p["lines"]]}
@@ -8075,15 +8076,7 @@ def _sanmar_po_lines(agg):
 def _order_submit(ts, p) -> tuple:
     """Re-check every order, then place each PO. -> (status, summary lines)."""
     sup = p["supplier"]
-    skips = set()
-    try:
-        rep = _slack("conversations.replies", {"channel": ORDER_CHANNEL, "ts": ts, "limit": 200}, get=True)
-        for m in rep.get("messages") or []:
-            t = m.get("text") or ""
-            if m.get("ts") != ts and m.get("user") in ORDER_APPROVERS and re.search(r"\bskip\b", t, re.I):
-                skips.update(re.findall(r"(?<!\d)(\d{4,6})(?!\d)", t))
-    except Exception as e:
-        print(f"[ORDER] thread read failed: {e}", flush=True)
+    skips = set(p.get("skips") or [])
     ss_ordered = set()
     try:
         for po in _ss.recent_pos():
@@ -8178,6 +8171,65 @@ def _order_submit(ts, p) -> tuple:
     status = "submitted" if placed and not failed else ("partial" if placed else "failed")
     return status, out
 
+def _ord_po_now(p):
+    """What each PO in the post looks like after skips -> text."""
+    skips = set(p.get("skips") or [])
+    out = []
+    for po in p["pos"]:
+        left = [o for o in po["orders"] if o["vid"] not in skips]
+        if not left:
+            out.append(f"PO \"{po['po_number']}\" — nothing left (dropped)")
+            continue
+        tot = [o.get("total") for o in left]
+        money = f" · ${sum(tot):,.2f}" if all(t is not None for t in tot) else ""
+        out.append(f"PO \"{'-'.join(o['vid'] for o in left)}\"{money}")
+    return " · ".join(out)
+
+
+def _ord_check_skips(ts, p, now) -> bool:
+    """Reply to `skip #NNNN` / `unskip #NNNN` in a post's thread as soon as it's seen."""
+    rep = _slack("conversations.replies", {"channel": ORDER_CHANNEL, "ts": ts, "limit": 200}, get=True)
+    last = float(p.get("reply_ts") or ts)
+    msgs = sorted((m for m in rep.get("messages") or [] if float(m["ts"]) > last), key=lambda m: float(m["ts"]))
+    if not msgs:
+        return False
+    vids = {o["vid"] for po in p["pos"] for o in po["orders"]}
+    for m in msgs:
+        p["reply_ts"] = m["ts"]
+        if m.get("bot_id") or m.get("subtype") or not m.get("user"):
+            continue
+        t = m.get("text") or ""
+        if re.search(r"\bunskip\b|\badd\b.*\bback\b", t, re.I):
+            verb = "unskip"
+        elif re.search(r"\bskip\b", t, re.I):
+            verb = "skip"
+        else:
+            continue
+        if m["user"] not in ORDER_APPROVERS:
+            _ord_post(f"Only {', '.join(ORDER_APPROVERS.values())} can change this order.", thread_ts=ts)
+            continue
+        nums = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", t)
+        hit = [n for n in nums if n in vids]
+        miss = [n for n in nums if n not in vids]
+        skips = set(p.get("skips") or [])
+        (skips.update if verb == "skip" else skips.difference_update)(hit)
+        p["skips"] = sorted(skips)
+        name = ORDER_APPROVERS[m["user"]]
+        if hit:
+            did = "removed from" if verb == "skip" else "added back to"
+            msg = (f"👍 Got it, {name} — {', '.join('#' + n for n in hit)} {did} this order.\n"
+                   f"Now: {_ord_po_now(p)}\n✅ the main post to place it.")
+        else:
+            msg = "I didn't find an order # to change. Use `skip #7467` or `unskip #7467`."
+        if miss:
+            msg += f"\n(Not in this post: {', '.join('#' + n for n in miss)})"
+        _ord_post(msg, thread_ts=ts)
+        sk = p.get("skips") or []
+        banner = (f"✏️ *Updated {now:%-I:%M %p} — skipped: {', '.join('#' + v for v in sk)}* · now {_ord_po_now(p)}\n\n"
+                  if sk else "")
+        _ord_update(ts, banner + p.get("text", ""))
+    return True
+
 
 def _order_poll_once():
     now = _central_now()
@@ -8225,6 +8277,13 @@ def _order_poll_once():
                 continue
             if st not in ("pending", "expired"):
                 continue
+            if st == "pending":
+                try:
+                    if _ord_check_skips(ts, p, now):
+                        changed = True
+                        _ord_save(props)
+                except Exception as e:
+                    print(f"[ORDER] thread check {ts}: {e}", flush=True)
             try:
                 rx = _slack("reactions.get", {"channel": ORDER_CHANNEL, "timestamp": ts, "full": "true"}, get=True)
             except Exception as e:

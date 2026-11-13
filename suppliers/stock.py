@@ -11,7 +11,9 @@ from suppliers import sanmar as _sm, ss as _ss
 
 _ORDER = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL"]
 _ALIAS = {"XXL": "2XL", "XXXL": "3XL", "XXXXL": "4XL", "XXXXXL": "5XL", "2X": "2XL", "3X": "3XL",
-          "4X": "4XL", "SM": "S", "MD": "M", "LG": "L", "SMALL": "S", "MEDIUM": "M", "LARGE": "L"}
+          "4X": "4XL", "SM": "S", "MD": "M", "LG": "L", "SMALL": "S", "MEDIUM": "M", "LARGE": "L",
+          # one-size items (Printavo's "Other" size column = beanies, caps, totes) -> SanMar/S&S OSFA
+          "OTHER": "OSFA", "ONESIZE": "OSFA", "OS": "OSFA", "ONESIZEFITSMOST": "OSFA", "OSFM": "OSFA"}
 
 
 def norm_size(s):
@@ -36,7 +38,7 @@ def _skey(s):
     return (_ORDER.index(s) if s in _ORDER else 99, s)
 
 
-_ABBR = {"ht": "heather", "htr": "heather", "hthr": "heather", "hth": "heather", "athl": "athletic",
+_ABBR = {"dp": "deep", "for": "forest", "ht": "heather", "htr": "heather", "hthr": "heather", "hth": "heather", "athl": "athletic",
          "dk": "dark", "lt": "light", "vtg": "vintage", "nvy": "navy", "grn": "green", "bl": "blue",
          "gry": "grey", "gray": "grey", "prpl": "purple", "blk": "black", "wht": "white", "org": "orange",
          "ylw": "yellow", "chrcl": "charcoal", "roy": "royal", "elec": "electric", "trbl": "triblend",

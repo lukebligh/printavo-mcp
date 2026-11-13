@@ -8168,7 +8168,10 @@ def _order_submit(ts, p) -> tuple:
         except Exception as e:
             failed += 1
             out.append(f"• ❌ PO \"{po_num}\" NOT placed: {str(e)[:300]}")
-    status = "submitted" if placed and not failed else ("partial" if placed else "failed")
+    if not placed and not failed:
+        status = "nothing"          # every order dropped (already ordered / skipped / changed) — not an error
+    else:
+        status = "submitted" if placed and not failed else ("partial" if placed else "failed")
     return status, out
 
 def _ord_po_now(p):
@@ -8356,11 +8359,13 @@ def _order_poll_once():
                 status, lines = "failed", [f"⚠️ Submit crashed: {str(e)[:300]} — check {p['supplier']} before ordering by hand."]
             p["status"], p["result"] = status, lines
             changed = True
-            icon = {"submitted": "✅", "partial": "⚠️", "failed": "❌"}[status]
+            icon = {"submitted": "✅", "partial": "⚠️", "failed": "❌", "nothing": "ℹ️"}[status]
             test = " (TEST — nothing ships)" if p.get("mode") == "test" else ""
             _ord_post(f"{icon} Approved by {name} {now:%-I:%M %p}{test}:\n" + "\n".join(lines), thread_ts=ts)
-            label = {"submitted": "✅ *PLACED*", "partial": "⚠️ *PARTLY PLACED*", "failed": "❌ *NOT PLACED*"}[status]
-            _ord_update(ts, f"{label} — approved by {name} {now:%-I:%M %p}{test}. Details in thread.\n\n" + p.get("text", ""))
+            label = {"submitted": "✅ *PLACED*", "partial": "⚠️ *PARTLY PLACED*", "failed": "❌ *NOT PLACED — error*",
+                     "nothing": "ℹ️ *NOTHING TO PLACE*"}[status]
+            _ord_update(ts, f"{label} — approved by {name} {now:%-I:%M %p}{test}:\n" + "\n".join(lines)
+                        + "\n\n— original post —\n" + p.get("text", ""))
         if changed:
             _ord_save(props)
 

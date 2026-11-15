@@ -71,7 +71,8 @@ def match_line(item, cache):
         if q > 0:
             z = _size(k)
             need[z] = need.get(z, 0) + q
-    res = {"style": style, "color": color, "need": need, "options": {}, "flag": None}
+    res = {"style": style, "color": color, "need": need, "options": {}, "flag": None,
+           "desc": (item.get("desc") or "").strip()}
     if not need:
         return None                        # fee / setup / non-garment line
     if not style:
@@ -261,7 +262,10 @@ def render(result, title):
                        + (f" · prod {o['prod']:%a %m/%d}" if o.get("prod") else ""))
             for l, opt in p["lines"]:
                 nd = "" if opt["nextday"] else "  ⚠ not next-day"
-                out.append(f"    {l['style']} {opt['color']}: {_sizes_txt(l['need'])} · ${opt['cost']:,.2f}{nd}")
+                desc = f" · {l['desc'][:45]}" if l.get("desc") else ""
+                pcs = sum(l["need"].values())
+                out.append(f"    *{l['style']}*{desc} · {opt['color']} — {_sizes_txt(l['need'])} = {pcs} pcs · "
+                           f"${opt['cost']:,.2f}{nd}")
     if result["held"]:
         out.append("\n*Holding (pooling for free freight):*")
         for s, p, why in result["held"]:
@@ -273,7 +277,8 @@ def render(result, title):
             nxt = "SanMar build, next weekday 10:30" if sup == "SanMar" else "S&S build, 2:15"
             out.append(f"  #{o['vid']} {o.get('nick') or ''} ${tot:,.2f} → {nxt}")
     if result["flagged"]:
-        out.append("\n*Flagged — order by hand or fix in Printavo:*")
+        out.append("\n*Order by hand (not at SanMar/S&S) or fix in Printavo:*")
         for o, l, why in result["flagged"]:
-            out.append(f"  #{o['vid']} {l['style']} {l['color']} {_sizes_txt(l['need'])} — {why}")
+            desc = f" {l['desc'][:35]}" if l.get("desc") else ""
+            out.append(f"  #{o['vid']} {l['style']}{desc} {l['color']} {_sizes_txt(l['need'])} — {why}")
     return "\n".join(out)

@@ -8176,7 +8176,7 @@ def _order_submit(ts, p) -> tuple:
                 test = ORDER_MODE != "live"
                 if not test and not ORDER_SS_LIVE_ENABLED:
                     raise RuntimeError("S&S live ordering is not switched on (ORDER_SS_LIVE_ENABLED)")
-                if test and os.environ.get("ORDER_SS_TEST_ORDERS", "false").lower() != "true":
+                if test and os.environ.get("ORDER_SS_TEST_ORDERS", "true").lower() != "true":
                     # Nov 15: S&S did NOT cancel test order 77888496 (stayed "In Progress"). Until S&S explains
                     # testOrder, test mode never calls S&S's order API at all.
                     raise RuntimeError("S&S test ordering is OFF — S&S didn't cancel our first test order "
@@ -8674,14 +8674,16 @@ def _order_report(update_snapshot=False):
 
 
 @mcp.tool()
-def order_daily_report(send: bool = False) -> str:
+def order_daily_report(send: bool = False, to: str = "") -> str:
     """Afternoon goods email (normally 3:30 PM weekdays, automatic): POs placed today by the bot and by
     hand, POs with no Printavo order #, and everything still waiting for goods. send=False previews;
     send=True emails Luke, Mechelle and Clint now."""
     try:
-        subject, html, text = _order_report(update_snapshot=send)
+        test_to = [a.strip() for a in to.split(",") if a.strip()]
+        subject, html, text = _order_report(update_snapshot=send and not test_to)
         if send:
-            _graph_send(ORDER_REPORT_FROM, ORDER_REPORT_TO, subject, html)
+            _graph_send(ORDER_REPORT_FROM, test_to or ORDER_REPORT_TO,
+                        ("[TEST] " if test_to else "") + subject, html)
             return "Sent.\n\n" + text
         return "[PREVIEW — not sent]\n\n" + text
     except Exception as e:

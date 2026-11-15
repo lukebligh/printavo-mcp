@@ -8415,6 +8415,12 @@ def _ord_check_skips(ts, p, props, now) -> bool:
     msgs = sorted((m for m in rep.get("messages") or [] if float(m["ts"]) > last), key=lambda m: float(m["ts"]))
     for m in msgs:
         p["reply_ts"] = m["ts"]
+        t = (m.get("text") or "").strip().lower()
+        # A ✅ typed as a thread reply (instead of a reaction on the post) counts too (Luke, Nov 15).
+        if (not m.get("bot_id") and m.get("user") in ORDER_APPROVERS and not p.get("text_approved_by")
+                and re.fullmatch(r"(:(white_check_mark|heavy_check_mark|ballot_box_with_check):|✅|✔️|approved?|go|place it)[.! ]*", t)):
+            p["text_approved_by"] = m["user"]
+            continue
         _ord_handle_msg(m, props, now, only_ts=ts)
     return bool(msgs)
 
@@ -8483,7 +8489,7 @@ def _order_poll_once():
                 continue
             who = next((u for r_ in (rx.get("message") or {}).get("reactions") or []
                         if r_.get("name", "").split("::")[0] in _APPROVE_EMOJI
-                        for u in r_.get("users") or [] if u in ORDER_APPROVERS), None)
+                        for u in r_.get("users") or [] if u in ORDER_APPROVERS), None) or p.get("text_approved_by")
             if not who:
                 cut = ORDER_CUTOFFS_CT.get(p["supplier"])
                 if st == "pending" and cut and not p.get("reminded") and created.date() == now.date():

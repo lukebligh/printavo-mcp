@@ -8176,6 +8176,12 @@ def _order_submit(ts, p) -> tuple:
                 test = ORDER_MODE != "live"
                 if not test and not ORDER_SS_LIVE_ENABLED:
                     raise RuntimeError("S&S live ordering is not switched on (ORDER_SS_LIVE_ENABLED)")
+                if test and os.environ.get("ORDER_SS_TEST_ORDERS", "false").lower() != "true":
+                    # Nov 15: S&S did NOT cancel test order 77888496 (stayed "In Progress"). Until S&S explains
+                    # testOrder, test mode never calls S&S's order API at all.
+                    raise RuntimeError("S&S test ordering is OFF — S&S didn't cancel our first test order "
+                                       "(77888496). Nothing was sent to S&S. These lines checked out: "
+                                       + ", ".join(f"{q}× {s_}" for s_, q in agg.items()))
                 ss_po = ("TEST-" + po_num) if test else po_num
                 res = _ss.place_order(ss_po, [{"sku": s, "qty": q} for s, q in agg.items()], test=test,
                                       warehouses="IL,KS,KY" if po.get("nextday") else "",

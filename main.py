@@ -8277,12 +8277,13 @@ _SIZE_TOK = r"(?:[2-6]xl|xxxl|xxl|y?xl|y?xs|y?s|y?m|y?l|osfa)"
 _SIZE_WORDS = [(r"\bextra[\s-]*large\b", " xl "), (r"\bx[\s-]*large\b", " xl "), (r"\blarges?\b", " l "),
                (r"\bmediums?\b", " m "), (r"\bsmalls?\b", " s "), (r"\b(more|and|pcs?|pieces?|of)\b", " ")]
 _STOP = {"skip", "unskip", "add", "unadd", "undo", "back", "the", "from", "order", "line", "on", "to", "please",
-         "more", "and", "this", "that", "of", "for", "in", "it"}
+         "more", "and", "this", "that", "of", "for", "in", "it", "thanks", "thank", "you", "pls", "plz", "ty",
+         "sent", "using", "claude", "just", "only", "item", "items", "po"}
 
 
 def _ord_parse(t, open_vids):
     """-> (order numbers, line-filter tokens, {size: qty} for add)"""
-    low = (t or "").lower()
+    low = re.sub(r"\*?sent using\*?\s+\S+", " ", (t or "").lower())
     nums = re.findall(r"#\s*(\d{4,6})\b", low)
     if not nums:
         nums = [n for n in re.findall(r"(?<!\d)(\d{4,6})(?!\d)", low) if n in open_vids]

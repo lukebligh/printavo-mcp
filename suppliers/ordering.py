@@ -72,7 +72,7 @@ def match_line(item, cache):
             z = _size(k)
             need[z] = need.get(z, 0) + q
     res = {"style": style, "color": color, "need": need, "options": {}, "flag": None,
-           "desc": (item.get("desc") or "").strip()}
+           "desc": " ".join((item.get("desc") or "").split())}
     if not need:
         return None                        # fee / setup / non-garment line
     if not style:

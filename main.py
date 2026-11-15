@@ -7985,7 +7985,17 @@ def _order_sig(items) -> str:
 
 
 def _order_snapshot(internal_id, otype="invoice") -> dict:
-    """Live status, tags and line items for one order — re-checked right before every submit."""
+    """Live status, tags and line items — re-checked right before every submit. Printavo moves an order
+    between quote and invoice as its status changes, so try the other type if the first isn't found."""
+    try:
+        return _order_snapshot_one(internal_id, otype)
+    except RuntimeError as e:
+        if "not found" not in str(e).lower():
+            raise
+        return _order_snapshot_one(internal_id, "quote" if otype == "invoice" else "invoice")
+
+
+def _order_snapshot_one(internal_id, otype):
     time.sleep(PAGE_DELAY_S)
     r = query_printavo('''query($id: ID!) { o: OTYPE(id: $id) { status { name } tags'''.replace("OTYPE", otype) + '''
         lineItemGroups(first: 25) { nodes { lineItems(first: 50) { nodes {

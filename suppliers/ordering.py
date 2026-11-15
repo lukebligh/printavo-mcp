@@ -97,8 +97,10 @@ def match_line(item, cache):
         rows = sd["by"][clr]
         sure = _st._cn(clr) == _st._cn(color) or _st._sk(clr) == _st._sk(color)
         cost, short, nextday = 0.0, [], True
+        # Youth items: Printavo says YM/YL, the supplier's youth style lists M/L.
+        smap = {z: (z if z in rows or not (z.startswith("Y") and z[1:] in rows) else z[1:]) for z in need}
         for z, q in need.items():
-            r = rows.get(z)
+            r = rows.get(smap[z])
             if not r or r["stock"] < q:
                 short.append(z)
                 continue
@@ -107,10 +109,11 @@ def match_line(item, cache):
                        if any(n.lower().startswith(w) for w in NEXT_DAY[sup]))
             if near < q:
                 nextday = False
-        priced = all((rows.get(z) or {}).get("price") for z in need)
+        priced = all((rows.get(smap[z]) or {}).get("price") for z in need)
         res["options"][sup] = {"color": clr, "sure": sure, "cost": round(cost, 2), "short": short,
                                "nextday": nextday and not short, "priced": priced,
-                               "skus": {z: (rows.get(z) or {}).get("sku") or "" for z in need}}
+                               "skus": {z: (rows.get(smap[z]) or {}).get("sku") or "" for z in need},
+                               "sizemap": smap}
     if not res["options"]:
         res["flag"] = "neither supplier carries this style/color"
     return res

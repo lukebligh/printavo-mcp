@@ -8053,7 +8053,7 @@ def _order_post_build(supplier, record_seen=True) -> str:
                                      "total": p.get("total"),
                                      "sig": p["order"].get("sig"),
                                      "lines": [{"style": l["style"], "color": opt["color"], "need": l["need"],
-                                                "desc": l.get("desc", ""),
+                                                "desc": l.get("desc", ""), "sizemap": opt.get("sizemap") or {},
                                                 "skus": opt.get("skus") or {}} for l, opt in p["lines"]]}
                                     for p in po["parts"]]}
                         for po in r["pos"]]}
@@ -8145,7 +8145,7 @@ def _order_submit(ts, p) -> tuple:
                 for o in kept:
                     for l in _ord_effective(p, o):
                         for z, q in l["need"].items():
-                            k = (l["style"], l["color"], z)
+                            k = (l["style"], l["color"], (l.get("sizemap") or {}).get(z, z))
                             agg[k] = agg.get(k, 0) + int(q)
                 lines = _sanmar_po_lines(agg)
                 if ORDER_MODE == "live":

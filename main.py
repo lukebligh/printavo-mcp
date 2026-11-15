@@ -8189,7 +8189,7 @@ def _order_submit(ts, p) -> tuple:
                 if not res["ok"]:
                     raise RuntimeError(res["message"])
                 nums = ", ".join(f"{x['orderNumber']} ({x['warehouse']}, ${x['total']:,.2f})" for x in res["orders"])
-                where = "as an S&S TEST order (created + cancelled, nothing ships)" if test else "with S&S"
+                where = "as an S&S TEST order" if test else "with S&S"
                 out.append(f"• ✅ PO \"{ss_po}\" placed {where} — {sum(agg.values())} pcs · S&S order {nums}")
             placed += 1
         except Exception as e:
@@ -8589,10 +8589,12 @@ def _order_report(update_snapshot=False):
             mm = re.search(r'PO "([^"]+)" placed', r_)
             if mm:
                 bot_pos.add(mm.group(1).strip().upper())
-        for po in p["pos"]:
-            for o in po["orders"]:
-                if o["vid"] not in set(p.get("skips") or []):
-                    placed.append(f"      #{o['vid']}: {_ord_order_txt(p, o)}")
+        dropped = {m_.group(1) for r_ in (p.get("result") or []) for m_ in [re.search(r"#(\d+) dropped", r_)] if m_}
+        if any(" placed " in r_ for r_ in (p.get("result") or [])):
+            for po in p["pos"]:
+                for o in po["orders"]:
+                    if o["vid"] not in set(p.get("skips") or []) and o["vid"] not in dropped:
+                        placed.append(f"      #{o['vid']}: {_ord_order_txt(p, o)}")
     sec.append(("Placed today by the ordering bot", placed or ["Nothing approved today."]))
 
     snap = _goods_json("order_po_snapshot.json", {})

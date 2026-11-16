@@ -21,6 +21,31 @@ from suppliers.goods import add_business_days
 FREE_FREIGHT = 200.0
 MAX_WAIT_BDAYS = 2
 NEXT_DAY = {"SanMar": ("cincinnati",), "S&S": ("il", "ks", "ky")}   # 1 business day to STL
+# Approx. UPS Ground business days to St. Louis, nearest first (Luke, Nov 16: closer is better, any DC is fine).
+TRANSIT = {"SanMar": {"cincinnati": 1, "minneapolis": 2, "dallas": 2, "richmond": 2, "robbinsville": 3,
+                      "jacksonville": 3, "phoenix": 4, "reno": 4, "seattle": 5},
+           "S&S": {"il": 1, "ks": 1, "ky": 1, "oh": 2, "tx": 2, "ga": 2, "pa": 3, "nj": 3, "fl": 3, "nv": 4, "wa": 5}}
+
+
+def _ship_from(sup, rows, smap, need, short):
+    """Nearest DC that can fill each size; the line ships as slow as its slowest size."""
+    worst, name = 0, ""
+    for z, qty in need.items():
+        if z in short:
+            continue
+        cands = []
+        for n, have in (rows.get(smap[z]) or {}).get("whs") or []:
+            if have >= qty:
+                d = next((v for k, v in TRANSIT[sup].items() if n.lower().startswith(k)), 3)
+                cands.append((d, n))
+        if not cands:
+            return "ships from 2+ DCs"
+        d, n = min(cands)
+        if d > worst:
+            worst, name = d, n
+    if not name:
+        return ""
+    return f"ships {name.split(',')[0]} (~{worst} day{'s' if worst != 1 else ''})"
 
 
 def bdays_between(a, b):
@@ -154,6 +179,8 @@ def match_line(item, cache):
         res["options"][sup] = {"color": clr, "sure": sure, "cost": round(cost, 2), "short": short,
                                "nextday": nextday and not short, "priced": priced,
                                "skus": {z: (rows.get(smap[z]) or {}).get("sku") or "" for z in need},
+                               "stock": {z: int((rows.get(smap[z]) or {}).get("stock") or 0) for z in need},
+                               "ship": _ship_from(sup, rows, smap, need, short),
                                "sizemap": smap}
     if not res["options"]:
         errs = [s_ for s_ in ("SanMar", "S&S") if (cache.get(s_, style, brand) or {}).get("error")
@@ -170,97 +197,175 @@ def ok(l, s):
     return bool(o and not o["short"] and o["sure"] and o["priced"])
 
 
-def choose(order_lines):
-    """Rule 6. -> (assignments {supplier: [(line, opt)]}, flagged [(line, why)])"""
+# SanMar is the preferred vendor (Luke, Nov 16). An order moves to S&S on price only when S&S can fill
+# ALL of it (single source) and saves at least this much — never line by line for pennies.
+PRICE_MOVE_MIN = 75.0
+PRICE_MOVE_PCT = 0.10
+
+# SanMar quote thresholds (Susan Maley, via Luke Nov 16): same piece across sizes at or over these
+# quantities -> Mechelle requests a quote; the bot does not place it.
+_RETAIL = ("nike", "ogio", "carhartt", "eddie bauer", "north face", "new era", "travismathew", "travis mathew",
+           "brooks brothers", "cotopaxi", "tentree", "columbia", "under armour", "tommy bahama", "mercer+mettle",
+           "mercer mettle", "outdoor research", "spyder", "volunteer knitwear", "champion", "russell outdoors")
+
+
+def quote_threshold(line, unit):
+    """-> (pieces, label) or None."""
+    desc = (line.get("desc") or "").lower()
+    brand = desc.split(" - ")[0] if " - " in desc else desc[:25]
+    st = (line.get("style") or "").upper()
+    if any(b in brand for b in _RETAIL):
+        return (50, "retail brand over $39.99") if unit > 39.99 else (100, "retail brand")
+    if "sport-tek" in brand or "sport tek" in brand or re.match(r"^(L|Y|T)?ST\d", st):
+        if unit > 39:
+            return 50, "Sport-Tek over $39"
+        return (100, "Sport-Tek $19.99+") if unit >= 19.99 else (200, "Sport-Tek")
+    if re.search(r"fleece|hood|sweatshirt|crewneck|pullover|quarter.zip|1/4.zip", desc):
+        return 250, "fleece / hoodie"
+    if re.search(r"\btee\b|t-shirt|tshirt|\bt shirt", desc):
+        return 500, "basic tee"
+    return None
+
+
+def _short_detail(l):
+    """Per short size: need vs what each supplier has."""
+    bits = []
+    sizes = sorted({z for o in l["options"].values() for z in o["short"]},
+                   key=lambda z: (_st._ORDER.index(z) if z in _st._ORDER else 99, z))
+    for z in sizes:
+        have = []
+        for s in ("SanMar", "S&S"):
+            o = l["options"].get(s)
+            have.append(f"{s} {'doesn’t carry it' if not o else 'has ' + str(o['stock'].get(z, 0))}")
+        bits.append(f"{z}: need {l['need'][z]} · " + " · ".join(have))
+    return "; ".join(bits)
+
+
+def choose(order_lines, release_shorts=False):
+    """-> (assignments {supplier: [(line, opt)]}, byhand [(line, why)], holds [text], notes [text])
+    SanMar first. Whole order stays at SanMar when SanMar can fill it (any DC). A line goes to S&S only
+    when SanMar can't fill it. Any line nobody can fill holds the WHOLE order unless shorts are released."""
     usable = [l for l in order_lines if l and not l["flag"]]
-    flagged = [(l, l["flag"]) for l in order_lines if l and l["flag"]]
-
-    whole = []
-    for s in ("SanMar", "S&S"):
-        if usable and all(ok(l, s) for l in usable):
-            whole.append((not all(l["options"][s]["nextday"] for l in usable),
-                          sum(l["options"][s]["cost"] for l in usable), s))
-    if whole:
-        s = sorted(whole)[0][2]
-        return {s: [(l, l["options"][s]) for l in usable]}, flagged
-    asg = {}
+    byhand = [(l, l["flag"]) for l in order_lines if l and l["flag"]]
+    holds, notes, asg = [], [], {}
+    if usable and all(ok(l, "SanMar") for l in usable):
+        sup = "SanMar"
+        if all(ok(l, "S&S") for l in usable):
+            a = sum(l["options"]["SanMar"]["cost"] for l in usable)
+            b = sum(l["options"]["S&S"]["cost"] for l in usable)
+            if a - b >= max(PRICE_MOVE_MIN, PRICE_MOVE_PCT * a):
+                sup = "S&S"
+                notes.append(f"whole order at S&S — saves ${a - b:,.2f} ({(a - b) / a:.0%}) vs SanMar")
+        return {sup: [(l, l["options"][sup]) for l in usable]}, byhand, holds, notes
     for l in usable:
-        cands = [(not o["nextday"], o["cost"], s) for s, o in l["options"].items() if ok(l, s)]
-        if cands:
-            s = sorted(cands)[0][2]
-            asg.setdefault(s, []).append((l, l["options"][s]))
-            continue
-        o = min(l["options"].values(), key=lambda x: (len(x["short"]), x["cost"]))
-        if o["short"]:
-            why = f"short at both suppliers ({', '.join(o['short'])})"
-        elif not o["sure"]:
-            why = f"color check: Printavo '{l['color']}' ≈ supplier '{o['color']}'"
+        if ok(l, "SanMar"):
+            asg.setdefault("SanMar", []).append((l, l["options"]["SanMar"]))
+        elif ok(l, "S&S"):
+            asg.setdefault("S&S", []).append((l, l["options"]["S&S"]))
+            sm = l["options"].get("SanMar")
+            notes.append(f"{l['style']} {l['color']} from S&S — SanMar "
+                         + ("is short " + ", ".join(sm["short"]) if sm and sm["short"] else "doesn’t carry it"))
         else:
-            why = "no price returned"
-        flagged.append((l, why))
-    return asg, flagged
+            shorty = [(s, o) for s, o in l["options"].items() if o["short"] and o["sure"] and o["priced"]]
+            if shorty:
+                txt = f"SHORT · {l['style']} {l['color']} — {_short_detail(l)}"
+                if not release_shorts:
+                    holds.append(txt)
+                    continue
+                s, o = sorted(shorty, key=lambda x: (len(x[1]["short"]), x[0] != "SanMar"))[0]
+                left = {z: q for z, q in l["need"].items() if z not in o["short"]}
+                notes.append("NOT ordering (short, approved): " + txt[8:])
+                if left:
+                    asg.setdefault(s, []).append((dict(l, need=left), o))
+            else:
+                o = next(iter(l["options"].values()))
+                holds.append(f"COLOR CHECK · {l['style']} — Printavo '{l['color']}' ≈ supplier '{o['color']}'. "
+                             "Fix the color in Printavo." if not o["sure"]
+                             else f"NO PRICE · {l['style']} {l['color']} — supplier returned no price")
+    return asg, byhand, holds, notes
 
 
-def plan(orders, today, first_seen, supplier_filter=None):
-    """orders: [{vid, nick, company, prod (date|None), lines: [match_line results]}]
-    -> {"pos": [...], "held": [...], "flagged": [...]}"""
+def plan(orders, today, first_seen, supplier_filter=None, releases=None):
+    """orders: [{vid, nick, company, due, lines: [match_line results]}]
+    -> {"pos", "held", "attention" [(order, [texts])], "flagged" [(order, line, why)]}"""
+    releases = releases or {}
     by_sup = {}
-    flagged, other = [], []
+    flagged, attention = [], []
     for o in orders:
-        asg, fl = choose(o["lines"])
-        if not o.get("promo"):                 # promo items are ordered through the promo flow
-            for l, why in fl:
-                flagged.append((o, l, why))
+        rel = releases.get(str(o["vid"])) or {}
+        asg, byhand, holds, notes = choose(o["lines"], release_shorts=bool(rel.get("shorts")))
+        if o.get("promo"):
+            byhand = []                        # promo items are ordered through the promo flow
+        for l, why in byhand:
+            flagged.append((o, l, why))
+        if not holds and not rel.get("quote"):
+            tot = {}
+            for l, opt in asg.get("SanMar", []):
+                pcs = sum(l["need"].values())
+                t = tot.setdefault(l["style"], {"pcs": 0, "th": quote_threshold(l, opt["cost"] / pcs if pcs else 0)})
+                t["pcs"] += pcs
+            for st, t in tot.items():
+                if t["th"] and t["pcs"] >= t["th"][0]:
+                    holds.append(f"QUOTE · {t['pcs']} × {st} — at or over SanMar's {t['th'][0]}-piece quote level "
+                                 f"({t['th'][1]}). Request a quote from SanMar first, then reply "
+                                 f"`quote done #{o['vid']}`.")
+        if holds:
+            if any(h.startswith("SHORT") for h in holds):
+                holds.append(f"→ Fix the order in Printavo (next post picks it up), or reply "
+                             f"`approve shorts #{o['vid']}` to order everything else.")
+            attention.append((o, holds + [f"✋ also order by hand: {l['style']} {l['color']} {_sizes_txt(l['need'])} — {w}"
+                                          for l, w in byhand]))
+            continue
+        if not asg:
+            if byhand:
+                attention.append((o, [f"✋ order by hand — {l['style']} {l['color']} {_sizes_txt(l['need'])}: {w}"
+                                      for l, w in byhand]))
+            continue
+        first = True
         for s, lines in asg.items():
             if supplier_filter and s != supplier_filter:
-                other.append((s, o, round(sum(x[1]["cost"] for x in lines), 2)))
                 continue
-            by_sup.setdefault(s, []).append({"order": o, "lines": lines,
-                                             "total": round(sum(x[1]["cost"] for x in lines), 2)})
+            part = {"order": o, "lines": lines, "total": round(sum(x[1]["cost"] for x in lines), 2),
+                    "notes": notes, "byhand": byhand if first else [],
+                    "elsewhere": [f"{len(v)} line(s) on the {k} post" for k, v in asg.items() if k != s]}
+            first = False
+            by_sup.setdefault(s, []).append(part)
     pos, held = [], []
     for s, parts in by_sup.items():
         own = [p for p in parts if p["total"] >= FREE_FREIGHT]
         pool = [p for p in parts if p["total"] < FREE_FREIGHT]
         for p in own:
-            pos.append({"supplier": s, "parts": [p], "why": f"own PO ${p['total']:,.2f}"})
+            pos.append({"supplier": s, "parts": [p], "why": "free freight"})
         if not pool:
             continue
         pool_total = sum(p["total"] for p in pool)
         if pool_total >= FREE_FREIGHT:
-            pos.append({"supplier": s, "parts": pool,
-                        "why": f"pooled {len(pool)} orders ${pool_total:,.2f} — free freight"})
+            pos.append({"supplier": s, "parts": pool, "why": f"{len(pool)} small orders pooled — free freight"})
             continue
         due = []
         for p in pool:
-            o = p["order"]
-            seen = first_seen.get(str(o["vid"]), today)
-            age = bdays_between(seen, today)
-            reason = None
+            age = bdays_between(first_seen.get(str(p["order"]["vid"]), today), today)
             # The clock runs from approval (first day in the queue), never from the production date (Luke, Nov 15).
-            if age >= MAX_WAIT_BDAYS:
-                reason = f"day {age} — max wait"
-            p["age"], p["reason"] = age, reason
-            if reason:
+            p["age"], p["reason"] = age, (f"waited {age} business days" if age >= MAX_WAIT_BDAYS else None)
+            if p["reason"]:
                 due.append(p)
         if not due:
             for p in pool:
-                held.append((s, p, f"pool ${pool_total:,.2f} < $200 — day {p['age']} of {MAX_WAIT_BDAYS}"
-                             + _due_warn(p["order"], today)))
+                held.append((s, p, f"day {p['age']} of {MAX_WAIT_BDAYS}" + _due_warn(p["order"], today)))
             continue
         if own:
             host = max(own, key=lambda p: p["total"])
             for po in pos:
                 if po["parts"][0] is host:
                     po["parts"] += due
-                    po["why"] += " + ride-along " + ", ".join(
-                        f"#{p['order']['vid']} ({p['reason']})" for p in due)
+                    po["why"] += " · " + ", ".join(f"#{p['order']['vid']}" for p in due) + " rides along"
             for p in pool:
                 if p not in due:
-                    held.append((s, p, f"pool < $200 — day {p['age']} of {MAX_WAIT_BDAYS}" + _due_warn(p["order"], today)))
+                    held.append((s, p, f"day {p['age']} of {MAX_WAIT_BDAYS}" + _due_warn(p["order"], today)))
         else:
             pos.append({"supplier": s, "parts": pool,
-                        "why": f"pool ${pool_total:,.2f} < $200 — shipping anyway, paying freight ("
-                               + ", ".join(f"#{p['order']['vid']} {p['reason']}" for p in due) + ")"})
+                        "why": "under $200 — PAYING FREIGHT (" + ", ".join(
+                            f"#{p['order']['vid']} {p['reason']}" for p in due) + ")"})
     # SanMar PO numbers max 28 chars -> at most 5 orders per PO (Nov 10).
     split = []
     for po in pos:
@@ -270,25 +375,25 @@ def plan(orders, today, first_seen, supplier_filter=None):
         chunks = [parts[i:i + n] for i in range(0, len(parts), n)]
         for k, ch in enumerate(chunks, 1):
             split.append({**po, "parts": ch,
-                          "why": po["why"] + (f" · part {k}/{len(chunks)} (max {n} orders per PO)" if len(chunks) > 1 else "")})
+                          "why": po["why"] + (f" · part {k}/{len(chunks)}" if len(chunks) > 1 else "")})
     pos = split
     for po in pos:
         po["total"] = round(sum(p["total"] for p in po["parts"]), 2)
         po["po_number"] = po_number(po)
-    return {"pos": pos, "held": held, "flagged": flagged, "other": other}
+    return {"pos": pos, "held": held, "flagged": flagged, "attention": attention, "other": []}
 
 
 MAX_ORDERS_PER_PO = 5
 DUE_WARN_BDAYS = 5
+PO_NUM_MAX = 28
 
 
 def _due_warn(order, today):
     """Customer due date in jeopardy while the order waits for free freight -> flag only (Luke, Nov 15)."""
     d = order.get("due")
     if d and d <= add_business_days(today, DUE_WARN_BDAYS):
-        return f" · ⚠ due {d:%a %m/%d} — `include #{order['vid']}` to order it today"
+        return f" · ⚠ due {d:%a %-m/%-d}"
     return ""
-PO_NUM_MAX = 28
 
 
 def po_number(po):
@@ -301,39 +406,50 @@ def _sizes_txt(need):
     return " ".join(f"{z}{need[z]}" for z in sorted(need, key=lambda z: (order.index(z) if z in order else 99, z)))
 
 
+def _order_head(o):
+    return (f"*#{o['vid']}* {o.get('company') or ''} — {o.get('nick') or ''}"
+            + (f" · due {o['due']:%a %-m/%-d}" if o.get("due") else ""))
+
+
+def _line_txt(l, opt):
+    desc = f" {l['desc'][:40]}" if l.get("desc") else ""
+    pcs = sum(l["need"].values())
+    ship = f" · {opt['ship']}" if opt.get("ship") else ""
+    return (f"   • *{l['style']}*{desc} · {opt['color']} — {_sizes_txt(l['need'])} = {pcs} pcs · ${opt['cost']:,.2f}{ship}"
+            + (f"\n      {l['dup']}" if l.get("dup") else ""))
+
+
+def _part_txt(p):
+    o = p["order"]
+    out = ["  " + _order_head(o)]
+    if o.get("lane"):
+        out.append(f"   ⚠ already in *{o['lane']}* with no goods PO — goods on hand? `skip #{o['vid']}` if so")
+    out += [_line_txt(l, opt) for l, opt in p["lines"]]
+    out += [f"   ↳ {n}" for n in p.get("notes") or []]
+    out += [f"   ↳ {e}" for e in p.get("elsewhere") or []]
+    out += [f"   ✋ order by hand: {l['style']} {l['color']} {_sizes_txt(l['need'])} — {w}" for l, w in p.get("byhand") or []]
+    return out
+
+
 def render(result, title):
+    """One entry per order. READY TO ORDER / HOLDING / NOT READY (Luke, Nov 16)."""
     out = [title]
-    if not result["pos"] and not result["held"] and not result["flagged"] and not result.get("other"):
-        return title + "\nNothing needs ordering."
-    if not result["pos"]:
-        out.append("*Nothing to order from this supplier right now* — no ✅ needed.")
-    for po in result["pos"]:
-        out.append(f"\n*{po['supplier']} PO \"{po['po_number']}\"* — ${po['total']:,.2f} · {po['why']}")
-        for p in po["parts"]:
-            o = p["order"]
-            out.append(f"  #{o['vid']} {o.get('company') or ''} — {o.get('nick') or ''}"
-                       + (f" · due {o['due']:%a %m/%d}" if o.get("due") else "")
-                       + (f"\n    ⚠ already in *{o['lane']}* with no goods PO — goods on hand? `skip #{o['vid']}` if so"
-                          if o.get("lane") else ""))
-            for l, opt in p["lines"]:
-                nd = "" if opt["nextday"] else "  ⚠ not next-day"
-                desc = f" · {l['desc'][:45]}" if l.get("desc") else ""
-                pcs = sum(l["need"].values())
-                out.append(f"    *{l['style']}*{desc} · {opt['color']} — {_sizes_txt(l['need'])} = {pcs} pcs · "
-                           f"${opt['cost']:,.2f}{nd}" + (f"\n      {l['dup']}" if l.get("dup") else ""))
+    if result["pos"]:
+        out.append("\n🟢 *READY TO ORDER*")
+        for po in result["pos"]:
+            out.append(f" *PO \"{po['po_number']}\"* · ${po['total']:,.2f} · {po['why']}")
+            for p in po["parts"]:
+                out += _part_txt(p)
     if result["held"]:
-        out.append("\n*Holding (pooling for free freight):*")
+        out.append("\n⏸ *HOLDING for free freight* (under $200 — `include #NNNN` to order today)")
         for s, p, why in result["held"]:
-            o = p["order"]
-            out.append(f"  {s} · #{o['vid']} {o.get('nick') or ''} ${p['total']:,.2f} — {why}")
-    if result.get("other"):
-        out.append("\n*Cheaper / better at the other supplier — goes on that supplier's build:*")
-        for sup, o, tot in result["other"]:
-            nxt = "SanMar build, next weekday 10:30" if sup == "SanMar" else "S&S build, 2:15"
-            out.append(f"  #{o['vid']} {o.get('nick') or ''} ${tot:,.2f} → {nxt}")
-    if result["flagged"]:
-        out.append("\n*Order by hand (not at SanMar/S&S) or fix in Printavo:*")
-        for o, l, why in result["flagged"]:
-            desc = f" {l['desc'][:35]}" if l.get("desc") else ""
-            out.append(f"  #{o['vid']} {l['style']}{desc} {l['color']} {_sizes_txt(l['need'])} — {why}")
+            out.append(f" ${p['total']:,.2f} · {why}")
+            out += _part_txt(p)
+    if result.get("attention"):
+        out.append("\n🔴 *NOT READY — NEEDS ATTENTION* (nothing on these orders gets placed)")
+        for o, texts in result["attention"]:
+            out.append("  " + _order_head(o))
+            out += [f"   {t}" for t in texts]
+    if len(out) == 1:
+        out.append("Nothing needs ordering.")
     return "\n".join(out)

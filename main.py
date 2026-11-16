@@ -7927,7 +7927,8 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
                            "nick": o["nick"], "company": o["company"],
                            "prod": o["prod"].date() if o.get("prod") else None, "lines": lines,
                            "status": o["status"]})
-        result = _ordering.plan(orders, today, first_seen, supplier_filter or None)
+        result = _ordering.plan(orders, today, first_seen, supplier_filter or None,
+                                releases=_goods_json("order_releases.json", {}))
     if result["pos"]:
         try:
             unnum = _recent_unnumbered_pos()
@@ -8072,7 +8073,7 @@ def _order_snapshot_one(internal_id, otype):
 
 def _ord_mode_banner():
     if ORDER_MODE == "test":
-        return "🧪 *TEST — nothing will actually be ordered* (SanMar test system / S&S test orders).\n"
+        return "🧪 TEST (nothing ships) · "
     return ""
 
 
@@ -8095,15 +8096,14 @@ def _order_post_build(supplier, record_seen=True) -> str:
         return "paused"
     r = _order_build_impl(supplier, record_seen=record_seen)
     cut = ORDER_CUTOFFS_CT.get(supplier, "")
-    head = (f"{_ord_mode_banner()}*{supplier} order build — {now:%a %-m/%-d %-I:%M %p}* · "
-            f"{r['queue']} direct orders need goods")
-    if r["held"] and not r["pos"]:
-        head += "\nHolding orders can be pulled into today's order with `include #NNNN`, then ✅."
-    if r["pos"]:
-        what = "this PO" if len(r["pos"]) == 1 else f"these {len(r['pos'])} POs"
-        head += (f"\n👉 *React ✅ to place {what}* — by {cut} for next-day delivery. "
-                 f"To drop an order first, reply in the thread: `skip #NNNN`. "
-                 f"Approvers: {', '.join(ORDER_APPROVERS.values())}.")
+    n_po = len(r["pos"])
+    try:
+        cut = datetime.strptime(cut, "%H:%M").strftime("%-I:%M")
+    except ValueError:
+        pass
+    action = (f"*{n_po} PO{'s' if n_po != 1 else ''} to approve — ✅ by {cut}*" if n_po
+              else "nothing to place right now")
+    head = f"{_ord_mode_banner()}*{supplier} · {now:%a %-m/%-d %-I:%M %p}* — {action}"
     text = _ordering.render(r, head) + _order_skip_note(r)
     with _ORDER_LOCK:
         props = _ord_load()
@@ -8113,7 +8113,7 @@ def _order_post_build(supplier, record_seen=True) -> str:
                 _ord_update(ts, f"⌛ *EXPIRED* — replaced by the {now:%a %-I:%M %p} build below. "
                                 f"Nothing was placed from this post.\n\n" + p.get("text", ""))
         ts = _ord_post(text)
-        if r["pos"] or r["held"]:
+        if True:
             props[ts] = {
                 "supplier": supplier, "mode": ORDER_MODE, "status": "pending", "created": now.isoformat(),
                 "text": text,
@@ -8347,6 +8347,10 @@ def _ord_refresh_post(ts, p, now):
 
 def _ord_verb(t):
     t = (t or "").strip().lower()
+    if re.search(r"\bapproved?\b.*\bshorts?\b|\bshorts?\b.*\b(ok|okay|approved?)\b", t):
+        return "release_shorts"
+    if re.search(r"\bquoted?\b.*\b(done|approved|ok|okay|received|in)\b", t):
+        return "release_quote"
     if re.match(r"^\s*unskip\b", t) or re.search(r"\badd\b.*\bback\b", t):
         return "unskip"
     if re.match(r"^\s*(unadd|undo add)\b", t):
@@ -8421,6 +8425,24 @@ def _ord_handle_msg(m, props, now, only_ts=None) -> bool:
     if m["user"] not in ORDER_APPROVERS:
         _ord_post(f"Only {', '.join(ORDER_APPROVERS.values())} can change an order.", thread_ts=reply_ts)
         return False
+    if verb in ("release_shorts", "release_quote"):
+        vids = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", re.sub(r"\*?sent using\*?\s+\S+", " ", t.lower()))
+        if not vids:
+            _ord_post("Which order? e.g. `approve shorts #7497` or `quote done #7500`.", thread_ts=reply_ts)
+            return True
+        rel = _goods_json("order_releases.json", {})
+        cutoff = (now - timedelta(days=21)).isoformat()
+        rel = {k: v for k, v in rel.items() if v.get("at", "") >= cutoff}
+        key = "shorts" if verb == "release_shorts" else "quote"
+        for v in vids:
+            rel.setdefault(v, {}).update({key: True, "at": now.isoformat(), "by": ORDER_APPROVERS[m["user"]]})
+        _goods_json_save("order_releases.json", rel)
+        _goods_json_save("order_rebuild.json", {"at": now.isoformat()})
+        what = ("approved with shorts — the short pieces will NOT be ordered" if key == "shorts"
+                else "quote handled — cleared to order")
+        _ord_post(f"👍 Got it, {ORDER_APPROVERS[m['user']]} — " + ", ".join("#" + v for v in vids)
+                  + f" {what}. Reposting the order list now (about a minute).", thread_ts=reply_ts)
+        return True
     open_props = [(ts, p) for ts, p in props.items()
                   if p.get("status") == "pending" and (not only_ts or ts == only_ts)]
     open_vids = ({o["vid"] for _ts, p in open_props for po in p["pos"] for o in po["orders"]}
@@ -8596,6 +8618,8 @@ def _order_poll_once():
             who = next((u for r_ in (rx.get("message") or {}).get("reactions") or []
                         if r_.get("name", "").split("::")[0] in _APPROVE_EMOJI
                         for u in r_.get("users") or [] if u in ORDER_APPROVERS), None) or p.get("text_approved_by")
+            if who and not p.get("pos"):
+                who = None                      # nothing on this post to place
             if not who:
                 cut = ORDER_CUTOFFS_CT.get(p["supplier"])
                 if st == "pending" and cut and p.get("pos") and not p.get("reminded") and created.date() == now.date():
@@ -8632,6 +8656,16 @@ def _order_poll_once():
                         + "\n\n— original post —\n" + p.get("text", ""))
         if changed:
             _ord_save(props)
+        # `approve shorts` / `quote done` -> repost today's lists so the order shows under READY
+        if _goods_json("order_rebuild.json", {}).get("at"):
+            _goods_json_save("order_rebuild.json", {})
+            today_s = now.date().isoformat()
+            sups = sorted({p["supplier"] for p in props.values() if p.get("created", "")[:10] == today_s}) or ["SanMar"]
+            for s_ in sups:
+                try:
+                    _order_post_build(s_, record_seen=False)
+                except Exception as e:
+                    _ord_post(f"⚠️ Couldn't repost the {s_} list: {str(e)[:200]}")
 
 
 
@@ -8757,6 +8791,8 @@ def _order_report(update_snapshot=False):
         for s, p_, why in r["held"]:
             waiting.append(f"Holding — {s} #{p_['order']['vid']} {p_['order'].get('nick') or ''} "
                            f"${p_['total']:,.2f} ({why})")
+        for o, texts in r.get("attention") or []:
+            waiting.append(f"NOT READY — #{o['vid']} {o.get('nick') or ''}: " + " | ".join(t for t in texts if not t.startswith("→")))
         for o, l, why in r["flagged"]:
             waiting.append(f"Order by hand — #{o['vid']} {l['style']} {l.get('desc', '')[:40]} {l['color']} "
                            f"{_ord_sizes(l['need'])} ({why})")

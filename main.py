@@ -8900,6 +8900,12 @@ def order_backtest(days: int = 56, max_orders: int = 250) -> str:
                 if len(cands) > 1:
                     cands = [n for n in cands if any(_scogs._size_qty(it, li["size"]) > 0 for it in get(n)["items"]
                                                      if _scogs._style_match(li["style"], it["style"]))] or cands
+                if len(cands) > 1:
+                    def _cm(it):
+                        return (_stock._cn(it["color"]) == _stock._cn(li["color"]) or
+                                _stock._sk(it["color"]) == _stock._sk(li["color"]) or _stock.abbr_match(li["color"], it["color"]))
+                    cands = [n for n in cands if any(_scogs._style_match(li["style"], it["style"]) and _cm(it)
+                                                     for it in get(n)["items"])] or cands
                 o = cands[0] if len(cands) == 1 else None
             if not o:
                 unattributed.append(f"{inv['vendor']} PO \"{inv['po']}\" {li['style']} {li['color']} {li['size']} ×{li['qty']:g}")

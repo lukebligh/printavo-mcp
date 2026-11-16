@@ -190,6 +190,8 @@ def exceptions_for(order, prod_date, infos, has_po, today=None):
     today = today or date.today()
     out = []
     if not has_po:
+        # Off Nov 16 (Luke): #goods-orders and the 3:30 email now cover "not ordered yet".
+        return out
         out.append((f"{order}|nopo", f"#{order}: no SanMar or S&S PO with this order # — "
                                       f"goods not ordered yet? (ignore if another vendor / customer-supplied)"))
         return out

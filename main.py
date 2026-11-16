@@ -8705,6 +8705,9 @@ def _supplier_po_sets():
     return sm, ss
 
 
+_NO_NUM = " — ⚠ no Printavo order # on this PO. Which order is it for? (Without the #, the bot can't tell those goods were bought.)"
+
+
 def _order_report(update_snapshot=False):
     """-> (subject, html, text)"""
     now = _central_now()
@@ -8730,7 +8733,7 @@ def _order_report(update_snapshot=False):
                 for o in po["orders"]:
                     if o["vid"] not in set(p.get("skips") or []) and o["vid"] not in dropped:
                         placed.append(f"      #{o['vid']}: {_ord_order_txt(p, o)}")
-    sec.append(("Placed today by the ordering bot", placed or ["Nothing approved today."]))
+    sec.append(("1. Ordered by the bot today", placed or ["Nothing."]))
 
     snap = _goods_json("order_po_snapshot.json", {})
     hand, no_num = [], []
@@ -8753,9 +8756,8 @@ def _order_report(update_snapshot=False):
                 except Exception:
                     pass
                 nums = _scogs.order_numbers(po)
-                hand.append(f"SanMar PO \"{po}\"{detail}" + ("" if nums else "  ⚠ NO PRINTAVO ORDER #"))
-                if not nums:
-                    no_num.append(f"SanMar PO \"{po}\"")
+                shown = "(PO # left blank)" if po.strip().upper() in ("NOT AVAILABLE", "N/A", "NA") else f"\"{po}\""
+                hand.append(f"SanMar PO {shown}{detail}" + ("" if nums else _NO_NUM))
             for onum in sorted(set(ss) - set(snap.get("ss") or [])):
                 o = ss[onum]
                 po = str(o.get("poNumber") or "")
@@ -8767,48 +8769,41 @@ def _order_report(update_snapshot=False):
                     pcs[k] = pcs.get(k, 0) + int(float(l.get("qtyOrdered") or 0))
                 nums = _scogs.order_numbers(po)
                 hand.append(f"S&S order {onum} PO \"{po}\" · " + ", ".join(f"{s} ×{q}" for s, q in pcs.items() if q)
-                            + ("" if nums else "  ⚠ NO PRINTAVO ORDER #"))
-                if not nums:
-                    no_num.append(f"S&S order {onum} (PO \"{po}\")")
+                            + ("" if nums else _NO_NUM))
         if update_snapshot or not snap:
             _goods_json_save("order_po_snapshot.json", {"sanmar": sorted(sm), "ss": sorted(ss), "at": now.isoformat()})
     except Exception as e:
         hand.append(f"⚠ Couldn't read supplier orders: {str(e)[:150]}")
-    sec.append(("Other SanMar / S&S orders placed since the last report (by hand)", hand or ["None."]))
-    if no_num:
-        sec.append(("⚠ POs with NO Printavo order # — add it, or the bot may order those goods again",
-                    no_num))
+    sec.append(("2. Ordered by hand (since yesterday's email)", hand or ["None."]))
 
     waiting = []
-    for ts, p in sorted(props.items()):
-        if p.get("status") == "pending":
-            waiting.append(f"{p['supplier']} post from {p['created'][5:16].replace('T', ' ')} — not ✅'d yet: "
-                           + _ord_po_now(p))
     try:
         r = _order_build_impl("", record_seen=False)
         for po in r["pos"]:
-            waiting.append(f"Needs ordering — {po['supplier']} PO \"{po['po_number']}\" ${po['total']:,.2f} "
+            waiting.append(f"Ready, not approved today — {po['supplier']} PO \"{po['po_number']}\" ${po['total']:,.2f} "
                            f"({po['why']}): " + ", ".join(f"#{x['order']['vid']} {x['order'].get('nick') or ''}"
                                                          for x in po["parts"]))
         for s, p_, why in r["held"]:
-            waiting.append(f"Holding — {s} #{p_['order']['vid']} {p_['order'].get('nick') or ''} "
+            waiting.append(f"Holding for free freight — {s} #{p_['order']['vid']} {p_['order'].get('nick') or ''} "
                            f"${p_['total']:,.2f} ({why})")
         for o, texts in r.get("attention") or []:
             waiting.append(f"NOT READY — #{o['vid']} {o.get('nick') or ''}: " + " | ".join(t for t in texts if not t.startswith("→")))
+        att = {str(o_["vid"]) for o_, _t in r.get("attention") or []}
         for o, l, why in r["flagged"]:
+            if str(o["vid"]) in att:
+                continue
             waiting.append(f"Order by hand — #{o['vid']} {l['style']} {l.get('desc', '')[:40]} {l['color']} "
                            f"{_ord_sizes(l['need'])} ({why})")
         if r.get("stuck"):
-            sec.append(("⚠ Stuck — approved 5+ business days ago, still no goods PO (and no #nogoods tag)", r["stuck"]))
+            sec.append(("⚠ Stuck — approved 5+ business days ago, still not ordered", r["stuck"]))
         if r.get("stale"):
-            sec.append(("Old orders still in an open status — close them out in Printavo", r["stale"]))
+            sec.append(("Old orders to close out in Printavo", r["stale"]))
     except Exception as e:
         waiting.append(f"⚠ Couldn't run the queue check: {str(e)[:150]}")
-    sec.append(("Still waiting — direct orders that need goods", waiting or ["Nothing waiting. 🎉"]))
+    sec.insert(2, ("3. Not ordered yet", waiting or ["Nothing waiting."]))
 
     subject = f"Goods ordered today — {now:%a %-m/%-d}" + (" (TEST MODE)" if ORDER_MODE == "test" else "")
-    html = ("<p>Daily goods check — spot-check what was ordered against what the jobs need.</p>"
-            + "".join(f"<h3>{_esc(t)}</h3><ul>" + "".join(f"<li>{_esc(x)}</li>" for x in ls) + "</ul>"
+    html = ("".join(f"<h3>{_esc(t)}</h3><ul>" + "".join(f"<li>{_esc(x)}</li>" for x in ls) + "</ul>"
                       for t, ls in sec))
     text = f"*{subject}*\n" + "\n".join(f"\n*{t}*\n" + "\n".join("• " + x for x in ls) for t, ls in sec)
     return subject, html, text

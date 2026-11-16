@@ -162,14 +162,9 @@ def plan(orders, today, first_seen, supplier_filter=None):
     flagged, other = [], []
     for o in orders:
         asg, fl = choose(o["lines"])
-        for l, why in fl:
-            flagged.append((o, l, why))
-        # Separate builds (Luke, Nov 12): SanMar 10:30, S&S 2:15. A SanMar-best order that can't wait
-        # for tomorrow's SanMar build (production date) goes to S&S if S&S can fill all of it.
-        if (supplier_filter == "S&S" and "SanMar" in asg and o.get("prod")
-                and add_business_days(today, 3) > o["prod"]
-                and all(ok(l, "S&S") for l, _opt in asg["SanMar"])):
-            asg.setdefault("S&S", []).extend((l, l["options"]["S&S"]) for l, _opt in asg.pop("SanMar"))
+        if not o.get("promo"):                 # promo items are ordered through the promo flow
+            for l, why in fl:
+                flagged.append((o, l, why))
         for s, lines in asg.items():
             if supplier_filter and s != supplier_filter:
                 other.append((s, o, round(sum(x[1]["cost"] for x in lines), 2)))
@@ -195,16 +190,16 @@ def plan(orders, today, first_seen, supplier_filter=None):
             seen = first_seen.get(str(o["vid"]), today)
             age = bdays_between(seen, today)
             reason = None
+            # The clock runs from approval (first day in the queue), never from the production date (Luke, Nov 15).
             if age >= MAX_WAIT_BDAYS:
                 reason = f"day {age} — max wait"
-            elif o.get("prod") and add_business_days(today, 3) > o["prod"]:
-                reason = f"prod date {o['prod']:%a %m/%d}"
             p["age"], p["reason"] = age, reason
             if reason:
                 due.append(p)
         if not due:
             for p in pool:
-                held.append((s, p, f"pool ${pool_total:,.2f} < $200 — day {p['age']} of {MAX_WAIT_BDAYS}"))
+                held.append((s, p, f"pool ${pool_total:,.2f} < $200 — day {p['age']} of {MAX_WAIT_BDAYS}"
+                             + _due_warn(p["order"], today)))
             continue
         if own:
             host = max(own, key=lambda p: p["total"])
@@ -215,7 +210,7 @@ def plan(orders, today, first_seen, supplier_filter=None):
                         f"#{p['order']['vid']} ({p['reason']})" for p in due)
             for p in pool:
                 if p not in due:
-                    held.append((s, p, f"pool < $200 — day {p['age']} of {MAX_WAIT_BDAYS}"))
+                    held.append((s, p, f"pool < $200 — day {p['age']} of {MAX_WAIT_BDAYS}" + _due_warn(p["order"], today)))
         else:
             pos.append({"supplier": s, "parts": pool,
                         "why": f"pool ${pool_total:,.2f} < $200 — shipping anyway, paying freight ("
@@ -238,6 +233,15 @@ def plan(orders, today, first_seen, supplier_filter=None):
 
 
 MAX_ORDERS_PER_PO = 5
+DUE_WARN_BDAYS = 5
+
+
+def _due_warn(order, today):
+    """Customer due date in jeopardy while the order waits for free freight -> flag only (Luke, Nov 15)."""
+    d = order.get("due")
+    if d and d <= add_business_days(today, DUE_WARN_BDAYS):
+        return f" · ⚠ due {d:%a %m/%d} — `include #{order['vid']}` to order it today"
+    return ""
 PO_NUM_MAX = 28
 
 
@@ -262,13 +266,15 @@ def render(result, title):
         for p in po["parts"]:
             o = p["order"]
             out.append(f"  #{o['vid']} {o.get('company') or ''} — {o.get('nick') or ''}"
-                       + (f" · prod {o['prod']:%a %m/%d}" if o.get("prod") else ""))
+                       + (f" · due {o['due']:%a %m/%d}" if o.get("due") else "")
+                       + (f"\n    ⚠ already in *{o['lane']}* with no goods PO — goods on hand? `skip #{o['vid']}` if so"
+                          if o.get("lane") else ""))
             for l, opt in p["lines"]:
                 nd = "" if opt["nextday"] else "  ⚠ not next-day"
                 desc = f" · {l['desc'][:45]}" if l.get("desc") else ""
                 pcs = sum(l["need"].values())
                 out.append(f"    *{l['style']}*{desc} · {opt['color']} — {_sizes_txt(l['need'])} = {pcs} pcs · "
-                           f"${opt['cost']:,.2f}{nd}")
+                           f"${opt['cost']:,.2f}{nd}" + (f"\n      {l['dup']}" if l.get("dup") else ""))
     if result["held"]:
         out.append("\n*Holding (pooling for free freight):*")
         for s, p, why in result["held"]:

@@ -4222,7 +4222,7 @@ def _fetch_orders_in_status(status_name: str, field: str = "invoices") -> dict:
             totalNodes
             pageInfo { hasNextPage endCursor }
             nodes {
-                id visualId nickname startAt
+                id visualId nickname startAt customerDueAt
                 status { name }
                 contact { fullName customer { companyName } }
             }
@@ -4242,6 +4242,7 @@ def _fetch_orders_in_status(status_name: str, field: str = "invoices") -> dict:
             "nick": (n.get("nickname") or "(no nickname)")[:40],
             "company": (c.get("customer") or {}).get("companyName") or c.get("fullName") or "—",
             "prod": _parse_dt(n.get("startAt")),
+            "due": _parse_dt(n.get("customerDueAt")),
             "contact": c,
             "id": n.get("id"),
             "type": field[:-1],
@@ -7808,7 +7809,34 @@ ORDER_SHADOW_ENABLED = os.environ.get("ORDER_SHADOW_ENABLED", "true").lower() no
 # 10:30 = SanMar (11:00 cutoff) + S&S; 14:15 = S&S only (3:00 cutoff), anything new since 10:30.
 ORDER_BUILD_TIMES_CT = os.environ.get("ORDER_BUILD_TIMES_CT", "10:30=SanMar,14:15=S&S")
 ORDER_SHADOW_USERS = os.environ.get("ORDER_SHADOW_USERS", "U0504FSDYB0")   # Luke only while in shadow
-_ORDER_QUEUE_STATUSES = ("QUOTE APPROVED", "ORDER GOODS") + _GOODS_ALERT_STATUSES
+# Queue = every APPROVED order (Luke, Nov 15): Printavo makes QUOTE APPROVED its first INVOICE-type
+# status, so every invoice not yet finished needs goods — art statuses, GXS, ORDER ON HOLD and even a
+# production lane (a process slip, flagged ⚠ but still caught). Finished, shipped, contract excluded.
+_ORDER_EXCLUDE = {s.lower() for s in (
+    "Quote", "MOCK-UP REQUESTED", "MOCK-UP READY", "QUOTE APPROVAL SENT", "BD",
+    "SP - COMPLETED", "EMB - COMPLETE", "DTF - COMPLETE", "STORE - READY TO SHIP", "STORE ORDER - SHIPPED",
+    "PROMO - SHIPPED - EST MERCH", "PROMO - SHIPPED - TO CUSTOMER", "READY FOR PICK UP", "PICKED UP",
+    "SHIPPED - BILLABLE", "SHIPPED - NOT BILLABLE", "INVOICED", "PAID & DONE", "FEEDBACK REQUESTED",
+    "UGP SHIPPED")}
+_LANE_WORDS = ("PRE-PRO", "PRE PRO", "READY", "IN PRODUCTION", "DIGITIZING", "SEW OUT", "ORDER TRANSFER")
+
+
+def _order_queue_statuses() -> list:
+    sres = fetch_all_statuses()
+    if "error" in sres:
+        raise RuntimeError(f"statuses: {sres['error']}")
+    return [x["name"] for x in sres["nodes"]
+            if _norm_status(x["name"]) not in _ORDER_EXCLUDE and not _norm_status(x["name"]).startswith("contract")]
+
+
+def _status_is_lane(name) -> bool:
+    u = (name or "").upper()
+    return u.startswith("STORE") or any(w in u for w in _LANE_WORDS)
+
+
+def _status_is_promo(name) -> bool:
+    return (name or "").upper().startswith("PROMO")
+
 
 
 def _printavo_items_by_id(internal_id: str, otype: str = "invoice") -> list:
@@ -7830,7 +7858,8 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
         raise RuntimeError(f"supplier modules failed to load: {_SANMAR_IMPORT_ERR}")
     today = _central_now().date()
     queue = []
-    for st, field in [(s_, f_) for s_ in _ORDER_QUEUE_STATUSES for f_ in ("invoices", "quotes")]:
+    for st in _order_queue_statuses():
+        field = "invoices"
         q = _fetch_orders_in_status(st, field)
         if "error" in q:
             if "not found in Printavo" in q["error"]:
@@ -7883,11 +7912,26 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             if not lines:
                 continue
             orders.append({"vid": o["vid"], "id": o.get("id"), "type": o.get("type", "invoice"),
+                           "due": o["due"].date() if o.get("due") else None,
+                           "lane": o["status"] if _status_is_lane(o["status"]) else "",
+                           "promo": _status_is_promo(o["status"]),
                            "sig": _order_sig(items),
                            "nick": o["nick"], "company": o["company"],
                            "prod": o["prod"].date() if o.get("prod") else None, "lines": lines,
                            "status": o["status"]})
         result = _ordering.plan(orders, today, first_seen, supplier_filter or None)
+    if result["pos"]:
+        try:
+            unnum = _recent_unnumbered_pos()
+            for po in result["pos"]:
+                for part in po["parts"]:
+                    for l, opt in part["lines"]:
+                        core = _scogs._core(l["style"])
+                        hits = [f"{s_} PO \"{n_}\"" for s_, n_, styles in unnum if core in styles]
+                        if hits:
+                            l["dup"] = "⚠ possible duplicate — " + ", ".join(hits[:2]) + " (no order #) has this style"
+        except Exception as e:
+            print(f"[ORDER] duplicate check: {e}", flush=True)
     result["queue"] = len(needs)
     result["tag_skipped"] = tag_skipped
     return result
@@ -8038,6 +8082,8 @@ def _order_post_build(supplier, record_seen=True) -> str:
     cut = ORDER_CUTOFFS_CT.get(supplier, "")
     head = (f"{_ord_mode_banner()}*{supplier} order build — {now:%a %-m/%-d %-I:%M %p}* · "
             f"{r['queue']} direct orders need goods")
+    if r["held"] and not r["pos"]:
+        head += "\nHolding orders can be pulled into today's order with `include #NNNN`, then ✅."
     if r["pos"]:
         what = "this PO" if len(r["pos"]) == 1 else f"these {len(r['pos'])} POs"
         head += (f"\n👉 *React ✅ to place {what}* — by {cut} for next-day delivery. "
@@ -8052,7 +8098,7 @@ def _order_post_build(supplier, record_seen=True) -> str:
                 _ord_update(ts, f"⌛ *EXPIRED* — replaced by the {now:%a %-I:%M %p} build below. "
                                 f"Nothing was placed from this post.\n\n" + p.get("text", ""))
         ts = _ord_post(text)
-        if r["pos"]:
+        if r["pos"] or r["held"]:
             props[ts] = {
                 "supplier": supplier, "mode": ORDER_MODE, "status": "pending", "created": now.isoformat(),
                 "text": text,
@@ -8066,7 +8112,15 @@ def _order_post_build(supplier, record_seen=True) -> str:
                                                 "desc": l.get("desc", ""), "sizemap": opt.get("sizemap") or {},
                                                 "skus": opt.get("skus") or {}} for l, opt in p["lines"]]}
                                     for p in po["parts"]]}
-                        for po in r["pos"]]}
+                        for po in r["pos"]],
+                "held": [{"vid": str(p_["order"]["vid"]), "id": p_["order"].get("id"),
+                          "type": p_["order"].get("type", "invoice"), "total": p_.get("total"),
+                          "sig": p_["order"].get("sig"),
+                          "nextday": all(opt["nextday"] for _l, opt in p_["lines"]),
+                          "lines": [{"style": l["style"], "color": opt["color"], "need": l["need"],
+                                     "desc": l.get("desc", ""), "sizemap": opt.get("sizemap") or {},
+                                     "skus": opt.get("skus") or {}} for l, opt in p_["lines"]]}
+                         for s_, p_, _why in r["held"] if s_ == supplier]}
         _ord_save(props)
     return text
 
@@ -8111,7 +8165,7 @@ def _order_submit(ts, p) -> tuple:
             ss_ordered.update(_scogs.order_numbers(po))
     except Exception as e:
         return "failed", [f"⚠️ Couldn't read S&S orders to check for duplicates ({e}) — nothing placed. React again to retry."]
-    queue_norm = {_norm_status(s) for s in _ORDER_QUEUE_STATUSES}
+    queue_norm = {_norm_status(s) for s in _order_queue_statuses()}
     _sanmar._PO_CACHE["at"] = 0          # never trust a cached PO list for the duplicate check
     out, placed, failed = [], 0, 0
     for po in p["pos"]:
@@ -8257,7 +8311,7 @@ def _ord_po_now(p):
 
 
 def _ord_changes_txt(p):
-    bits = [f"#{v} skipped" for v in p.get("skips") or []]
+    bits = [f"#{v} skipped" for v in p.get("skips") or []] + [f"#{v} included" for v in p.get("included") or []]
     for vid, idxs in (p.get("line_skips") or {}).items():
         o = next((o for po in p["pos"] for o in po["orders"] if o["vid"] == vid), None)
         if o and idxs:
@@ -8284,6 +8338,8 @@ def _ord_verb(t):
         return "unadd"
     if re.match(r"^\s*add\b", t):
         return "add"
+    if re.match(r"^\s*include\b", t):
+        return "include"
     if re.search(r"\bskip\b", t):
         return "skip"
     return None
@@ -8352,19 +8408,37 @@ def _ord_handle_msg(m, props, now, only_ts=None) -> bool:
         return False
     open_props = [(ts, p) for ts, p in props.items()
                   if p.get("status") == "pending" and (not only_ts or ts == only_ts)]
-    open_vids = {o["vid"] for _ts, p in open_props for po in p["pos"] for o in po["orders"]}
+    open_vids = ({o["vid"] for _ts, p in open_props for po in p["pos"] for o in po["orders"]}
+                 | {h["vid"] for _ts, p in open_props for h in p.get("held") or []})
     nums, toks, sizes = _ord_parse(t, open_vids)
     name = ORDER_APPROVERS[m["user"]]
     out, touched = [], []
     if not nums:
         ex = {"skip": "`skip #7467` (whole order) or `skip #7489 Tultex` (one line)",
               "unskip": "`unskip #7467`", "add": "`add #7500 2 L 1 XL` (or `add #7500 PC590H 2 L`)",
-              "unadd": "`unadd #7500`"}[verb]
+              "unadd": "`unadd #7500`", "include": "`include #7510`"}[verb]
         _ord_post(f"I didn't see an order # on an open order post. Try {ex}.", thread_ts=reply_ts)
         return True
     for vid in nums:
         found = False
         for ts, p in open_props:
+            if verb == "include":
+                h = next((h for h in p.get("held") or [] if h["vid"] == vid), None)
+                if not h:
+                    continue
+                found = True
+                p["held"] = [x for x in p["held"] if x["vid"] != vid]
+                if p["pos"]:
+                    p["pos"][0]["orders"].append(h)
+                else:
+                    p["pos"].append({"po_number": vid, "why": f"included by {name}", "total": h.get("total"),
+                                     "nextday": h.get("nextday", True), "orders": [h]})
+                p.setdefault("included", []).append(vid)
+                out.append(f"#{vid} pulled into today's {p['supplier']} order (pays freight if the PO stays under $200). "
+                           f"Now: {_ord_po_now(p)}")
+                if (ts, p) not in touched:
+                    touched.append((ts, p))
+                continue
             o = next((o for po in p["pos"] for o in po["orders"] if o["vid"] == vid), None)
             if not o:
                 continue
@@ -8509,7 +8583,7 @@ def _order_poll_once():
                         for u in r_.get("users") or [] if u in ORDER_APPROVERS), None) or p.get("text_approved_by")
             if not who:
                 cut = ORDER_CUTOFFS_CT.get(p["supplier"])
-                if st == "pending" and cut and not p.get("reminded") and created.date() == now.date():
+                if st == "pending" and cut and p.get("pos") and not p.get("reminded") and created.date() == now.date():
                     hh, mm = (int(x) for x in cut.split(":"))
                     left = hh * 60 + mm - (now.hour * 60 + now.minute)
                     if 0 < left <= 10:
@@ -8718,6 +8792,183 @@ def _order_report_tick(now_ct):
         _ord_post(text[:39000])
         _post_cogs_dm(f"⚠️ The afternoon goods email didn't send ({str(e)[:200]}) — posted it in #goods-orders instead.",
                       recipients="U0504FSDYB0")
+
+
+
+
+def _recent_unnumbered_pos(days=3) -> list:
+    """SanMar / S&S POs from the last few days with NO Printavo order # -> [(supplier, po, {core styles})].
+    Used to warn on a post line: those goods may already be bought."""
+    out = []
+    since = _central_now() - timedelta(days=days)
+    try:
+        for row in _sanmar.order_status("lastUpdate", since=since.strftime("%Y-%m-%dT00:00:00")):
+            if row["po"] and not _scogs.order_numbers(row["po"]):
+                out.append(("SanMar", row["po"], {_scogs._core(l["style"]) for l in row["lines"] if l["style"]}))
+    except Exception as e:
+        print(f"[ORDER] unnumbered SanMar POs: {e}", flush=True)
+    try:
+        for o in _ss.orders_recent():
+            po = str(o.get("poNumber") or "")
+            if str(o.get("orderDate") or "")[:10] >= since.date().isoformat() and not _scogs.order_numbers(po):
+                out.append(("S&S", po or f"(blank PO) S&S {o.get('orderNumber')}",
+                            {_scogs._core(str(l.get("styleName") or "")) for l in o.get("lines") or []}))
+    except Exception as e:
+        print(f"[ORDER] unnumbered S&S POs: {e}", flush=True)
+    return out
+
+
+def _bt_order(vid):
+    """Printavo order for the look-back test: contact, status, tags, items (with description)."""
+    iid, otype, err = _find_order(str(vid))
+    if not iid:
+        return None
+    time.sleep(PAGE_DELAY_S)
+    r = query_printavo(f'''query {{ o: {otype}(id: "{iid}") {{ nickname status {{ name }} tags
+        contact {{ fullName customer {{ companyName }} }}
+        lineItemGroups(first: 25) {{ nodes {{ lineItems(first: 50) {{ nodes {{
+            itemNumber description color sizes {{ size count }} }} }} }} }} }} }}''')
+    o = r.get("o") if "error" not in r else None
+    if not o:
+        return None
+    items = []
+    for g in (o.get("lineItemGroups") or {}).get("nodes") or []:
+        for li in (g.get("lineItems") or {}).get("nodes") or []:
+            items.append({"style": li.get("itemNumber") or "", "color": li.get("color") or "",
+                          "desc": " ".join((li.get("description") or "").split()),
+                          "sizes": {s.get("size"): s.get("count") or 0 for s in (li.get("sizes") or [])}})
+    return {"vid": str(vid), "type": otype, "nick": o.get("nickname") or "", "status": (o.get("status") or {}).get("name"),
+            "tags": o.get("tags") or [], "contact": o.get("contact") or {}, "items": items}
+
+
+@mcp.tool()
+def order_backtest(days: int = 56, max_orders: int = 250) -> str:
+    """LOOK-BACK TEST — read-only, posts nothing anywhere. For every direct order that SanMar or S&S
+    invoiced in the last `days` days (from the order #s on the POs), compares what the ordering bot
+    WOULD have ordered from the Printavo order (style, color, size, qty) with what was actually bought.
+    Stock is ignored (we can't know past stock). Reports matches, over/under quantities, color
+    differences and lines the bot would have flagged for ordering by hand."""
+    from collections import defaultdict
+    end = _central_now().date()
+    start = end - timedelta(days=days)
+    invs, errs = [], []
+    try:
+        invs += _sanmar.normalized_invoices(start.isoformat(), end.isoformat())
+    except Exception as e:
+        errs.append(f"SanMar invoices: {e}")
+    try:
+        invs += _ss.invoices_by_date(start.isoformat(), end.isoformat())
+    except Exception as e:
+        errs.append(f"S&S invoices: {e}")
+    orders_cache = {}
+
+    def get(vid):
+        if vid not in orders_cache:
+            try:
+                orders_cache[vid] = _bt_order(vid)
+            except Exception:
+                orders_cache[vid] = None
+        return orders_cache[vid]
+
+    actual = defaultdict(lambda: defaultdict(float))
+    acolor = defaultdict(lambda: defaultdict(set))
+    apos = defaultdict(set)
+    unattributed = []
+    for inv in invs:
+        nums = _scogs.order_numbers(inv["po"])
+        if not nums:
+            continue
+        for li in inv["lines"]:
+            if len(nums) == 1:
+                o = nums[0]
+            else:
+                cands = [n for n in nums if get(n) and any(_scogs._style_match(li["style"], it["style"])
+                                                           for it in get(n)["items"])]
+                if len(cands) > 1:
+                    cands = [n for n in cands if any(_scogs._size_qty(it, li["size"]) > 0 for it in get(n)["items"]
+                                                     if _scogs._style_match(li["style"], it["style"]))] or cands
+                o = cands[0] if len(cands) == 1 else None
+            if not o:
+                unattributed.append(f"{inv['vendor']} PO \"{inv['po']}\" {li['style']} {li['color']} {li['size']} ×{li['qty']:g}")
+                continue
+            core = _scogs._core(li["style"])
+            actual[o][(core, _stock.norm_size(li["size"]))] += li["qty"]
+            acolor[o][core].add(li["color"])
+            apos[o].add(f"{inv['vendor']} \"{inv['po']}\"")
+    cache = _ordering.StyleCache()
+    res = {"match": [], "over": [], "under": [], "color": [], "flag": [], "skipped": []}
+    n = 0
+    with _stock._LOCK:
+        for vid in sorted(actual, key=int):
+            n += 1
+            if n > max_orders:
+                break
+            o = get(vid)
+            if not o:
+                res["skipped"].append(f"#{vid} not found in Printavo")
+                continue
+            if _cogs_is_contract_customer({"contact": o["contact"]}):
+                res["skipped"].append(f"#{vid} contract")
+                continue
+            if any(str(t).strip().lower().lstrip("#") in ORDER_SKIP_TAGS for t in o["tags"]):
+                res["skipped"].append(f"#{vid} tagged #nogoods")
+                continue
+            bot = defaultdict(float)
+            bcolor = {}
+            flags = []
+            for it in o["items"]:
+                m = _ordering.match_line(it, cache)
+                if not m:
+                    continue
+                opts = [(s, op) for s, op in m["options"].items() if op["sure"]]
+                if m["flag"] or not opts:
+                    why = m["flag"] or ("color check: Printavo '" + m["color"] + "'")
+                    flags.append(f"{m['style']} {m['color']} {_ord_sizes(m['need'])} — {why}")
+                    continue
+                sup, op = min(opts, key=lambda x: (len(x[1]["short"]), x[1]["cost"]))
+                core = _scogs._core(m["style"])
+                bcolor[core] = op["color"]
+                for z, q in m["need"].items():
+                    bot[(core, _stock.norm_size((op.get("sizemap") or {}).get(z, z)))] += q
+            act = actual[vid]
+            over = [f"{c} {z}: bot {bot[(c, z)]:g} vs bought {act.get((c, z), 0):g}"
+                    for (c, z) in sorted(bot) if bot[(c, z)] > act.get((c, z), 0)]
+            under = [f"{c} {z}: bot {bot.get((c, z), 0):g} vs bought {act[(c, z)]:g}"
+                     for (c, z) in sorted(act) if act[(c, z)] > bot.get((c, z), 0)]
+            colors = [f"{c}: bot '{bc}' vs bought {', '.join(sorted(acolor[vid][c]))}"
+                      for c, bc in bcolor.items() if acolor[vid].get(c)
+                      and _stock._cn(bc) not in {_stock._cn(x) for x in acolor[vid][c]}]
+            head = f"#{vid} {o['nick'][:40]} [{o['status']}] — {'; '.join(sorted(apos[vid]))}"
+            if flags:
+                res["flag"].append(head + "\n      " + "\n      ".join(flags))
+            if colors:
+                res["color"].append(head + "\n      " + "\n      ".join(colors))
+            if over:
+                res["over"].append(head + "\n      " + "\n      ".join(over))
+            if under:
+                res["under"].append(head + "\n      " + "\n      ".join(under))
+            if not (over or under or colors or flags):
+                res["match"].append(f"#{vid}")
+    total = len(res["match"]) + len({x.split()[0] for k in ("over", "under", "color", "flag") for x in res[k]})
+    out = [f"LOOK-BACK TEST · {start} → {end} · {len(invs)} supplier invoices · "
+           f"{sum(1 for v in actual)} orders with goods on a numbered PO",
+           f"Exact match (bot = what was bought): {len(res['match'])} orders"]
+    labels = {"over": "Bot would have ordered MORE than was bought (over-order risk — or stock/backorder/changes)",
+              "under": "Bot would have ordered LESS than was bought (miss risk — or overs/extras bought by hand)",
+              "color": "Different color than what was bought",
+              "flag": "Lines the bot would have flagged for ordering by hand",
+              "skipped": "Skipped (contract / #nogoods / not found)"}
+    for k in ("over", "under", "color", "flag", "skipped"):
+        out.append(f"\n== {labels[k]}: {len(res[k])} ==")
+        out += [("  " + x) for x in res[k]]
+    if unattributed:
+        out.append(f"\n== Invoice lines on combined POs that couldn't be tied to one order: {len(unattributed)} ==")
+        out += ["  " + x for x in unattributed[:60]]
+    if errs:
+        out.append("\nErrors: " + "; ".join(errs))
+    text = "\n".join(out)
+    _goods_json_save("order_backtest.txt", text)
+    return text
 
 
 @mcp.tool()

@@ -36,7 +36,7 @@ def norm_size(s):
 
 def core(style):
     """BC3001CVC ~ 3001CVC, NL6210 ~ 6210 (S&S lists outside brands by bare number)."""
-    s = re.sub(r"[^A-Z0-9]", "", str(style or "").upper())
+    s = re.sub(r"[^A-Z0-9]", "", re.split(r"[_ ]", str(style or "").strip().upper())[0])   # Y500_YT -> Y500
     return re.sub(r"^(BC|NL|DT|CT|CAR)(?=\d)", "", s)
 
 
@@ -118,7 +118,7 @@ def _q(x):
     return int(x) if float(x).is_integer() else x
 
 
-def compare(needs, have, own_styles=None):
+def compare(needs, have, own_styles=None, own_needs=None):
     """own_styles: core styles of THIS order — only these can be reported 'not on any PO'
     (other orders on a combined PO may have their blanks on a different PO)."""
     have_by_style = {}
@@ -126,6 +126,21 @@ def compare(needs, have, own_styles=None):
         have_by_style.setdefault(core(st), []).append((st, co, norm_size(sz), q))
     need_by = {}
     issues, unknown = [], False
+    # THIS order's own lines: a mismatch is reported only on the order that needs that piece, and
+    # under the item # the order uses (DT6102, not 6102). Other orders sharing the PO report their own.
+    own_keys, own_sc, label_of = None, set(), {}
+    if own_needs is not None:
+        own_keys = set()
+        for st, co, sz, q in own_needs:
+            if not real_style(st) or not q:
+                continue
+            cs = core(st)
+            cols = sorted({c for _s, c, _z, _q2 in have_by_style.get(cs, []) if c})
+            pk = (_stock._pick_colors(cols, co) if co else cols) if cols else []
+            if pk:
+                own_keys.add((cs, pk[0], norm_size(sz)))
+                own_sc.add((cs, pk[0]))
+                label_of[cs] = st.split("_")[0]
     for st, co, sz, q in needs:
         if not real_style(st) or not q:
             continue
@@ -166,7 +181,9 @@ def compare(needs, have, own_styles=None):
         n, h = need_by.get(k, 0), have_by.get(k, 0)
         if n == h:
             continue
-        label = f"{k[0]} {k[1]} {k[2] or '—'}"
+        if own_keys is not None and k not in own_keys and not (n == 0 and (k[0], k[1]) in own_sc):
+            continue                                   # another order's piece on a shared PO
+        label = f"{label_of.get(k[0], k[0])} {k[1]} {k[2] or '—'}"
         if h == 0:
             issues.append(f"{label}: order needs {_q(n)}, PO has none")
         elif n == 0:

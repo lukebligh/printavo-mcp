@@ -7426,7 +7426,7 @@ def _goods_po_check(vid, internal_id, infos):
     if not have:
         return None
     order_nums = sorted({n for _p, i in infos for n in (i.get("orders") or [])} | {vid})
-    needs, own = [], set()
+    needs, own, own_needs = [], set(), []
     for n in order_nums:
         iid = internal_id if n == vid and internal_id else None
         if not iid:
@@ -7437,11 +7437,13 @@ def _goods_po_check(vid, internal_id, infos):
             for sz, q in (li.get("sizes") or {}).items():
                 if q:
                     needs.append((li["style"], li["color"], sz, q))
+                    if n == vid:
+                        own_needs.append((li["style"], li["color"], sz, q))
             if n == vid and _pocheck.real_style(li["style"]):
                 own.add(_pocheck.core(li["style"]))
     if not needs:
         return None
-    issues, total, unknown = _pocheck.compare(needs, have, own_styles=own)
+    issues, total, unknown = _pocheck.compare(needs, have, own_styles=own, own_needs=own_needs)
     if unknown and not issues:
         return None
     return issues, total

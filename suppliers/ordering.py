@@ -309,7 +309,14 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
                     holds.append(f"QUOTE · {t['pcs']} × {st} — at or over SanMar's {t['th'][0]}-piece quote level "
                                  f"({t['th'][1]}). Request a quote from SanMar first, then reply "
                                  f"`quote done #{o['vid']}`.")
+        # A held / by-hand order shows on the post of the supplier it belongs to — SanMar unless only
+        # S&S is involved (Luke, Nov 16: #7497 is a SanMar order, keep it off the S&S post).
+        inv = set(asg) | {("SanMar" if "SanMar" in l["options"] else "S&S") for l in o["lines"]
+                          if l and not l["flag"] and not ok(l, "SanMar") and not ok(l, "S&S")}
+        show = (not supplier_filter) or (supplier_filter in inv) or (not inv and supplier_filter == "SanMar")
         if holds:
+            if not show:
+                continue
             if any(h.startswith("SHORT") for h in holds):
                 holds.append(f"→ Fix the order in Printavo (next post picks it up), or reply "
                              f"`approve shorts #{o['vid']}` to order everything else.")
@@ -317,7 +324,7 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
                                           for l, w in byhand]))
             continue
         if not asg:
-            if byhand:
+            if byhand and show:
                 attention.append((o, [f"✋ order by hand — {l['style']} {l['color']} {_sizes_txt(l['need'])}: {w}"
                                       for l, w in byhand]))
             continue

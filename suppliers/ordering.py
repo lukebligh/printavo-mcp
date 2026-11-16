@@ -57,6 +57,11 @@ class StyleCache:
                 sd = {"found": False, "error": str(e)[:150]}
             # S&S lists one style # under several brands (Gildan 18500 + others): the brand in the
             # Printavo description picks the right one.
+            if sd.get("error"):
+                try:
+                    sd = (_st.sanmar_side(style, "") if supplier == "SanMar" else _st.ss_side(style, ""))
+                except Exception as e:
+                    sd = {"found": False, "error": str(e)[:150]}
             if supplier == "S&S" and len(sd.get("styles", [])) > 1 and brand:
                 try:
                     sd2 = _st.ss_side(style, "", brand)
@@ -103,6 +108,11 @@ def match_line(item, cache):
             sd = cache.get(sup, base, brand)
             if sd.get("found"):
                 res["style"] = base
+        if (not sd.get("found") or not sd.get("by")) and re.search(r"\d[A-Z]*[MR]$", style.upper()) and len(style) > 3:
+            sd2 = cache.get(sup, style[:-1], brand)
+            if sd2.get("found") and sd2.get("by"):
+                sd = sd2
+                res["style"] = style[:-1]
         if not sd.get("found") or not sd.get("by"):
             continue
         picked = _st._pick_colors(list(sd["by"].keys()), color)
@@ -112,7 +122,10 @@ def match_line(item, cache):
         _st._NEED.update(need)
         clr = _st._best(picked, sd["by"])[0]
         rows = sd["by"][clr]
-        sure = (_st._cn(clr) == _st._cn(color) or _st._sk(clr) == _st._sk(color)
+        color_c = re.sub(r"\([^)]*\)", " ", color).strip() or color
+        sure = (_st._cn(clr) == _st._cn(color_c) or _st._sk(clr) == _st._sk(color_c)
+                or (_st.generic_match(clr, color_c)
+                    and len({_st._cn(c) for c in sd["by"] if _st.generic_match(c, color_c)}) == 1)
                 or (_st.abbr_match(clr, color) and sum(1 for c in sd["by"] if _st.abbr_match(c, color)) == 1))
         cost, short, nextday = 0.0, [], True
         smap = {}
@@ -121,6 +134,8 @@ def match_line(item, cache):
                 smap[z] = z
             elif z.startswith("Y") and z[1:] in rows and youth_style:
                 smap[z] = z[1:]          # youth style lists youth sizes as S/M/L
+            elif z == "OSFA" and len(rows) == 1:
+                smap[z] = next(iter(rows))     # caps sold in one size under another name ("M/L")
             elif z + "T" in rows:
                 smap[z] = z + "T"        # tall style: Printavo '3XL' = supplier '3XLT'
             else:
@@ -141,7 +156,10 @@ def match_line(item, cache):
                                "skus": {z: (rows.get(smap[z]) or {}).get("sku") or "" for z in need},
                                "sizemap": smap}
     if not res["options"]:
-        res["flag"] = "neither supplier carries this style/color"
+        errs = [s_ for s_ in ("SanMar", "S&S") if (cache.get(s_, style, brand) or {}).get("error")
+                and "ambiguous" not in cache.get(s_, style, brand)["error"]]
+        res["flag"] = (f"couldn't look it up at {' / '.join(errs)} just now — will retry next build" if errs
+                       else "neither supplier carries this style/color")
     if not youth_style and any(z.startswith("Y") for z in need):
         res["flag"] = "youth sizes on an adult item # — use the youth style (e.g. 18000B, PC54Y)"
     return res

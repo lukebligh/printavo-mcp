@@ -131,10 +131,24 @@ def orders_recent():
 
 
 def _get(path, params):
-    try:
-        r = httpx.get(f"{BASE}{path}", auth=_auth(), timeout=60, params={**params, "mediatype": "json"})
-    except httpx.HTTPError as e:
-        raise SSError(f"S&S unreachable: {e}")
+    r, last = None, None
+    for attempt in range(5):
+        try:
+            r = httpx.get(f"{BASE}{path}", auth=_auth(), timeout=60, params={**params, "mediatype": "json"})
+        except httpx.HTTPError as e:
+            last, r = e, None
+            time.sleep(2 + attempt * 2)
+            continue
+        if r.status_code == 429 or r.status_code >= 500:      # S&S allows ~60 calls a minute
+            try:
+                wait = float(r.headers.get("Retry-After") or 0)
+            except ValueError:
+                wait = 0
+            time.sleep(min(max(wait, 3 + attempt * 4), 30))
+            continue
+        break
+    if r is None:
+        raise SSError(f"S&S unreachable: {last}")
     if r.status_code == 404:
         return []
     if r.status_code != 200:

@@ -7942,6 +7942,8 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             print(f"[ORDER] duplicate check: {e}", flush=True)
     result["queue"] = len(needs)
     result["tag_skipped"] = tag_skipped
+    result["stuck"] = [f"#{o['vid']} {o['nick']} [{o['status']}] — approved {first_seen[str(o['vid'])]:%a %-m/%-d}"
+                       for o in needs if _ordering.bdays_between(first_seen[str(o["vid"])], today) >= 5]
     result["stale"] = stale
     return result
 
@@ -8758,6 +8760,10 @@ def _order_report(update_snapshot=False):
         for o, l, why in r["flagged"]:
             waiting.append(f"Order by hand — #{o['vid']} {l['style']} {l.get('desc', '')[:40]} {l['color']} "
                            f"{_ord_sizes(l['need'])} ({why})")
+        if r.get("stuck"):
+            sec.append(("⚠ Stuck — approved 5+ business days ago, still no goods PO (and no #nogoods tag)", r["stuck"]))
+        if r.get("stale"):
+            sec.append(("Old orders still in an open status — close them out in Printavo", r["stale"]))
     except Exception as e:
         waiting.append(f"⚠ Couldn't run the queue check: {str(e)[:150]}")
     sec.append(("Still waiting — direct orders that need goods", waiting or ["Nothing waiting. 🎉"]))
@@ -8829,6 +8835,11 @@ def _recent_unnumbered_pos(days=3) -> list:
     except Exception as e:
         print(f"[ORDER] unnumbered S&S POs: {e}", flush=True)
     return out
+
+
+def _bt_size(z):
+    z = _stock.norm_size(z)
+    return "OSFA" if "/" in z or z in ("OSFA", "ONE SIZE") else z
 
 
 def _bt_order(vid):
@@ -8911,7 +8922,7 @@ def order_backtest(days: int = 56, max_orders: int = 250) -> str:
                 unattributed.append(f"{inv['vendor']} PO \"{inv['po']}\" {li['style']} {li['color']} {li['size']} ×{li['qty']:g}")
                 continue
             core = _scogs._core(li["style"])
-            actual[o][(core, _stock.norm_size(li["size"]))] += li["qty"]
+            actual[o][(core, _bt_size(li["size"]))] += li["qty"]
             acolor[o][core].add(li["color"])
             apos[o].add(f"{inv['vendor']} \"{inv['po']}\"")
     cache = _ordering.StyleCache()
@@ -8948,7 +8959,7 @@ def order_backtest(days: int = 56, max_orders: int = 250) -> str:
                 core = _scogs._core(m["style"])
                 bcolor[core] = op["color"]
                 for z, q in m["need"].items():
-                    bot[(core, _stock.norm_size((op.get("sizemap") or {}).get(z, z)))] += q
+                    bot[(core, _bt_size((op.get("sizemap") or {}).get(z, z)))] += q
             act = actual[vid]
             over = [f"{c} {z}: bot {bot[(c, z)]:g} vs bought {act.get((c, z), 0):g}"
                     for (c, z) in sorted(bot) if bot[(c, z)] > act.get((c, z), 0)]

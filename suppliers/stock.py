@@ -74,6 +74,18 @@ def _abbr_of(short, full):
     return all(ch in it for ch in short)
 
 
+_GENERIC = {"blue", "green"}
+
+
+def generic_match(c, want):
+    """'Royal Blue' = SanMar 'Royal', 'Kelly Green' = 'Kelly': same words once a trailing blue/green is dropped."""
+    a, b = _ctoks(c), _ctoks(want)
+    if a == b or not a or not b:
+        return False
+    strip = lambda t: t[:-1] if len(t) > 1 and t[-1] in _GENERIC else t
+    return "".join(strip(a)) == "".join(strip(b))
+
+
 def abbr_match(c, want):
     """Same number of words and each supplier word abbreviates the wanted word —
     SanMar's stock feed shortens names: 'Hthrd Nep Blue' = 'Heathered Neptune Blue', 'S Orange' = 'Safety Orange'."""
@@ -85,10 +97,13 @@ def _pick_colors(colors, want):
     """Exact > same skeleton > every word abbreviates (only if unique) > contains > skeleton contains."""
     if not want:
         return sorted(colors)
+    want = re.sub(r"\([^)]*\)", " ", want).strip() or want      # "White (COMMAND ONLY)" -> "White"
     w, ws = _cn(want), _sk(want)
     ab = [c for c in colors if abbr_match(c, want)]
+    gm = [c for c in colors if generic_match(c, want)]
     for test in (lambda c: _cn(c) == w, lambda c: _sk(c) == ws,
                  lambda c: len(ab) == 1 and c in ab,
+                 lambda c: len({_cn(x) for x in gm}) == 1 and c in gm,
                  lambda c: w in _cn(c), lambda c: ws and ws in _sk(c)):
         hit = sorted(c for c in colors if test(c))
         if hit:

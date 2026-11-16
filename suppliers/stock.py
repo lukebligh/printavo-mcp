@@ -13,7 +13,8 @@ _ORDER = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL"]
 _ALIAS = {"XXL": "2XL", "XXXL": "3XL", "XXXXL": "4XL", "XXXXXL": "5XL", "2X": "2XL", "3X": "3XL",
           "4X": "4XL", "SM": "S", "MD": "M", "LG": "L", "SMALL": "S", "MEDIUM": "M", "LARGE": "L",
           # one-size items (Printavo's "Other" size column = beanies, caps, totes) -> SanMar/S&S OSFA
-          "OTHER": "OSFA", "ONESIZE": "OSFA", "OS": "OSFA", "ONESIZEFITSMOST": "OSFA", "OSFM": "OSFA"}
+          "OTHER": "OSFA", "ONESIZE": "OSFA", "OS": "OSFA", "ONESIZEFITSMOST": "OSFA", "OSFM": "OSFA",
+          "ADJUSTABLE": "OSFA", "ADJ": "OSFA"}
 
 
 def norm_size(s):
@@ -58,12 +59,36 @@ def _sk(c):
     return (c[:1] + re.sub(r"[aeiouy]", "", c[1:])) if c else ""
 
 
+def _ctoks(c):
+    """Color -> word tokens: camelCase and '/' split, abbreviations expanded ('HtGy/Royal' -> heather grey royal)."""
+    words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])", " ", c or "").lower())
+    return [_ABBR.get(w, w) for w in words if w]
+
+
+def _abbr_of(short, full):
+    """'nep' is an abbreviation of 'neptune', 'hthrd' of 'heathered', 's' of 'safety':
+    same first letter and every letter appears in order."""
+    if not short or not full or short[0] != full[0]:
+        return False
+    it = iter(full)
+    return all(ch in it for ch in short)
+
+
+def abbr_match(c, want):
+    """Same number of words and each supplier word abbreviates the wanted word —
+    SanMar's stock feed shortens names: 'Hthrd Nep Blue' = 'Heathered Neptune Blue', 'S Orange' = 'Safety Orange'."""
+    a, b = _ctoks(c), _ctoks(want)
+    return len(a) == len(b) and len(a) > 0 and all(_abbr_of(x, y) or _abbr_of(y, x) for x, y in zip(a, b))
+
+
 def _pick_colors(colors, want):
-    """Exact > same skeleton (abbreviation) > contains > skeleton contains."""
+    """Exact > same skeleton > every word abbreviates (only if unique) > contains > skeleton contains."""
     if not want:
         return sorted(colors)
     w, ws = _cn(want), _sk(want)
+    ab = [c for c in colors if abbr_match(c, want)]
     for test in (lambda c: _cn(c) == w, lambda c: _sk(c) == ws,
+                 lambda c: len(ab) == 1 and c in ab,
                  lambda c: w in _cn(c), lambda c: ws and ws in _sk(c)):
         hit = sorted(c for c in colors if test(c))
         if hit:

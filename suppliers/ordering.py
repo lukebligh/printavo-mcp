@@ -48,13 +48,26 @@ class StyleCache:
     def __init__(self):
         self.data = {}
 
-    def get(self, supplier, style):
-        key = (supplier, style.upper())
+    def get(self, supplier, style, brand=""):
+        key = (supplier, style.upper(), brand.lower() if supplier == "S&S" else "")
         if key not in self.data:
             try:
                 sd = (_st.sanmar_side(style, "") if supplier == "SanMar" else _st.ss_side(style, ""))
             except Exception as e:
                 sd = {"found": False, "error": str(e)[:150]}
+            # S&S lists one style # under several brands (Gildan 18500 + others): the brand in the
+            # Printavo description picks the right one.
+            if supplier == "S&S" and len(sd.get("styles", [])) > 1 and brand:
+                try:
+                    sd2 = _st.ss_side(style, "", brand)
+                    if sd2.get("found") and len(sd2.get("styles", [])) <= 1:
+                        sd = sd2
+                    else:
+                        keep = [x for x in sd.get("styles", []) if x.lower().startswith(brand.lower())]
+                        if len(keep) == 1:
+                            sd = _st.ss_side(style, "", keep[0][: -len(style)].strip() or brand)
+                except Exception:
+                    pass
             if supplier == "S&S" and len(sd.get("styles", [])) > 1:
                 sd = {"found": False, "error": f"ambiguous at S&S ({', '.join(sd['styles'][:3])})"}
             self.data[key] = sd
@@ -80,10 +93,14 @@ def match_line(item, cache):
         return res
     # Printavo item #s sometimes carry a suffix ("Y500_YT" = youth Y500): fall back to the base style.
     base = re.split(r"[_ ]", style)[0]
+    desc = (item.get("desc") or "")
+    brand = desc.split(" - ")[0].strip() if " - " in desc and len(desc.split(" - ")[0]) <= 30 else ""
+    youth_style = bool(re.search(r"youth|toddler|kid|infant", desc, re.I)
+                       or re.match(r"^Y", style.upper()) or re.search(r"\dY|B$|T$", style.upper()))
     for sup in ("SanMar", "S&S"):
-        sd = cache.get(sup, style)
+        sd = cache.get(sup, style, brand)
         if (not sd.get("found") or not sd.get("by")) and base and base != style:
-            sd = cache.get(sup, base)
+            sd = cache.get(sup, base, brand)
             if sd.get("found"):
                 res["style"] = base
         if not sd.get("found") or not sd.get("by"):
@@ -95,10 +112,19 @@ def match_line(item, cache):
         _st._NEED.update(need)
         clr = _st._best(picked, sd["by"])[0]
         rows = sd["by"][clr]
-        sure = _st._cn(clr) == _st._cn(color) or _st._sk(clr) == _st._sk(color)
+        sure = (_st._cn(clr) == _st._cn(color) or _st._sk(clr) == _st._sk(color)
+                or (_st.abbr_match(clr, color) and sum(1 for c in sd["by"] if _st.abbr_match(c, color)) == 1))
         cost, short, nextday = 0.0, [], True
-        # Youth items: Printavo says YM/YL, the supplier's youth style lists M/L.
-        smap = {z: (z if z in rows or not (z.startswith("Y") and z[1:] in rows) else z[1:]) for z in need}
+        smap = {}
+        for z in need:
+            if z in rows:
+                smap[z] = z
+            elif z.startswith("Y") and z[1:] in rows and youth_style:
+                smap[z] = z[1:]          # youth style lists youth sizes as S/M/L
+            elif z + "T" in rows:
+                smap[z] = z + "T"        # tall style: Printavo '3XL' = supplier '3XLT'
+            else:
+                smap[z] = z
         for z, q in need.items():
             r = rows.get(smap[z])
             if not r or r["stock"] < q:
@@ -116,6 +142,8 @@ def match_line(item, cache):
                                "sizemap": smap}
     if not res["options"]:
         res["flag"] = "neither supplier carries this style/color"
+    if not youth_style and any(z.startswith("Y") for z in need):
+        res["flag"] = "youth sizes on an adult item # — use the youth style (e.g. 18000B, PC54Y)"
     return res
 
 

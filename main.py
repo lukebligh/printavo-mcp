@@ -4222,7 +4222,7 @@ def _fetch_orders_in_status(status_name: str, field: str = "invoices") -> dict:
             totalNodes
             pageInfo { hasNextPage endCursor }
             nodes {
-                id visualId nickname startAt customerDueAt
+                id visualId nickname startAt customerDueAt invoiceAt
                 status { name }
                 contact { fullName customer { companyName } }
             }
@@ -4243,6 +4243,7 @@ def _fetch_orders_in_status(status_name: str, field: str = "invoices") -> dict:
             "company": (c.get("customer") or {}).get("companyName") or c.get("fullName") or "—",
             "prod": _parse_dt(n.get("startAt")),
             "due": _parse_dt(n.get("customerDueAt")),
+            "invoiced": _parse_dt(n.get("invoiceAt")),
             "contact": c,
             "id": n.get("id"),
             "type": field[:-1],
@@ -7879,9 +7880,16 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             ss_orders_with_po.update(_scogs.order_numbers(po))
     except Exception as e:
         print(f"[ORDER] S&S PO list failed: {e}", flush=True)
-    needs, tag_skipped = [], []
+    needs, tag_skipped, stale = [], [], []
+    old_cut = today - timedelta(days=ORDER_MAX_AGE_DAYS)
     for o in queue:
         vid = str(o["vid"])
+        # Supplier PO history only reaches back ~6 months, so an old order stuck in an open status
+        # looks un-ordered. Never propose those — list them so the status gets cleaned up.
+        dates = [d.date() for d in (o.get("invoiced"), o.get("due"), o.get("prod")) if d]
+        if dates and max(dates) < old_cut:
+            stale.append(f"#{vid} {o['nick']} [{o['status']}]")
+            continue
         try:
             if _sanmar.find_pos(vid) or vid in ss_orders_with_po:
                 continue                                  # already ordered
@@ -7934,11 +7942,13 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             print(f"[ORDER] duplicate check: {e}", flush=True)
     result["queue"] = len(needs)
     result["tag_skipped"] = tag_skipped
+    result["stale"] = stale
     return result
 
 
 # Direct orders whose blanks are customer-supplied or come from another vendor: tag them in Printavo
 # with #nogoods and auto-ordering never touches them (Luke, Nov 10).
+ORDER_MAX_AGE_DAYS = int(os.environ.get("ORDER_MAX_AGE_DAYS", "60"))
 ORDER_SKIP_TAGS = {t.strip().lower().lstrip("#") for t in os.environ.get("ORDER_SKIP_TAGS", "nogoods").split(",")
                    if t.strip()}
 
@@ -7952,7 +7962,10 @@ def _order_has_skip_tag(internal_id, otype="invoice") -> bool:
 
 def _order_skip_note(r) -> str:
     sk = r.get("tag_skipped") or []
-    return ("\n_Skipped — tagged #nogoods: " + ", ".join(f"#{v}" for v in sk) + "_") if sk else ""
+    st = r.get("stale") or []
+    old = ("\n_Old orders still in an open status (not ordering — close them out in Printavo): "
+           + ", ".join(st[:15]) + "_") if st else ""
+    return old + (("\n_Skipped — tagged #nogoods: " + ", ".join(f"#{v}" for v in sk) + "_") if sk else "")
 
 
 @mcp.tool()

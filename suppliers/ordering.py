@@ -199,8 +199,8 @@ def ok(l, s):
 
 # SanMar is the preferred vendor (Luke, Nov 16). An order moves to S&S on price only when S&S can fill
 # ALL of it (single source) and saves at least this much — never line by line for pennies.
-PRICE_MOVE_MIN = 75.0
-PRICE_MOVE_PCT = 0.10
+PRICE_MOVE_MIN = 0.01          # Luke, Nov 16: the threshold is 8% of the order, no dollar floor
+PRICE_MOVE_PCT = 0.08
 
 # SanMar quote thresholds (Susan Maley, via Luke Nov 16): same piece across sizes at or over these
 # quantities -> Mechelle requests a quote; the bot does not place it.

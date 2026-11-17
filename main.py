@@ -9120,13 +9120,13 @@ def order_rules_lookback(days: int = 56) -> str:
                 n_cmp += 1
                 a = sum(l["options"]["SanMar"]["cost"] for l in lines)
                 b = sum(l["options"]["S&S"]["cost"] for l in lines)
-                if a and (a - b) / a >= _ordering.PRICE_MOVE_PCT:
+                if a and (a - b) >= max(_ordering.PRICE_MOVE_MIN, _ordering.PRICE_MOVE_PCT * a):
                     moves.append((a - b, f"#{vid} {o['nick'][:35]} — SanMar ${a:,.2f} vs S&S ${b:,.2f} · "
                                          f"saves ${a - b:,.2f} ({(a - b) / a:.0%})"))
     out = [f"RULES LOOK-BACK · {start} → {end} · {n_ok} direct orders checked",
            f"\n== Would be held for a SanMar QUOTE: {len(quotes)} =="] + ["  " + x for x in quotes]
     out += [f"\n== Close (60%+ of a threshold, not held): {len(near)} =="] + ["  " + x for x in near]
-    out += [f"\n== Would move WHOLE to S&S at {_ordering.PRICE_MOVE_PCT:.0%}+ savings: {len(moves)} of {n_cmp} orders "
+    out += [f"\n== Would move WHOLE to S&S at {_ordering.PRICE_MOVE_PCT:.0%}+ and ${_ordering.PRICE_MOVE_MIN:.0f}+ savings: {len(moves)} of {n_cmp} orders "
             f"both suppliers can fill today · total savings ${sum(m[0] for m in moves):,.2f} =="]
     out += ["  " + m[1] for m in sorted(moves, reverse=True)]
     return "\n".join(out)

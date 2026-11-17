@@ -9035,6 +9035,66 @@ def order_backtest(days: int = 56, max_orders: int = 250) -> str:
 
 
 @mcp.tool()
+def order_rules_lookback(days: int = 56) -> str:
+    """READ-ONLY, posts nothing. Over the direct orders SanMar / S&S invoiced in the last `days` days:
+    (1) which would have been held for a SanMar QUOTE under the quantity thresholds, and
+    (2) which would have moved WHOLE to S&S under the 8% price rule (today's prices and stock)."""
+    end = _central_now().date()
+    start = end - timedelta(days=days)
+    invs = []
+    for fn in (_sanmar.normalized_invoices, _ss.invoices_by_date):
+        try:
+            invs += fn(start.isoformat(), end.isoformat())
+        except Exception as e:
+            print(f"[ORDER] rules lookback: {e}", flush=True)
+    vids = sorted({n for inv in invs for n in _scogs.order_numbers(inv["po"])}, key=int)
+    cache = _ordering.StyleCache()
+    quotes, moves, near, n_ok, n_cmp = [], [], [], 0, 0
+    with _stock._LOCK:
+        for vid in vids:
+            try:
+                o = _bt_order(vid)
+            except Exception:
+                o = None
+            if not o or _cogs_is_contract_customer({"contact": o["contact"]}):
+                continue
+            lines = [m for m in (_ordering.match_line(it, cache) for it in o["items"]) if m and not m["flag"]]
+            if not lines:
+                continue
+            n_ok += 1
+            tot = {}
+            for l in lines:
+                sm = l["options"].get("SanMar")
+                if not sm:
+                    continue
+                pcs = sum(l["need"].values())
+                unit = (sm["cost"] / max(1, sum(q for z, q in l["need"].items() if z not in sm["short"]))) if sm["cost"] else 0
+                t = tot.setdefault(l["style"], {"pcs": 0, "th": _ordering.quote_threshold(l, unit), "unit": unit,
+                                               "desc": l.get("desc", "")[:40]})
+                t["pcs"] += pcs
+            for st, t in tot.items():
+                if t["th"] and t["pcs"] >= t["th"][0]:
+                    quotes.append(f"#{vid} {o['nick'][:35]} — {t['pcs']} × {st} ({t['desc']}) · ${t['unit']:.2f} ea · "
+                                  f"threshold {t['th'][0]} ({t['th'][1]})")
+                elif t["th"] and t["pcs"] >= 0.6 * t["th"][0]:
+                    near.append(f"#{vid} — {t['pcs']} × {st} · threshold {t['th'][0]} ({t['th'][1]})")
+            if all(_ordering.ok(l, "SanMar") for l in lines) and all(_ordering.ok(l, "S&S") for l in lines):
+                n_cmp += 1
+                a = sum(l["options"]["SanMar"]["cost"] for l in lines)
+                b = sum(l["options"]["S&S"]["cost"] for l in lines)
+                if a and (a - b) / a >= _ordering.PRICE_MOVE_PCT:
+                    moves.append((a - b, f"#{vid} {o['nick'][:35]} — SanMar ${a:,.2f} vs S&S ${b:,.2f} · "
+                                         f"saves ${a - b:,.2f} ({(a - b) / a:.0%})"))
+    out = [f"RULES LOOK-BACK · {start} → {end} · {n_ok} direct orders checked",
+           f"\n== Would be held for a SanMar QUOTE: {len(quotes)} =="] + ["  " + x for x in quotes]
+    out += [f"\n== Close (60%+ of a threshold, not held): {len(near)} =="] + ["  " + x for x in near]
+    out += [f"\n== Would move WHOLE to S&S at {_ordering.PRICE_MOVE_PCT:.0%}+ savings: {len(moves)} of {n_cmp} orders "
+            f"both suppliers can fill today · total savings ${sum(m[0] for m in moves):,.2f} =="]
+    out += ["  " + m[1] for m in sorted(moves, reverse=True)]
+    return "\n".join(out)
+
+
+@mcp.tool()
 def order_build_post(supplier: str = "SanMar") -> str:
     """Run a blank-ordering build NOW for one supplier ("SanMar" or "S&S") and post it to #goods-orders
     for ✅ approval. In ORDER_MODE=test an approved post goes to SanMar's TEST system / S&S test orders —

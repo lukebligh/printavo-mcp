@@ -8267,6 +8267,12 @@ def _order_submit(ts, p) -> tuple:
                 else:
                     env = "edev"
                 pre = _sanmar.po_call("getPreSubmitInfo", po_num, lines, env=env, email="sales@estmerch.com")
+                if not pre["ok"] and "inventory key" in ((pre["message"] or "") + " ".join(
+                        d["message"] or "" for d in pre["lines"])).lower():
+                    # SanMar didn't recognise a part ID (seen on its test system for newer styles):
+                    # send style / color / size instead, which SanMar also accepts.
+                    lines = [{k: v for k, v in l.items() if k not in ("inventoryKey", "sizeIndex")} for l in lines]
+                    pre = _sanmar.po_call("getPreSubmitInfo", po_num, lines, env=env, email="sales@estmerch.com")
                 if not pre["ok"]:
                     raise RuntimeError("stock check failed: " + (pre["message"] or "") + " " + "; ".join(
                         f"{d['style']} {d['color']} {d['size']}: {d['message']}" for d in pre["lines"] if d["message"]))

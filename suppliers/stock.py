@@ -48,7 +48,7 @@ _ABBR = {"dp": "deep", "for": "forest", "ht": "heather", "htr": "heather", "hthr
 
 def _cn(c):
     """Normalize a color: split SanMar camelCase ('HthrNavy'), expand abbreviations."""
-    words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])", " ", c or "").lower())
+    words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", c or "").lower())
     return "".join(_ABBR.get(w, w) for w in words if w)
 
 
@@ -61,7 +61,7 @@ def _sk(c):
 
 def _ctoks(c):
     """Color -> word tokens: camelCase and '/' split, abbreviations expanded ('HtGy/Royal' -> heather grey royal)."""
-    words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])", " ", c or "").lower())
+    words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", c or "").lower())
     return [_ABBR.get(w, w) for w in words if w]
 
 

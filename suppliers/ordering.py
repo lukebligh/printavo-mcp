@@ -313,7 +313,8 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
         # S&S is involved (Luke, Nov 16: #7497 is a SanMar order, keep it off the S&S post).
         inv = set(asg) | {("SanMar" if "SanMar" in l["options"] else "S&S") for l in o["lines"]
                           if l and not l["flag"] and not ok(l, "SanMar") and not ok(l, "S&S")}
-        show = (not supplier_filter) or (supplier_filter in inv) or (not inv and supplier_filter == "SanMar")
+        home = "SanMar" if ("SanMar" in inv or not inv) else "S&S"       # one home post per held order
+        show = (not supplier_filter) or supplier_filter == home
         if holds:
             if not show:
                 continue

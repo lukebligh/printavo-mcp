@@ -7842,11 +7842,32 @@ def _status_is_promo(name) -> bool:
 
 
 
-def _printavo_items_by_id(internal_id: str, otype: str = "invoice") -> list:
-    time.sleep(PAGE_DELAY_S)
-    r = query_printavo(f'''query {{ o: {otype}(id: "{internal_id}") {{
+def _printavo_items_by_id(internal_id: str, otype: str = "invoice", strict: bool = False) -> list:
+    r = {}
+    for attempt in range(3 if strict else 1):
+        time.sleep(PAGE_DELAY_S + attempt * 2)
+        r = _printavo_items_query(internal_id, otype)
+        if "error" not in r:
+            break
+    if "error" in r and strict:
+        # Never treat "Printavo didn't answer" as "this order has no garments" (Nov 16: an order vanished
+        # from a post that way).
+        raise RuntimeError(str(r["error"])[:120])
+    if strict and not r.get("o"):
+        time.sleep(PAGE_DELAY_S)
+        r = _printavo_items_query(internal_id, "quote" if otype == "invoice" else "invoice")
+        if "error" in r or not r.get("o"):
+            raise RuntimeError("order not returned by Printavo")
+    return _printavo_items_parse(r)
+
+
+def _printavo_items_query(internal_id, otype):
+    return query_printavo(f'''query {{ o: {otype}(id: "{internal_id}") {{
         lineItemGroups(first: 25) {{ nodes {{ lineItems(first: 50) {{ nodes {{
             itemNumber description color sizes {{ size count }} }} }} }} }} }} }}''')
+
+
+def _printavo_items_parse(r):
     out = []
     for g in ((r.get("o") or {}).get("lineItemGroups") or {}).get("nodes") or []:
         for li in (g.get("lineItems") or {}).get("nodes") or []:
@@ -7913,11 +7934,16 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
         _goods_json_save("order_first_seen.json",
                          {k: v for k, v in seen.items() if k in live or v >= cutoff})
     cache = _ordering.StyleCache()
-    orders = []
+    orders, unread = [], []
     with _stock._LOCK:
         for o in needs:
-            items = (_printavo_items_by_id(o["id"], o.get("type", "invoice")) if o.get("id")
-                     else _printavo_order_items(o["vid"]))
+            try:
+                items = (_printavo_items_by_id(o["id"], o.get("type", "invoice"), strict=True) if o.get("id")
+                         else _printavo_order_items(o["vid"]))
+            except Exception as e:
+                unread.append(f"#{o['vid']}")
+                print(f"[ORDER] couldn't read #{o['vid']}: {e}", flush=True)
+                continue
             lines = [m for m in (_ordering.match_line(i, cache) for i in items) if m]
             if not lines:
                 continue
@@ -7945,6 +7971,7 @@ def _order_build_impl(supplier_filter: str = "", record_seen: bool = True) -> di
             print(f"[ORDER] duplicate check: {e}", flush=True)
     result["queue"] = len(needs)
     result["tag_skipped"] = tag_skipped
+    result["unread"] = unread
     result["stuck"] = [f"#{o['vid']} {o['nick']} [{o['status']}] — approved {first_seen[str(o['vid'])]:%a %-m/%-d}"
                        for o in needs if _ordering.bdays_between(first_seen[str(o["vid"])], today) >= 5]
     result["stale"] = stale
@@ -7970,6 +7997,10 @@ def _order_skip_note(r) -> str:
     st = r.get("stale") or []
     old = ("\n_Old orders still in an open status (not ordering — close them out in Printavo): "
            + ", ".join(st[:15]) + "_") if st else ""
+    ur = r.get("unread") or []
+    if ur:
+        old = ("\n⚠ *Couldn't read " + ", ".join(ur) + " from Printavo just now — NOT on this list.* "
+               "It will be on the next post.") + old
     return old + (("\n_Skipped — tagged #nogoods: " + ", ".join(f"#{v}" for v in sk) + "_") if sk else "")
 
 
@@ -8665,6 +8696,7 @@ def _order_poll_once():
             sups = sorted({p["supplier"] for p in props.values() if p.get("created", "")[:10] == today_s}) or ["SanMar"]
             for s_ in sups:
                 try:
+                    time.sleep(8)
                     _order_post_build(s_, record_seen=False)
                 except Exception as e:
                     _ord_post(f"⚠️ Couldn't repost the {s_} list: {str(e)[:200]}")

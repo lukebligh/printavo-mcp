@@ -9164,6 +9164,94 @@ def order_rules_lookback(days: int = 56) -> str:
     return "\n".join(out)
 
 
+@mcp.tool()
+def order_supplier_lookback(days: int = 56) -> str:
+    """READ-ONLY, posts nothing. WHO we bought from vs who the bot would pick. For every direct order
+    SanMar / S&S invoiced in the last `days` days: the supplier each style was actually bought from
+    (by hand) next to the supplier the bot's rules choose today (SanMar preferred; whole order to S&S
+    at 8% and $50; line to S&S only if SanMar can't). Today's prices; stock ignored when short today."""
+    from collections import defaultdict
+    end = _central_now().date()
+    start = end - timedelta(days=days)
+    invs = []
+    for fn in (_sanmar.normalized_invoices, _ss.invoices_by_date):
+        try:
+            invs += fn(start.isoformat(), end.isoformat())
+        except Exception as e:
+            print(f"[ORDER] supplier lookback: {e}", flush=True)
+    bought = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))     # vid -> supplier style -> vendor -> pcs
+    multi = set()
+    for inv in invs:
+        nums = _scogs.order_numbers(inv["po"])
+        if len(nums) > 1:
+            multi.update(nums)
+        for n_ in nums:
+            for li in inv["lines"]:
+                bought[n_][li["style"]][inv["vendor"]] += li["qty"]
+    cache = _ordering.StyleCache()
+    same, diff, part, skipped = [], [], [], 0
+    tally = defaultdict(int)
+    with _stock._LOCK:
+        for vid in sorted(bought, key=int):
+            try:
+                o = _bt_order(vid)
+            except Exception:
+                o = None
+            if not o or _cogs_is_contract_customer({"contact": o["contact"]}):
+                skipped += 1
+                continue
+            lines = [m for m in (_ordering.match_line(it, cache) for it in o["items"]) if m and not m["flag"]]
+            if not lines:
+                skipped += 1
+                continue
+            asg, _bh, holds, notes = _ordering.choose(lines)
+            pick, note = {}, "; ".join(notes)
+            if holds:
+                note = "short today — stock ignored"
+                for l in lines:
+                    ops = l["options"]
+                    pick[id(l)] = "SanMar" if ops.get("SanMar") and ops["SanMar"]["sure"] else ("S&S" if ops.get("S&S") else "")
+            else:
+                for sup, ls in asg.items():
+                    for l, _op in ls:
+                        pick[id(l)] = sup
+            rows, agree, n_cmp = [], True, 0
+            for l in lines:
+                bot = pick.get(id(l), "")
+                names = {l["style"]} | {op.get("style") or "" for op in l["options"].values()}
+                act = defaultdict(float)
+                for st, vend in bought[vid].items():
+                    if any(nm and _scogs._style_match(st, nm) for nm in names):
+                        for v, q in vend.items():
+                            act[v] += q
+                if not act or not bot:
+                    continue
+                n_cmp += 1
+                who = " + ".join(sorted(act))
+                tally[(who, bot)] += 1
+                if who != bot:
+                    agree = False
+                    both = "both carry it" if len(l["options"]) == 2 else f"only {next(iter(l['options']))} carries it"
+                    a_, b_ = l["options"].get("SanMar"), l["options"].get("S&S")
+                    price = (f" · today SanMar ${a_['cost']:,.2f} vs S&S ${b_['cost']:,.2f}"
+                             if a_ and b_ and not a_["short"] and not b_["short"] else "")
+                    rows.append(f"{l['style']} {l['color']} ({sum(l['need'].values())} pcs): bought {who} → bot {bot} · {both}{price}")
+            if not n_cmp:
+                skipped += 1
+                continue
+            head = f"#{vid} {o['nick'][:38]}" + (" (shared PO)" if vid in multi else "") + (f" — {note}" if note else "")
+            if agree:
+                same.append(head)
+            else:
+                diff.append(head + "\n      " + "\n      ".join(rows))
+    out = [f"SUPPLIER LOOK-BACK · {start} → {end} · {len(same) + len(diff)} direct orders compared ({skipped} skipped)",
+           f"Same supplier the bot would pick: {len(same)} · Different: {len(diff)}",
+           "\nLine tally (bought → bot): " + " · ".join(f"{a} → {b}: {n}" for (a, b), n in sorted(tally.items(), key=lambda x: -x[1])),
+           f"\n== DIFFERENT: {len(diff)} =="] + ["  " + x for x in diff]
+    out += [f"\n== SAME: {len(same)} =="] + ["  " + ", ".join(x.split(' ')[0] for x in same)]
+    return "\n".join(out)
+
+
 _HOUSE = ("port authority", "port & company", "port and company", "sport-tek", "sport tek", "district",
           "cornerstone", "mercer+mettle", "mercer mettle", "volunteer knitwear", "allmade")
 

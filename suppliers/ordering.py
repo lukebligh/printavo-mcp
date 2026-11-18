@@ -137,16 +137,29 @@ def match_line(item, cache):
     brand = desc.split(" - ")[0].strip() if " - " in desc and len(desc.split(" - ")[0]) <= 30 else ""
     youth_style = bool(re.search(r"youth|toddler|kid|infant", desc, re.I)
                        or re.match(r"^Y", style.upper()) or re.search(r"\dY|B$|T$", style.upper()))
+    # No brand on the line ("3001Y — YOUTH Jersey Tee"): let S&S name the brand, so SanMar's prefixed
+    # number (BC3001Y / NL6210) can still be found.
+    sm_brand = brand
+    if not _st.SM_PREFIX.get(_st._bn(brand)) and re.match(r"^\d", style):
+        for cand in dict.fromkeys([style, base] + ([style[:-1]] if re.search(r"\d[A-Z]*[MR]$", style.upper())
+                                                  and len(style) > 3 else [])):
+            ss0 = cache.get("S&S", cand, brand)
+            if ss0.get("found") and len(ss0.get("styles") or []) == 1:
+                b2 = ss0["styles"][0].rsplit(" ", 1)[0]
+                if _st.SM_PREFIX.get(_st._bn(b2)):
+                    sm_brand = b2
+                break
     for sup in ("SanMar", "S&S"):
-        sd = cache.get(sup, style, brand)
+        _b = sm_brand if sup == "SanMar" else brand
+        sd = cache.get(sup, style, _b)
         used = style
         if (not sd.get("found") or not sd.get("by")) and base and base != style:
-            sd = cache.get(sup, base, brand)
+            sd = cache.get(sup, base, _b)
             if sd.get("found"):
                 res["style"] = base
                 used = base
         if (not sd.get("found") or not sd.get("by")) and re.search(r"\d[A-Z]*[MR]$", style.upper()) and len(style) > 3:
-            sd2 = cache.get(sup, style[:-1], brand)
+            sd2 = cache.get(sup, style[:-1], _b)
             if sd2.get("found") and sd2.get("by"):
                 sd = sd2
                 res["style"] = style[:-1]

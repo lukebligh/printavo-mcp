@@ -741,6 +741,7 @@ def get_order_details(visual_id: str) -> str:
         f"  PO #:           {inv.get('visualPoNumber', '')}",
         f"  Customer Due:   {inv.get('customerDueAt', '')}",
         f"  Production Date:{(inv.get('dueAt') or inv.get('startAt') or '')[:10]}",
+        f"  Calendar block: {inv.get('startAt')} → {inv.get('dueAt')}",
         f"  Invoice Date:   {inv.get('invoiceAt', '')}",
         f"  Internal ID:    {inv.get('id')}",
     ]
@@ -1589,12 +1590,12 @@ def update_invoice_fields(
         }
     else:
         mutation = f"""
-        mutation($id: ID!, $nickname: String, $visualPoNumber: String, $startAt: ISO8601DateTime, $customerDueAt: ISO8601Date, $invoiceAt: ISO8601Date) {{
+        mutation($id: ID!, $nickname: String, $visualPoNumber: String, $startAt: ISO8601DateTime, $customerDueAt: ISO8601Date, $invoiceAt: ISO8601Date, $paymentDueAt: ISO8601Date) {{
             {update_field}(id: $id, input: {{
                 nickname: $nickname, visualPoNumber: $visualPoNumber,
-                startAt: $startAt, customerDueAt: $customerDueAt, invoiceAt: $invoiceAt
+                startAt: $startAt, customerDueAt: $customerDueAt, invoiceAt: $invoiceAt, paymentDueAt: $paymentDueAt
             }}) {{
-                id visualId nickname visualPoNumber customerDueAt startAt invoiceAt
+                id visualId nickname visualPoNumber customerDueAt startAt dueAt invoiceAt paymentDueAt
             }}
         }}
         """
@@ -1604,10 +1605,18 @@ def update_invoice_fields(
             "invoiceAt": invoice_date,
         }
     result = query_printavo(mutation, variables)
+    pay_note = ""
+    if "error" in result and order_type != "quote" and "payment due date" in str(result["error"]).lower():
+        # Printavo won't take an invoice date later than the payment due date — move that with it.
+        variables["paymentDueAt"] = invoice_date
+        result = query_printavo(mutation, variables)
+        pay_note = f"\n  Payment Due Date:  moved to {invoice_date} (Printavo requires it on or after the invoice date)"
     if "error" in result:
         return f"API Error: {result['error']}"
     inv = result.get(update_field, {})
-    block_note = ""
+    block_note = pay_note
+    if order_type != "quote":
+        block_note += f"\n  Calendar block:    {inv.get('startAt')} → {inv.get('dueAt')}"
     if order_type == "quote":
         # The calendar draws an order from startAt to dueAt. A quote's startAt was
         # never written, so a new quote stretched from a stale start to the
@@ -1633,7 +1642,7 @@ def update_invoice_fields(
                 block_note = f"\n  Calendar block:    {b.get('startAt')} → {b.get('dueAt')}"
         except Exception as e:
             block_note = f"\n  ⚠ Calendar block not set: {e}"
-    prod_date = (inv.get('dueAt') or inv.get('startAt') or '')[:10]
+    prod_date = ((inv.get('dueAt') if order_type == 'quote' else inv.get('startAt')) or inv.get('dueAt') or inv.get('startAt') or '')[:10]
     return (
         f"Order #{inv.get('visualId')} header updated!\n"
         f"  Nickname:          {inv.get('nickname')}\n"

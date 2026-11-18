@@ -8399,6 +8399,10 @@ def _ord_verb(t):
         return "release_shorts"
     if re.search(r"\bquoted?\b.*\b(done|approved|ok|okay|received|in)\b", t):
         return "release_quote"
+    if re.match(r"^\s*move\b", t) and re.search(r"\b(back|sanmar)\b", t):
+        return "move_back"
+    if re.match(r"^\s*move\b", t) and re.search(r"s\s*(&|&amp;|and|n)?\s*s\b", t):
+        return "move_ss"
     if re.match(r"^\s*unskip\b", t) or re.search(r"\badd\b.*\bback\b", t):
         return "unskip"
     if re.match(r"^\s*(unadd|undo add)\b", t):
@@ -8473,21 +8477,25 @@ def _ord_handle_msg(m, props, now, only_ts=None) -> bool:
     if m["user"] not in ORDER_APPROVERS:
         _ord_post(f"Only {', '.join(ORDER_APPROVERS.values())} can change an order.", thread_ts=reply_ts)
         return False
-    if verb in ("release_shorts", "release_quote"):
+    if verb in ("release_shorts", "release_quote", "move_ss", "move_back"):
         vids = re.findall(r"(?<!\d)(\d{4,6})(?!\d)", re.sub(r"\*?sent using\*?\s+\S+", " ", t.lower()))
         if not vids:
-            _ord_post("Which order? e.g. `approve shorts #7497` or `quote done #7500`.", thread_ts=reply_ts)
+            _ord_post("Which order? e.g. `approve shorts #7497`, `quote done #7500` or `move #7500 to S&S`.", thread_ts=reply_ts)
             return True
         rel = _goods_json("order_releases.json", {})
         cutoff = (now - timedelta(days=21)).isoformat()
         rel = {k: v for k, v in rel.items() if v.get("at", "") >= cutoff}
-        key = "shorts" if verb == "release_shorts" else "quote"
+        key = {"release_shorts": "shorts", "release_quote": "quote"}.get(verb, "to_ss")
         for v in vids:
-            rel.setdefault(v, {}).update({key: True, "at": now.isoformat(), "by": ORDER_APPROVERS[m["user"]]})
+            val = True if key != "to_ss" else (now.date().isoformat() if verb == "move_ss" else "")
+            rel.setdefault(v, {}).update({key: val, "at": now.isoformat(), "by": ORDER_APPROVERS[m["user"]]})
         _goods_json_save("order_releases.json", rel)
         _goods_json_save("order_rebuild.json", {"at": now.isoformat()})
         what = ("approved with shorts — the short pieces will NOT be ordered" if key == "shorts"
-                else "quote handled — cleared to order")
+                else "quote handled — cleared to order" if key == "quote"
+                else "moving to S&S for today — it comes off the SanMar post and goes on the 2:15 S&S post with the "
+                     "orders that were holding (if S&S can still fill it at the same price or less)" if verb == "move_ss"
+                else "back to SanMar")
         _ord_post(f"👍 Got it, {ORDER_APPROVERS[m['user']]} — " + ", ".join("#" + v for v in vids)
                   + f" {what}. Reposting the order list now (about a minute).", thread_ts=reply_ts)
         return True

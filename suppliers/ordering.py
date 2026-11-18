@@ -334,11 +334,18 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
     """orders: [{vid, nick, company, due, lines: [match_line results]}]
     -> {"pos", "held", "attention" [(order, [texts])], "flagged" [(order, line, why)]}"""
     releases = releases or {}
-    by_sup = {}
+    by_sup, all_sup = {}, {}
     flagged, attention = [], []
     for o in orders:
         rel = releases.get(str(o["vid"])) or {}
         asg, byhand, holds, notes = choose(o["lines"], release_shorts=bool(rel.get("shorts")))
+        moved = False
+        if (rel.get("to_ss") == today.isoformat() and not holds and set(asg) == {"SanMar"}
+                and all(ok(l, "S&S") for l, _o in asg["SanMar"])):
+            asg = {"S&S": [(l, l["options"]["S&S"]) for l, _o in asg["SanMar"]]}
+            notes = notes + [f"moved to S&S today by {rel.get('by') or 'an approver'} — ships with the S&S orders "
+                             f"that were holding (`move #{o['vid']} back` to undo)"]
+            moved = True
         if o.get("promo"):
             byhand = []                        # promo items are ordered through the promo flow
         for l, why in byhand:
@@ -376,13 +383,16 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
             continue
         first = True
         for s, lines in asg.items():
+            part = {"order": o, "lines": lines, "total": round(sum(x[1]["cost"] for x in lines), 2),
+                    "notes": list(notes), "byhand": byhand if first else [], "moved": moved,
+                    "solo": len(asg) == 1,
+                    "elsewhere": [f"{len(v)} line(s) on the {k} post" for k, v in asg.items() if k != s]}
+            all_sup.setdefault(s, []).append(part)
             if supplier_filter and s != supplier_filter:
                 continue
-            part = {"order": o, "lines": lines, "total": round(sum(x[1]["cost"] for x in lines), 2),
-                    "notes": notes, "byhand": byhand if first else [],
-                    "elsewhere": [f"{len(v)} line(s) on the {k} post" for k, v in asg.items() if k != s]}
             first = False
             by_sup.setdefault(s, []).append(part)
+    _ss_hold_option(all_sup)
     pos, held = [], []
     for s, parts in by_sup.items():
         own = [p for p in parts if p["total"] >= FREE_FREIGHT]
@@ -402,12 +412,15 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
             p["age"], p["reason"] = age, (f"waited {age} business days" if age >= MAX_WAIT_BDAYS else None)
             if p["reason"]:
                 due.append(p)
+        # an order an approver moved to S&S today takes the whole waiting pool with it
+        if any(p.get("moved") for p in own):
+            due = list(pool)
         if not due:
             for p in pool:
                 held.append((s, p, f"day {p['age']} of {MAX_WAIT_BDAYS}" + _due_warn(p["order"], today)))
             continue
         if own:
-            host = max(own, key=lambda p: p["total"])
+            host = max(own, key=lambda p: (bool(p.get("moved")), p["total"]))
             for po in pos:
                 if po["parts"][0] is host:
                     po["parts"] += due
@@ -434,6 +447,39 @@ def plan(orders, today, first_seen, supplier_filter=None, releases=None):
         po["total"] = round(sum(p["total"] for p in po["parts"]), 2)
         po["po_number"] = po_number(po)
     return {"pos": pos, "held": held, "flagged": flagged, "attention": attention, "other": []}
+
+
+def _ss_hold_option(all_sup):
+    """Luke, Nov 18: a small S&S order is waiting for free freight and a SanMar order could ship from S&S
+    at the same price or less -> OFFER (never do) moving it, so both ship today on one free-freight PO.
+    The approver replies `move #N to S&S`; otherwise it stays SanMar and tomorrow's post re-works it."""
+    ss = all_sup.get("S&S") or []
+    pool = [p for p in ss if p["total"] < FREE_FREIGHT and not p.get("moved")]
+    pool_total = sum(p["total"] for p in pool)
+    if not pool or pool_total >= FREE_FREIGHT or any(p.get("moved") for p in ss):
+        return
+    sm = all_sup.get("SanMar") or []
+    sm_own = [p for p in sm if p["total"] >= FREE_FREIGHT]
+    sm_pool = [p for p in sm if p["total"] < FREE_FREIGHT]
+    sm_pool_total = sum(p["total"] for p in sm_pool)
+    waiting = ", ".join(f"#{p['order']['vid']}" for p in pool)
+    for p in sm:
+        if not p.get("solo") or not all(ok(l, "S&S") for l, _o in p["lines"]):
+            continue
+        a = p["total"]
+        b = round(sum(l["options"]["S&S"]["cost"] for l, _o in p["lines"]), 2)
+        if b > a + 0.005 or b + pool_total < FREE_FREIGHT:
+            continue
+        # don't strand what's left at SanMar under the free-freight line
+        if p in sm_own:
+            pass
+        elif sm_pool_total >= FREE_FREIGHT and sm_pool_total - a < FREE_FREIGHT and len(sm_pool) > 1:
+            continue
+        p["notes"].append(f"💡 option: reply `move #{p['order']['vid']} to S&S` — S&S has {waiting} holding "
+                          f"(${pool_total:,.2f}); this order ships from S&S "
+                          + (f"for ${a - b:,.2f} less" if a - b >= 0.01 else "at the same price")
+                          + " and they all go out today on one free-freight PO (2:15 S&S post). "
+                            "Or just ✅ to keep it at SanMar.")
 
 
 MAX_ORDERS_PER_PO = 5

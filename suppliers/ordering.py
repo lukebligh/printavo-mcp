@@ -317,6 +317,16 @@ def choose(order_lines, release_shorts=False):
                 holds.append(f"COLOR CHECK · {l['style']} — Printavo '{l['color']}' ≈ supplier '{o['color']}'. "
                              "Fix the color in Printavo." if not o["sure"]
                              else f"NO PRICE · {l['style']} {l['color']} — supplier returned no price")
+    # One supplier, one shipment (Luke, Nov 18): when part of the order has to come from S&S anyway and
+    # S&S can fill the rest at the same price or less, the WHOLE order goes to S&S.
+    if not holds and asg.get("SanMar") and asg.get("S&S") and all(ok(l, "S&S") for l, _o in asg["SanMar"]):
+        a = sum(o["cost"] for _l, o in asg["SanMar"])
+        b = sum(l["options"]["S&S"]["cost"] for l, _o in asg["SanMar"])
+        if b <= a + 0.005:
+            n_ss = len(asg["S&S"])
+            asg = {"S&S": asg["S&S"] + [(l, l["options"]["S&S"]) for l, _o in asg["SanMar"]]}
+            notes.append(f"whole order at S&S — one shipment ({n_ss} line(s) only S&S can fill"
+                         + (f"; saves ${a - b:,.2f}" if a - b >= 0.01 else "; same price") + ")")
     return asg, byhand, holds, notes
 
 

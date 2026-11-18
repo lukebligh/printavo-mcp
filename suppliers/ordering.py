@@ -229,7 +229,7 @@ def quote_threshold(line, unit):
 
 def _short_detail(l):
     """Only the sizes the best supplier can't cover: need vs have. SanMar first. The other supplier is
-    mentioned only when it actually has some of that size — never when it has none or doesn't carry it."""
+    mentioned whenever it carries the item (even at 0) — never when it doesn't carry it."""
     opts = l["options"]
     cands = [s for s in ("SanMar", "S&S") if opts.get(s) and opts[s]["short"]]
     if not cands:
@@ -240,9 +240,8 @@ def _short_detail(l):
     for z in sorted(opts[prim]["short"], key=lambda z: (_st._ORDER.index(z) if z in _st._ORDER else 99, z)):
         need, have = l["need"][z], opts[prim]["stock"].get(z, 0)
         t = f"{z}: need {need}, {prim} has {have} ({need - have} short)"
-        o2 = (opts.get(other) or {}).get("stock", {}).get(z, 0) if opts.get(other) else 0
-        if o2:
-            t += f", {other} has {o2}"
+        if opts.get(other):                      # the other supplier carries it: say what it has, even 0
+            t += f", {other} has {opts[other]['stock'].get(z, 0)}"
         bits.append(t)
     return "; ".join(bits)
 

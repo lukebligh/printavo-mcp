@@ -74,12 +74,22 @@ class StyleCache:
         self.data = {}
 
     def get(self, supplier, style, brand=""):
-        key = (supplier, style.upper(), brand.lower() if supplier == "S&S" else "")
+        key = (supplier, style.upper(), brand.lower())
         if key not in self.data:
             try:
                 sd = (_st.sanmar_side(style, "") if supplier == "SanMar" else _st.ss_side(style, ""))
             except Exception as e:
                 sd = {"found": False, "error": str(e)[:150]}
+            # Printavo has S&S's bare number ("3001", "6210"): SanMar lists it with a brand prefix (BC3001, NL6210).
+            pre = _st.SM_PREFIX.get(_st._bn(brand))
+            if supplier == "SanMar" and pre and not sd.get("found") and not sd.get("error") \
+                    and re.match(r"^\d", style) and not style.upper().startswith(pre):
+                try:
+                    sd2 = _st.sanmar_side(pre + style, "")
+                    if sd2.get("found") and sd2.get("by"):
+                        sd = dict(sd2, style_used=(pre + style).upper())
+                except Exception:
+                    pass
             # S&S lists one style # under several brands (Gildan 18500 + others): the brand in the
             # Printavo description picks the right one.
             if sd.get("error"):
@@ -129,15 +139,18 @@ def match_line(item, cache):
                        or re.match(r"^Y", style.upper()) or re.search(r"\dY|B$|T$", style.upper()))
     for sup in ("SanMar", "S&S"):
         sd = cache.get(sup, style, brand)
+        used = style
         if (not sd.get("found") or not sd.get("by")) and base and base != style:
             sd = cache.get(sup, base, brand)
             if sd.get("found"):
                 res["style"] = base
+                used = base
         if (not sd.get("found") or not sd.get("by")) and re.search(r"\d[A-Z]*[MR]$", style.upper()) and len(style) > 3:
             sd2 = cache.get(sup, style[:-1], brand)
             if sd2.get("found") and sd2.get("by"):
                 sd = sd2
                 res["style"] = style[:-1]
+                used = style[:-1]
         if not sd.get("found") or not sd.get("by"):
             continue
         picked = _st._pick_colors(list(sd["by"].keys()), color)
@@ -176,7 +189,7 @@ def match_line(item, cache):
             if near < q:
                 nextday = False
         priced = all((rows.get(smap[z]) or {}).get("price") for z in need)
-        res["options"][sup] = {"color": clr, "sure": sure, "cost": round(cost, 2), "short": short,
+        res["options"][sup] = {"style": sd.get("style_used") or used, "color": clr, "sure": sure, "cost": round(cost, 2), "short": short,
                                "nextday": nextday and not short, "priced": priced,
                                "skus": {z: (rows.get(smap[z]) or {}).get("sku") or "" for z in need},
                                "stock": {z: int((rows.get(smap[z]) or {}).get("stock") or 0) for z in need},

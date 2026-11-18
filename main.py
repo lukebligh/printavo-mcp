@@ -8165,7 +8165,7 @@ def _order_post_build(supplier, record_seen=True) -> str:
                                      "type": p["order"].get("type", "invoice"),
                                      "total": p.get("total"),
                                      "sig": p["order"].get("sig"),
-                                     "lines": [{"style": l["style"], "color": opt["color"], "need": l["need"],
+                                     "lines": [{"style": opt.get("style") or l["style"], "color": opt["color"], "need": l["need"],
                                                 "desc": l.get("desc", ""), "sizemap": opt.get("sizemap") or {},
                                                 "skus": opt.get("skus") or {}} for l, opt in p["lines"]]}
                                     for p in po["parts"]]}
@@ -8174,7 +8174,7 @@ def _order_post_build(supplier, record_seen=True) -> str:
                           "type": p_["order"].get("type", "invoice"), "total": p_.get("total"),
                           "sig": p_["order"].get("sig"),
                           "nextday": all(opt["nextday"] for _l, opt in p_["lines"]),
-                          "lines": [{"style": l["style"], "color": opt["color"], "need": l["need"],
+                          "lines": [{"style": opt.get("style") or l["style"], "color": opt["color"], "need": l["need"],
                                      "desc": l.get("desc", ""), "sizemap": opt.get("sizemap") or {},
                                      "skus": opt.get("skus") or {}} for l, opt in p_["lines"]]}
                          for s_, p_, _why in r["held"] if s_ == supplier]}

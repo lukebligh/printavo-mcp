@@ -173,18 +173,41 @@ def sanmar_side(style, color):
 
 
 # SanMar prefixes some outside brands; S&S lists them by the bare number.
-_SS_BRAND = {"BC": "BELLA + CANVAS", "NL": "Next Level", "CAR": "Carhartt", "CT": "Carhartt"}
+_SS_BRAND = {"BC": "BELLA + CANVAS", "NL": "Next Level", "CAR": "Carhartt", "CT": "Carhartt", "G": "Gildan"}
+# ...and the reverse: a bare S&S-style number for these brands is SanMar's number with the prefix.
+SM_PREFIX = {"bellacanvas": "BC", "nextlevel": "NL", "nextlevelapparel": "NL"}
+
+
+def _bn(x):
+    return re.sub(r"[^a-z0-9]", "", str(x or "").lower())
+
+
+def _ss_same(i, style, brand):
+    """S&S answers a competitor's style # with its own COMPARABLE product (PC61 -> Bayside 8100,
+    DM130 -> Hanes 5586). Those are different garments. Keep an S&S item only when its style # IS the
+    one asked for, or is that number minus a SanMar brand prefix AND the brand matches."""
+    sn = str(i.get("styleName") or "").upper().strip()
+    S = style.upper().strip()
+    if not sn:
+        return False
+    if S == sn or S.endswith(" " + sn):
+        return True
+    m = re.match(r"^([A-Z]+)(\d.*)$", S)
+    if m and m.group(2) == sn:
+        hint, have = _bn(brand or _SS_BRAND.get(m.group(1), "")), _bn(i.get("brandName"))
+        return bool(hint) and bool(have) and (hint in have or have in hint)
+    return False
 
 
 _DS_ONLY = {}
 
 
 def ss_side(style, color, brand=""):
-    items = _ss.products(f"{brand} {style}".strip())
+    items = [i for i in _ss.products(f"{brand} {style}".strip()) if _ss_same(i, style, brand)]
     m = re.match(r"^([A-Za-z]+)(\d.*)$", style)
     if not items and m:
         b = brand or _SS_BRAND.get(m.group(1).upper(), "")
-        items = _ss.products(f"{b} {m.group(2)}".strip())
+        items = [i for i in _ss.products(f"{b} {m.group(2)}".strip()) if _ss_same(i, style, b)]
     if not items:
         return {"supplier": "S&S", "found": False}
     colors = sorted({i.get("colorName") or "" for i in items})

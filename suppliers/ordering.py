@@ -186,7 +186,7 @@ def match_line(item, cache):
         errs = [s_ for s_ in ("SanMar", "S&S") if (cache.get(s_, style, brand) or {}).get("error")
                 and "ambiguous" not in cache.get(s_, style, brand)["error"]]
         res["flag"] = (f"couldn't look it up at {' / '.join(errs)} just now — will retry next build" if errs
-                       else "neither supplier carries this style/color")
+                       else "not a SanMar or S&S item")
     if not youth_style and any(z.startswith("Y") for z in need):
         res["flag"] = "youth sizes on an adult item # — use the youth style (e.g. 18000B, PC54Y)"
     return res
@@ -228,16 +228,22 @@ def quote_threshold(line, unit):
 
 
 def _short_detail(l):
-    """Per short size: need vs what each supplier has."""
+    """Only the sizes the best supplier can't cover: need vs have. SanMar first. The other supplier is
+    mentioned only when it actually has some of that size — never when it has none or doesn't carry it."""
+    opts = l["options"]
+    cands = [s for s in ("SanMar", "S&S") if opts.get(s) and opts[s]["short"]]
+    if not cands:
+        return ""
+    prim = cands[0]
+    other = "S&S" if prim == "SanMar" else "SanMar"
     bits = []
-    sizes = sorted({z for o in l["options"].values() for z in o["short"]},
-                   key=lambda z: (_st._ORDER.index(z) if z in _st._ORDER else 99, z))
-    for z in sizes:
-        have = []
-        for s in ("SanMar", "S&S"):
-            o = l["options"].get(s)
-            have.append(f"{s} {'doesn’t carry it' if not o else 'has ' + str(o['stock'].get(z, 0))}")
-        bits.append(f"{z}: need {l['need'][z]} · " + " · ".join(have))
+    for z in sorted(opts[prim]["short"], key=lambda z: (_st._ORDER.index(z) if z in _st._ORDER else 99, z)):
+        need, have = l["need"][z], opts[prim]["stock"].get(z, 0)
+        t = f"{z}: need {need}, {prim} has {have} ({need - have} short)"
+        o2 = (opts.get(other) or {}).get("stock", {}).get(z, 0) if opts.get(other) else 0
+        if o2:
+            t += f", {other} has {o2}"
+        bits.append(t)
     return "; ".join(bits)
 
 

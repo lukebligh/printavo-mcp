@@ -8790,12 +8790,12 @@ def _order_report(update_snapshot=False):
                     for row in rows:
                         for l in row["lines"]:
                             pcs[l["style"]] = pcs.get(l["style"], 0) + int(float(l["ordered"] or 0))
-                    detail = " · " + ", ".join(f"{s} ×{q}" for s, q in pcs.items() if q)
+                    detail = [f"{s} × {q}" for s, q in pcs.items() if q]
                 except Exception:
-                    pass
+                    detail = []
                 nums = _scogs.order_numbers(po)
                 shown = "(PO # left blank)" if po.strip().upper() in ("NOT AVAILABLE", "N/A", "NA") else f"\"{po}\""
-                hand.append(f"SanMar PO {shown}{detail}" + ("" if nums else _NO_NUM))
+                hand.append((f"SanMar PO {shown}" + ("" if nums else _NO_NUM), detail))
             for onum in sorted(set(ss) - set(snap.get("ss") or [])):
                 o = ss[onum]
                 po = str(o.get("poNumber") or "")
@@ -8806,8 +8806,8 @@ def _order_report(update_snapshot=False):
                     k = f"{l.get('brandName', '')} {l.get('styleName', '')}".strip()
                     pcs[k] = pcs.get(k, 0) + int(float(l.get("qtyOrdered") or 0))
                 nums = _scogs.order_numbers(po)
-                hand.append(f"S&S order {onum} PO \"{po}\" · " + ", ".join(f"{s} ×{q}" for s, q in pcs.items() if q)
-                            + ("" if nums else _NO_NUM))
+                hand.append((f"S&S order {onum} · PO \"{po}\"" + ("" if nums else _NO_NUM),
+                             [f"{s} × {q}" for s, q in pcs.items() if q]))
         if update_snapshot or not snap:
             _goods_json_save("order_po_snapshot.json", {"sanmar": sorted(sm), "ss": sorted(ss), "at": now.isoformat()})
     except Exception as e:
@@ -8818,20 +8818,30 @@ def _order_report(update_snapshot=False):
     try:
         r = _order_build_impl("", record_seen=False)
         for po in r["pos"]:
-            waiting.append(f"Ready, not approved today — {po['supplier']} PO \"{po['po_number']}\" ${po['total']:,.2f} "
-                           f"({po['why']}): " + ", ".join(f"#{x['order']['vid']} {x['order'].get('nick') or ''}"
-                                                         for x in po["parts"]))
+            waiting.append((f"READY, no ✅ today — {po['supplier']} PO \"{po['po_number']}\" · ${po['total']:,.2f} · {po['why']}",
+                            [f"#{x['order']['vid']} {x['order'].get('nick') or ''}".strip() for x in po["parts"]]))
         for s, p_, why in r["held"]:
-            waiting.append(f"Holding for free freight — {s} #{p_['order']['vid']} {p_['order'].get('nick') or ''} "
-                           f"${p_['total']:,.2f} ({why})")
+            waiting.append((f"HOLDING for free freight — #{p_['order']['vid']} {p_['order'].get('nick') or ''}".strip(),
+                            [f"{s} · ${p_['total']:,.2f} · {why}"]))
+        byhand = []
         for o, texts in r.get("attention") or []:
-            waiting.append(f"NOT READY — #{o['vid']} {o.get('nick') or ''}: " + " | ".join(t for t in texts if not t.startswith("→")))
+            texts = [t for t in texts if not t.startswith("→")]
+            name = f"#{o['vid']} {o.get('nick') or ''}".strip()
+            clean = [re.sub(r"^✋ (also )?order by hand\s*[—:]\s*", "", t) for t in texts]
+            if texts and all(t.startswith("✋") for t in texts):
+                byhand.append((f"ORDER BY HAND — {name}", clean))
+            else:
+                waiting.append((f"NEEDS ATTENTION — {name}",
+                                [("Order by hand: " + c) if t.startswith("✋") else c for t, c in zip(texts, clean)]
+                                + [f"Fix the order in Printavo, or reply \"approve shorts #{o['vid']}\" in #goods-orders"
+                                   if any(t.startswith("SHORT") for t in texts) else ""]))
         att = {str(o_["vid"]) for o_, _t in r.get("attention") or []}
         for o, l, why in r["flagged"]:
             if str(o["vid"]) in att:
                 continue
-            waiting.append(f"Order by hand — #{o['vid']} {l['style']} {l.get('desc', '')[:40]} {l['color']} "
-                           f"{_ord_sizes(l['need'])} ({why})")
+            byhand.append((f"ORDER BY HAND — #{o['vid']} {o.get('nick') or ''}".strip(),
+                           [f"{l['style']} {l['color']} {_ord_sizes(l['need'])} — {why}"]))
+        waiting += byhand
         if r.get("stuck"):
             sec.append(("⚠ Stuck — approved 5+ business days ago, still not ordered", r["stuck"]))
         if r.get("stale"):
@@ -8841,9 +8851,22 @@ def _order_report(update_snapshot=False):
     sec.insert(2, ("3. Not ordered yet", waiting or ["Nothing waiting."]))
 
     subject = f"Goods ordered today — {now:%a %-m/%-d}" + (" (TEST MODE)" if ORDER_MODE == "test" else "")
-    html = ("".join(f"<h3>{_esc(t)}</h3><ul>" + "".join(f"<li>{_esc(x)}</li>" for x in ls) + "</ul>"
-                      for t, ls in sec))
-    text = f"*{subject}*\n" + "\n".join(f"\n*{t}*\n" + "\n".join("• " + x for x in ls) for t, ls in sec)
+    def _li(x):
+        if isinstance(x, str):
+            return f"<li>{_esc(x)}</li>"
+        head, subs = x
+        subs = [y for y in subs if y]
+        return (f"<li style='margin-bottom:10px'><b>{_esc(head)}</b>"
+                + ("<ul>" + "".join(f"<li>{_esc(y)}</li>" for y in subs) + "</ul>" if subs else "") + "</li>")
+
+    def _tx(x):
+        if isinstance(x, str):
+            return "• " + x
+        head, subs = x
+        return "• " + head + "".join("\n     ◦ " + y for y in subs if y)
+
+    html = "".join(f"<h3>{_esc(t)}</h3><ul>" + "".join(_li(x) for x in ls) + "</ul>" for t, ls in sec)
+    text = f"*{subject}*\n" + "\n".join(f"\n*{t}*\n" + "\n".join(_tx(x) for x in ls) for t, ls in sec)
     return subject, html, text
 
 

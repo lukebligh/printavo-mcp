@@ -9164,6 +9164,104 @@ def order_rules_lookback(days: int = 56) -> str:
     return "\n".join(out)
 
 
+_HOUSE = ("port authority", "port & company", "port and company", "sport-tek", "sport tek", "district",
+          "cornerstone", "mercer+mettle", "mercer mettle", "volunteer knitwear", "allmade")
+
+
+@mcp.tool()
+def order_style_audit(days: int = 120) -> str:
+    """READ-ONLY, posts nothing. Item-number audit: every style on the direct orders SanMar / S&S
+    invoiced in the last `days` days, looked up at BOTH suppliers. Lists (A) styles found at SanMar
+    but not S&S with S&S's closest candidates, (B) found at S&S but not SanMar, (C) styles matched at
+    both under a DIFFERENT number (to confirm they're the same garment)."""
+    end = _central_now().date()
+    start = end - timedelta(days=days)
+    invs = []
+    for fn in (_sanmar.normalized_invoices, _ss.invoices_by_date):
+        try:
+            invs += fn(start.isoformat(), end.isoformat())
+        except Exception as e:
+            print(f"[ORDER] style audit: {e}", flush=True)
+    vids = sorted({n for inv in invs for n in _scogs.order_numbers(inv["po"])}, key=int)
+    cache = _ordering.StyleCache()
+    seen = {}
+    with _stock._LOCK:
+        for vid in vids:
+            try:
+                o = _bt_order(vid)
+            except Exception:
+                o = None
+            if not o or _cogs_is_contract_customer({"contact": o["contact"]}):
+                continue
+            for it in o["items"]:
+                st = (it.get("style") or "").strip()
+                if not st or not any(int(v or 0) > 0 for v in (it.get("sizes") or {}).values()):
+                    continue
+                k = st.upper()
+                if k not in seen:
+                    seen[k] = {"style": st, "desc": it.get("desc", ""), "orders": []}
+                seen[k]["orders"].append(vid)
+
+        def _resolve(sup, style, brand):
+            base = re.split(r"[_ ]", style)[0]
+            for cand in [style, base] + ([style[:-1]] if re.search(r"\d[A-Z]*[MR]$", style.upper()) and len(style) > 3 else []):
+                sd = cache.get(sup, cand, brand)
+                if sd.get("found") and sd.get("by"):
+                    return cand, sd
+                if sd.get("error"):
+                    return None, sd
+            return None, {}
+
+        a, b, c, house, errs, both = [], [], [], 0, [], 0
+        for k, e in sorted(seen.items()):
+            desc = e["desc"]
+            brand = desc.split(" - ")[0].strip() if " - " in desc and len(desc.split(" - ")[0]) <= 30 else ""
+            sm_st, sm = _resolve("SanMar", e["style"], brand)
+            ss_st, ss = _resolve("S&S", e["style"], brand)
+            tag = f"{e['style']} · {desc[:45]} · {len(e['orders'])} order(s), e.g. #{e['orders'][-1]}"
+            if sm.get("error") or ss.get("error"):
+                errs.append(f"{tag} — {(sm.get('error') or ss.get('error'))[:80]}")
+                continue
+            if sm_st and ss_st:
+                both += 1
+                names = ss.get("styles") or []
+                bare = re.sub(r"^[A-Za-z]+(?=\d)", "", e["style"]).upper()
+                same = any(n.upper().split()[-1] == e["style"].upper() for n in names)
+                if not same or len(names) > 1:
+                    c.append(f"{tag}\n      SanMar \"{sm_st}\"  =  S&S {' / '.join(names) or ss_st}")
+            elif sm_st and not ss_st:
+                if any(h in brand.lower() for h in _HOUSE):
+                    house += 1
+                    continue
+                core = re.sub(r"^[A-Za-z]+(?=\d)", "", re.split(r"[_ ]", e["style"])[0])
+                digits = re.sub(r"\D", "", core)
+                cands = []
+                for q in dict.fromkeys([f"{brand} {core}".strip(), core, digits]):
+                    if not q or len(q) < 3:
+                        continue
+                    try:
+                        for s_ in _ss._get("/styles/", {"search": q})[:40]:
+                            n_ = f"{s_.get('brandName', '')} {s_.get('styleName', '')}".strip()
+                            if digits and digits in re.sub(r"\D", "", str(s_.get("styleName", ""))) and n_ not in cands:
+                                if not brand or brand.lower().split()[0] in n_.lower():
+                                    cands.insert(0, n_)
+                                else:
+                                    cands.append(n_)
+                    except Exception:
+                        pass
+                a.append(f"{tag}\n      S&S candidates: {', '.join(cands[:6]) or 'none found'}")
+            elif ss_st and not sm_st:
+                b.append(f"{tag}\n      S&S: {' / '.join(ss.get('styles') or [ss_st])}")
+    out = [f"ITEM-NUMBER AUDIT · {start} → {end} · {len(seen)} styles on {len(vids)} supplier-invoiced orders",
+           f"Matched at both suppliers: {both} · SanMar house brands (S&S never carries): {house}",
+           f"\n== A. At SanMar, NOT matched at S&S: {len(a)} =="] + ["  " + x for x in a]
+    out += [f"\n== B. At S&S, NOT matched at SanMar: {len(b)} =="] + ["  " + x for x in b]
+    out += [f"\n== C. Matched at both under a different number — confirm same garment: {len(c)} =="] + ["  " + x for x in c]
+    if errs:
+        out += [f"\n== Couldn't look up: {len(errs)} =="] + ["  " + x for x in errs]
+    return "\n".join(out)
+
+
 @mcp.tool()
 def order_build_post(supplier: str = "SanMar") -> str:
     """Run a blank-ordering build NOW for one supplier ("SanMar" or "S&S") and post it to #goods-orders

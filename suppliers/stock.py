@@ -176,6 +176,9 @@ def sanmar_side(style, color):
 _SS_BRAND = {"BC": "BELLA + CANVAS", "NL": "Next Level", "CAR": "Carhartt", "CT": "Carhartt"}
 
 
+_DS_ONLY = {}
+
+
 def ss_side(style, color, brand=""):
     items = _ss.products(f"{brand} {style}".strip())
     m = re.match(r"^([A-Za-z]+)(\d.*)$", style)
@@ -194,12 +197,19 @@ def ss_side(style, color, brand=""):
             price = next((float(i[f]) for f in ("customerPrice", "salePrice", "casePrice", "piecePrice")
                           if isinstance(i.get(f), (int, float)) and i[f] > 0), None)
             # drop-ship stock (abbr DS / dropship flag) isn't shelf stock and prices higher -> excluded
+            _isds = lambda w: bool(w.get("dropship")) or (w.get("warehouseAbbr") or "").upper() == "DS"
             whs = [(w.get("warehouseAbbr") or "?", int(w.get("qty") or 0)) for w in (i.get("warehouses") or [])
-                   if not w.get("dropship") and (w.get("warehouseAbbr") or "").upper() != "DS"]
+                   if not _isds(w)]
+            # mill drop-ship stock (e.g. Next Level AL / CA): never counted as stock, kept for information only
+            ds = sum(int(w.get("qty") or 0) for w in (i.get("warehouses") or []) if _isds(w))
             if not whs and (i.get("warehouses") or []):
+                if ds and sz in rows:
+                    rows[sz]["ds"] = rows[sz].get("ds", 0) + ds
+                elif ds:
+                    _DS_ONLY.setdefault((i.get("styleName"), i.get("colorName")), {})[sz] = ds
                 continue
             rows[sz] = {"stock": sum(q for _n, q in whs) if whs else int(i.get("qty") or 0),
-                        "price": price, "top": _near("S&S", whs), "whs": whs,
+                        "price": price, "top": _near("S&S", whs), "whs": whs, "ds": ds,
                         "sku": i.get("sku") or i.get("skuID_Master") or ""}
     by = {c: r for c, r in by.items() if r}
     colors = sorted(by) or colors

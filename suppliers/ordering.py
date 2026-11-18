@@ -180,6 +180,7 @@ def match_line(item, cache):
                                "nextday": nextday and not short, "priced": priced,
                                "skus": {z: (rows.get(smap[z]) or {}).get("sku") or "" for z in need},
                                "stock": {z: int((rows.get(smap[z]) or {}).get("stock") or 0) for z in need},
+                               "ds": {z: int((rows.get(smap[z]) or {}).get("ds") or 0) for z in need},
                                "ship": _ship_from(sup, rows, smap, need, short),
                                "sizemap": smap}
     if not res["options"]:
@@ -242,6 +243,9 @@ def _short_detail(l):
         t = f"{z}: need {need}, {prim} has {have} ({need - have} short)"
         if opts.get(other):                      # the other supplier carries it: say what it has, even 0
             t += f", {other} has {opts[other]['stock'].get(z, 0)}"
+        dsq = ((opts.get("S&S") or {}).get("ds") or {}).get(z, 0)
+        if dsq:                                  # information only — the bot never orders drop-ship
+            t += f" (+{dsq:,} at the mill via S&S drop-ship — by hand only)"
         bits.append(t)
     return "; ".join(bits)
 

@@ -8311,7 +8311,7 @@ def _order_submit(ts, p) -> tuple:
                                        + ", ".join(f"{q}× {s_}" for s_, q in agg.items()))
                 ss_po = ("TEST-" + po_num) if test else po_num
                 res = _ss.place_order(ss_po, [{"sku": s, "qty": q} for s, q in agg.items()], test=test,
-                                      warehouses="IL,KS,KY" if po.get("nextday") else "",
+                                      warehouses="IL,KS" if po.get("nextday") else "",
                                       email="" if test else "sales@estmerch.com")
                 if not res["ok"]:
                     raise RuntimeError(res["message"])

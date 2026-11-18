@@ -94,7 +94,7 @@ SHIP_TO = {"customer": "ESTABLISHED MERCH", "attn": "", "address": "1920 S VANDE
 
 def place_order(po_number, lines, test=True, warehouses="", email=""):
     """POST /v2/orders. lines: [{"sku": ..., "qty": n}]. test=True -> S&S validates, creates and
-    cancels it (nothing ships). warehouses: 'IL,KS,KY' to restrict auto-select (next-day).
+    cancels it (nothing ships). warehouses: 'IL,KS' to restrict auto-select (next-day).
     -> {"ok", "message", "orders": [{orderNumber, warehouse, total}]}"""
     body = {"shippingAddress": SHIP_TO, "shippingMethod": "1", "poNumber": po_number,
             "emailConfirmation": email, "testOrder": bool(test), "autoselectWarehouse": True,
@@ -105,6 +105,14 @@ def place_order(po_number, lines, test=True, warehouses="", email=""):
         r = httpx.post(f"{BASE}/orders/", auth=_auth(), json=body, timeout=120)
     except httpx.HTTPError as e:
         return {"ok": False, "message": f"S&S unreachable: {e}", "orders": []}
+    if r.status_code == 400 and warehouses and "warehouse" in r.text.lower():
+        # S&S refused the next-day warehouse list (e.g. an abbreviation it doesn't know): place it with
+        # S&S's own warehouse pick rather than fail the PO.
+        body["autoselectWarehouse_Warehouses"] = ""
+        try:
+            r = httpx.post(f"{BASE}/orders/", auth=_auth(), json=body, timeout=120)
+        except httpx.HTTPError as e:
+            return {"ok": False, "message": f"S&S unreachable: {e}", "orders": []}
     if r.status_code not in (200, 201):
         return {"ok": False, "message": f"S&S HTTP {r.status_code}: {r.text[:300]}", "orders": []}
     data = r.json() or []

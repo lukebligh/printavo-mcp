@@ -9173,6 +9173,88 @@ def order_rules_lookback(days: int = 56) -> str:
 
 
 @mcp.tool()
+def order_why(visual_id: str) -> str:
+    """READ-ONLY. Why is (or isn't) an order on the goods-ordering posts? Walks one order through every
+    gate the ordering bot applies and says where it stops."""
+    vid = str(visual_id).strip().lstrip("#")
+    out = [f"ORDER #{vid} — ordering-bot gates"]
+    iid, otype, err = _find_order(vid)
+    if not iid:
+        return f"#{vid}: not found in Printavo ({err})"
+    r = query_printavo(f'''query {{ o: {otype}(id: "{iid}") {{ nickname status {{ name }} tags startAt customerDueAt invoiceAt
+        contact {{ fullName customer {{ companyName }} }} }} }}''')
+    o = (r or {}).get("o") or {}
+    st = (o.get("status") or {}).get("name") or "?"
+    out.append(f"  {o.get('nickname')} · type {otype} · status {st}")
+    stop = None
+    if otype != "invoice":
+        stop = stop or "it is a QUOTE in Printavo's API — the queue only reads invoices"
+        out.append("  ✗ type: quote (queue reads invoices only)")
+    else:
+        out.append("  ✓ type: invoice")
+    qs = {_norm_status(x) for x in _order_queue_statuses()}
+    if _norm_status(st) in qs:
+        out.append(f"  ✓ status '{st}' is in the ordering queue")
+    else:
+        why = "a CONTRACT status" if _norm_status(st).startswith("contract") else "a not-yet-approved or finished status"
+        out.append(f"  ✗ status '{st}' is not in the ordering queue ({why})")
+        stop = stop or f"status '{st}' is not in the queue"
+    c = o.get("contact") or {}
+    if _cogs_is_contract_customer({"contact": c}):
+        out.append(f"  ✗ customer is on the CONTRACT list ({(c.get('customer') or {}).get('companyName') or c.get('fullName')})")
+        stop = stop or "the customer is marked CONTRACT on the Scorecard Customers tab"
+    else:
+        out.append("  ✓ customer is direct")
+    today = _central_now().date()
+    dates = [d.date() for d in (_parse_dt(o.get("invoiceAt")), _parse_dt(o.get("customerDueAt")), _parse_dt(o.get("startAt"))) if d]
+    if dates and max(dates) < today - timedelta(days=ORDER_MAX_AGE_DAYS):
+        out.append(f"  ✗ older than {ORDER_MAX_AGE_DAYS} days (newest date {max(dates)})")
+        stop = stop or "old-order guard"
+    else:
+        out.append("  ✓ not an old order")
+    try:
+        pos = _sanmar.find_pos(vid)
+    except Exception as e:
+        pos = []
+        out.append(f"  ? SanMar PO lookup failed: {str(e)[:100]}")
+    try:
+        sspos = [po for po in _ss.recent_pos() if vid in _scogs.order_numbers(po)]
+    except Exception as e:
+        sspos = []
+        out.append(f"  ? S&S PO lookup failed: {str(e)[:100]}")
+    if pos or sspos:
+        out.append("  ✗ a supplier PO already carries this order #: "
+                   + ", ".join([f'SanMar \"{x}\"' for x in pos] + [f'S&S \"{x}\"' for x in sspos]))
+        stop = stop or "a SanMar/S&S PO already has this order # on it — the bot treats the whole order as ordered"
+    else:
+        out.append("  ✓ no supplier PO carries this order # yet")
+    if _order_has_skip_tag(iid, otype):
+        out.append("  ✗ tagged #nogoods")
+        stop = stop or "#nogoods tag"
+    else:
+        out.append("  ✓ no #nogoods tag")
+    try:
+        items = _printavo_items_by_id(iid, otype, strict=True)
+        cache = _ordering.StyleCache()
+        with _stock._LOCK:
+            lines = [(i, _ordering.match_line(i, cache)) for i in items]
+        for i, m in lines:
+            if not m:
+                out.append(f"  · line {i.get('style') or '(no item #)'}: no sizes/quantities — treated as a fee line, ignored")
+            elif m["flag"]:
+                out.append(f"  · line {m['style']} {m['color']}: ORDER BY HAND — {m['flag']}")
+            else:
+                out.append(f"  · line {m['style']} {m['color']}: " + ", ".join(
+                    f"{s_} {'OK' if _ordering.ok(m, s_) else 'short/unsure'}" for s_ in m["options"]))
+        if not any(m for _i, m in lines):
+            stop = stop or "no line has sizes/quantities"
+    except Exception as e:
+        out.append(f"  ? couldn't read the line items: {str(e)[:120]}")
+    out.append("\nRESULT: " + (f"NOT on the posts — {stop}." if stop else "passes every gate — it should be on the posts."))
+    return "\n".join(out)
+
+
+@mcp.tool()
 def order_supplier_lookback(days: int = 56) -> str:
     """READ-ONLY, posts nothing. WHO we bought from vs who the bot would pick. For every direct order
     SanMar / S&S invoiced in the last `days` days: the supplier each style was actually bought from

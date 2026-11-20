@@ -129,6 +129,7 @@ def compare(needs, have, own_styles=None, own_needs=None):
     # THIS order's own lines: a mismatch is reported only on the order that needs that piece, and
     # under the item # the order uses (DT6102, not 6102). Other orders sharing the PO report their own.
     own_keys, own_sc, label_of = None, set(), {}
+    own_lines = None if own_needs is None else {(core(st), _stock._cn(co)) for st, co, _sz, q in own_needs if q}
     if own_needs is not None:
         own_keys = set()
         for st, co, sz, q in own_needs:
@@ -155,7 +156,10 @@ def compare(needs, have, own_styles=None, own_needs=None):
             continue
         pick = _stock._pick_colors(colors, co) if co else colors
         if not pick:
-            issues.append(f"{st} {co}: color not on the PO (PO has {', '.join(colors[:4])})")
+            # only THIS order's own line can be reported — on a shared PO, another order's color may
+            # sit on a different PO (#7326's Midnight Navy showed up on #7548 / #7557, Nov 19)
+            if own_lines is None or (cs, _stock._cn(co)) in own_lines:
+                issues.append(f"{st} {co}: color not on the PO (PO has {', '.join(colors[:4])})")
             continue
         k = (cs, pick[0], norm_size(sz))
         need_by[k] = need_by.get(k, 0) + float(q)

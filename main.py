@@ -7464,6 +7464,17 @@ GOODS_PO_CHECK_USERS = os.environ.get("GOODS_PO_CHECK_USERS", "U07VDET3XEX,U0504
 def _goods_send_po_issues(rep: dict):
     seen = _goods_json("goods_pocheck_seen.json", {})
     new = []
+    # latest mismatches per order, for the 3:30 goods email ("Ordered, but the PO doesn't match")
+    try:
+        latest = {str(r["vid"]): {"nick": r.get("nick") or "", "issues": list(r["po_issues"][0])[:8],
+                                  "pos": [po for po, _i in r["infos"]], "at": _central_now().isoformat()}
+                  for r in rep["results"] if r.get("po_issues") and r["po_issues"][0]}
+        if len(rep["results"]) > 1 or latest:
+            keep = _goods_json("goods_pocheck_latest.json", {}) if len(rep["results"]) <= 1 else {}
+            keep.update(latest)
+            _goods_json_save("goods_pocheck_latest.json", keep)
+    except Exception as e:
+        print(f"[GOODS] pocheck latest: {e}", flush=True)
     for r in rep["results"]:
         pi = r.get("po_issues")
         if not pi or not pi[0]:
@@ -8866,6 +8877,18 @@ def _order_report(update_snapshot=False):
     except Exception as e:
         waiting.append(f"⚠ Couldn't run the queue check: {str(e)[:150]}")
     sec.insert(2, ("3. Not ordered yet", waiting or ["Nothing waiting."]))
+    # Report only (Luke, Nov 19): an order leaves the queue as soon as ANY PO carries its #, even when that
+    # PO covers only part of it. List what the PO check found so the gap is seen the same day.
+    try:
+        cut = (now - timedelta(hours=30)).isoformat()
+        mism = [(f"#{v} {d.get('nick', '')}".strip() + " — PO " + ", ".join(f'"{x}"' for x in d.get("pos") or []),
+                 d.get("issues") or [])
+                for v, d in sorted(_goods_json("goods_pocheck_latest.json", {}).items())
+                if d.get("at", "") >= cut and d.get("issues")]
+        if mism:
+            sec.insert(3, ("4. Ordered, but the PO doesn't match the order — check these (the bot won't re-order them)", mism))
+    except Exception as e:
+        print(f"[ORDER] report pocheck: {e}", flush=True)
 
     subject = f"Goods ordered today — {now:%a %-m/%-d}" + (" (TEST MODE)" if ORDER_MODE == "test" else "")
     def _li(x):
